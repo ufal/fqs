@@ -1,0 +1,214 @@
+[
+  {
+    "id": "rich_idx",
+    "label": "Pando Rich Test Index",
+    "project_root": "/tmp/rich_idx",
+    "project_url": "http://127.0.0.1/local/rich_idx",
+    "preferred_backend": "pando",
+    "visibility": "published",
+    "listing_visibility": "server_admin",
+    "environment": "dev",
+    "family_key": null,
+    "family_label": null,
+    "version_tag": null,
+    "source_kind": "pando_raw",
+    "supports_xml": false,
+    "http_policy_mode": "disabled",
+    "http_allowed_operations": [],
+    "interfaces": ["query"],
+    "capabilities": {
+      "xml_context": false,
+      "teitok_integration": false,
+      "fcs": {
+        "enabled": true,
+        "resource_pid": "local:rich_idx",
+        "supports_dataviews": ["hits"]
+      }
+    },
+    "settings": {
+      "index_path": "/tmp/rich_idx"
+    },
+    "is_current": true
+  },
+  {
+    "id": "infoveillance_pando",
+    "label": "Infoveillance Pando",
+    "project_root": "/Users/mjanssen/programming/easycorp/teitok/infoveillance/pando",
+    "project_url": "http://127.0.0.1/teitok/easycorp/infoveillance/index.php",
+    "preferred_backend": "pando",
+    "visibility": "published",
+    "listing_visibility": "public",
+    "environment": "live",
+    "family_key": null,
+    "family_label": null,
+    "version_tag": null,
+    "source_kind": "teitok_pando",
+    "supports_xml": true,
+    "http_policy_mode": "auth_required",
+    "http_allowed_operations": ["query", "catalog"],
+    "interfaces": ["query", "kwic", "xml_context"],
+    "capabilities": {
+      "xml_context": true,
+      "teitok_integration": true,
+      "fcs": {
+        "enabled": true,
+        "resource_pid": "teitok:infoveillance_pando",
+        "supports_dataviews": ["hits", "kwic"]
+      }
+    },
+    "settings": {},
+    "is_current": true
+  },
+  {
+    "id": "clickhouse_local_test",
+    "label": "ClickHouse Local Test Corpus",
+    "project_root": "/srv/corpora/clickhouse/test",
+    "project_url": "http://127.0.0.1/corpora/clickhouse/local-test",
+    "preferred_backend": "clickql",
+    "visibility": "staging",
+    "listing_visibility": "server_admin",
+    "environment": "dev",
+    "family_key": "local_tests",
+    "family_label": "Local Test Corpora",
+    "version_tag": "dev",
+    "source_kind": "clickhouse_native",
+    "supports_xml": false,
+    "http_policy_mode": "disabled",
+    "http_allowed_operations": [],
+    "interfaces": ["query", "freq"],
+    "capabilities": {
+      "requires_clickhouse_dsn": true,
+      "fcs": {
+        "enabled": true,
+        "resource_pid": "local:clickhouse_local_test",
+        "supports_dataviews": ["hits"]
+      }
+    },
+    "settings": {
+      "todo": "set actual DSN/table names"
+    },
+    "is_current": true
+  },
+  {
+    "id": "blacklab_local_test",
+    "label": "BlackLab Local Test Corpus",
+    "project_root": "/data/blacklab/index",
+    "project_url": "http://127.0.0.1:8080/blacklab-server",
+    "preferred_backend": "blacklab",
+    "visibility": "staging",
+    "listing_visibility": "server_admin",
+    "environment": "dev",
+    "family_key": "local_tests",
+    "family_label": "Local Test Corpora",
+    "version_tag": "dev",
+    "source_kind": "blacklab_native",
+    "supports_xml": false,
+    "http_policy_mode": "disabled",
+    "http_allowed_operations": [],
+    "interfaces": ["query"],
+    "capabilities": {
+      "requires_blacklab_endpoint": true,
+      "fcs": {
+        "enabled": true,
+        "resource_pid": "local:blacklab_local_test",
+        "supports_dataviews": ["hits"]
+      }
+    },
+    "settings": {
+      "blacklab_server_config_hint": "easycorp/docker/easycorp-demo/config/blacklab-server.yaml"
+    },
+    "is_current": true
+  },
+  {
+    "id": "kontext_local_test",
+    "label": "KonText Local Test Corpus",
+    "project_root": "/var/lib/manatee/corpora/local_test",
+    "project_url": "http://127.0.0.1:8080/kontext",
+    "preferred_backend": "manatee",
+    "visibility": "staging",
+    "listing_visibility": "server_admin",
+    "environment": "dev",
+    "family_key": "local_tests",
+    "family_label": "Local Test Corpora",
+    "version_tag": "dev",
+    "source_kind": "kontext_manatee",
+    "supports_xml": false,
+    "http_policy_mode": "disabled",
+    "http_allowed_operations": [],
+    "interfaces": ["query"],
+    "capabilities": {
+      "requires_manatee_registry": true,
+      "fcs": {
+        "enabled": true,
+        "resource_pid": "local:kontext_local_test",
+        "supports_dataviews": ["hits"]
+      }
+    },
+    "settings": {
+      "todo": "set actual registry file path"
+    },
+    "is_current": true
+  },
+  {
+    "id": "pmltq_local_test",
+    "label": "PML-TQ Local Test Corpus",
+    "project_root": "/Users/mjanssen/programming/easycorp/teitok/infoveillance/tmp",
+    "project_url": "http://127.0.0.1/corpora/pmltq/local-test",
+    "preferred_backend": "clickql",
+    "visibility": "staging",
+    "listing_visibility": "server_admin",
+    "environment": "dev",
+    "family_key": "local_tests",
+    "family_label": "Local Test Corpora",
+    "version_tag": "dev",
+    "source_kind": "pmltq_query_layer",
+    "supports_xml": false,
+    "http_policy_mode": "disabled",
+    "http_allowed_operations": [],
+    "interfaces": ["query"],
+    "capabilities": {
+      "query_language": "pmltq",
+      "requires_query_translation": true,
+      "fcs": {
+        "enabled": true,
+        "resource_pid": "local:pmltq_local_test",
+        "supports_dataviews": ["hits"]
+      }
+    },
+    "settings": {
+      "pmltq_sql_hint": "pmltqload.sql / pmltqdata.sql present in tmp"
+    },
+    "is_current": true
+  },
+  {
+    "id": "cwb_test_corpus",
+    "label": "CWB TEST Corpus",
+    "project_root": "/tmp/testcorpora/cwb-demo/Dickens-1.0",
+    "project_url": "http://127.0.0.1/corpora/cwb-test",
+    "preferred_backend": "cqp",
+    "visibility": "staging",
+    "listing_visibility": "server_admin",
+    "environment": "dev",
+    "family_key": "local_tests",
+    "family_label": "Local Test Corpora",
+    "version_tag": "test",
+    "source_kind": "cwb_registry",
+    "supports_xml": false,
+    "http_policy_mode": "disabled",
+    "http_allowed_operations": [],
+    "interfaces": ["query", "kwic", "freq"],
+    "capabilities": {
+      "requires_cwb_registry": true,
+      "fcs": {
+        "enabled": true,
+        "resource_pid": "local:cwb_test_corpus",
+        "supports_dataviews": ["hits", "kwic"]
+      }
+    },
+    "settings": {
+      "registry_hint": "/tmp/testcorpora/cwb-demo/Dickens-1.0/registry/dickens",
+      "corpus_name": "dickens"
+    },
+    "is_current": true
+  }
+]
