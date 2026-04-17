@@ -61,7 +61,7 @@ cargo run -- status --host 127.0.0.1 --port 8787
 
 Endpoints:
 
-- `GET /health`
+- `GET /health` — JSON includes `version`, `db_path`, and optional `server_name` (set via `--server-name` or env `FQS_SERVER_NAME`, e.g. to label a deployment or distinguish host vs container)
 - `GET /corpora?request_role=visitor|admin&tag=<browse-label>`
 - `GET /labels` — distinct browse labels (for Kontext-style facets)
 - `GET /fcs?operation=explain|searchRetrieve|scan&x-corpus=<id>&x-fcs-context=<id>&query=<cql>`

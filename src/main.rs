@@ -148,6 +148,9 @@ struct ServeArgs {
     /// Consider sessions stale after N minutes of inactivity
     #[arg(long, default_value_t = 120)]
     session_ttl_minutes: i64,
+    /// Human-readable label for this instance (shown in /health; e.g. "LINDAT live corpus query server")
+    #[arg(long = "server-name", env = "FQS_SERVER_NAME")]
+    server_name: Option<String>,
     #[command(flatten)]
     db: DbPathArg,
 }
@@ -214,6 +217,7 @@ struct HttpAppState {
     host: String,
     port: u16,
     fcs_database: String,
+    server_name: Option<String>,
     request_log_path: PathBuf,
     request_log_max_bytes: u64,
     request_log_keep_files: usize,
@@ -1278,6 +1282,7 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         host: args.host.clone(),
         port: args.port,
         fcs_database: args.fcs_database.clone(),
+        server_name: args.server_name.clone(),
         request_log_path: request_log_path.clone(),
         request_log_max_bytes: args.log_max_bytes,
         request_log_keep_files: args.log_keep_files,
@@ -1291,7 +1296,7 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         }
     });
     let app = Router::new()
-        .route("/", get(http_root))
+        .route("/", get(http_root_with_state))
         .route("/health", get(http_health))
         .route("/corpora", get(http_list_corpora))
         .route("/labels", get(http_browse_labels))
@@ -1312,6 +1317,7 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
             "address": addr,
             "db_path": db_path,
             "fcs_database": args.fcs_database,
+            "server_name": args.server_name,
             "test_mode": args.test,
             "log_file": request_log_path,
             "log_max_bytes": args.log_max_bytes,
@@ -1329,19 +1335,24 @@ async fn http_health(State(state): State<HttpAppState>) -> Json<Value> {
         "ok": true,
         "service": "fqs",
         "mode": "http",
+        "version": env!("CARGO_PKG_VERSION"),
+        "server_name": state.server_name,
         "db_path": state.db_path.to_string_lossy(),
     }))
 }
 
-async fn http_root() -> Json<Value> {
+async fn http_root_with_state(State(state): State<HttpAppState>) -> Json<Value> {
     Json(json!({
         "ok": true,
         "service": "fqs",
+        "version": env!("CARGO_PKG_VERSION"),
+        "server_name": state.server_name,
         "routes": [
             {"method":"GET", "path":"/", "description":"Route index"},
             {"method":"GET", "path":"/health", "description":"Health check"},
             {"method":"GET", "path":"/corpora", "description":"List corpora (query params: request_role, environment, include_noncurrent, tag)"},
             {"method":"GET", "path":"/labels", "description":"Distinct browse labels for catalog filtering"},
+            {"method":"GET", "path":"/fcs", "description":"FCS/SRU-style endpoint"},
             {"method":"POST", "path":"/query", "description":"Run query (JSON body: corpus, query, language?, start?, size?, request_role?)"}
         ]
     }))
