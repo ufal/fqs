@@ -485,6 +485,53 @@ fn resolve_db_path(arg: &DbPathArg) -> PathBuf {
     default_db_path()
 }
 
+/// Sidecar JSON written on successful `fqs serve` bind so clients (TEITOK PHP, shell) can discover
+/// the HTTP base URL without hard-coding port 8787. Lives next to the catalog DB.
+fn fqs_http_runtime_path(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("fqs-http.json")
+}
+
+/// Host to advertise in `fqs-http.json` for same-machine consumers (e.g. PHP-FPM → loopback).
+fn loopback_url_host(bind_host: &str) -> String {
+    match bind_host.trim() {
+        "" | "0.0.0.0" | "::" | "[::]" => "127.0.0.1".to_string(),
+        h => h.to_string(),
+    }
+}
+
+fn read_fqs_http_runtime_url(db_path: &Path) -> Option<String> {
+    let path = fqs_http_runtime_path(db_path);
+    let s = fs::read_to_string(&path).ok()?;
+    let v: Value = serde_json::from_str(&s).ok()?;
+    v.get("url")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn write_fqs_http_runtime_file(db_path: &Path, bind_host: &str, port: u16) -> Result<()> {
+    let host = loopback_url_host(bind_host);
+    let url = format!("http://{}:{}", host, port);
+    let path = fqs_http_runtime_path(db_path);
+    let ts = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "".to_string());
+    let v = json!({
+        "url": url,
+        "updated_at": ts,
+        "db_path": db_path.to_string_lossy(),
+    });
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, serde_json::to_string_pretty(&v)?)?;
+    Ok(())
+}
+
 fn default_db_path() -> PathBuf {
     #[cfg(target_os = "windows")]
     {
@@ -866,6 +913,16 @@ fn handle_status(args: StatusArgs) -> Result<()> {
         } else {
             anyhow::bail!("--url must be an http:// URL (example: http://127.0.0.1:8787)")
         }
+    } else if let Some(runtime_url) = read_fqs_http_runtime_url(&db_path) {
+        if let Some((h, p, path)) = parse_http_url_target(&runtime_url) {
+            let effective = format!("http://{}:{}{}", h, p, path);
+            (h, p, path, effective)
+        } else {
+            anyhow::bail!(
+                "Invalid \"url\" in {} (expected http://host:port/...)",
+                fqs_http_runtime_path(&db_path).display()
+            )
+        }
     } else {
         (
             args.host.clone(),
@@ -886,14 +943,17 @@ fn handle_status(args: StatusArgs) -> Result<()> {
         Ok((ok, line)) => (ok, line, String::new()),
         Err(e) => (false, String::new(), e.to_string()),
     };
+    // Top-level `ok` matches HTTP reachability (same notion TEITOK uses for FQS query routing).
+    // The status command still exits 0 after printing JSON so scripts can parse output; use `ok` for health.
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
-            "ok": true,
+            "ok": http_ok,
             "operation": "status",
             "db_path": db_path,
             "http": {
                 "url": effective_url,
+                "runtime_file": fqs_http_runtime_path(&db_path),
                 "health_path": health_path,
                 "ok": http_ok,
                 "status_line": status_line,
@@ -1157,6 +1217,33 @@ async fn http_log_middleware(
     response
 }
 
+/// Canonical query-language id for the given backend, or an error if the dialect does not match
+/// the executor (e.g. `manatee-cql` with `pando`). Translation between dialects belongs to callers
+/// or to flexicorp-pando / Manatee, not FQS.
+fn query_language_effective_for_backend(backend: &str, requested_language: &str) -> Result<String> {
+    let t = requested_language.trim();
+    let lower = t.to_ascii_lowercase();
+    match backend {
+        "pando" => match lower.as_str() {
+            "" | "auto" => Ok("pando-cql".to_string()),
+            "pando-cql" => Ok("pando-cql".to_string()),
+            _ => anyhow::bail!(
+                "Query language '{}' is not supported for backend 'pando' (use 'pando-cql' or 'auto')",
+                if t.is_empty() { "(empty)" } else { t }
+            ),
+        },
+        "cqp" => match lower.as_str() {
+            "" | "auto" => Ok("cwb-cql".to_string()),
+            "cwb-cql" => Ok("cwb-cql".to_string()),
+            _ => anyhow::bail!(
+                "Query language '{}' is not supported for backend 'cqp' (use 'cwb-cql' or 'auto')",
+                if t.is_empty() { "(empty)" } else { t }
+            ),
+        },
+        _ => anyhow::bail!("Unknown backend for query language validation: {}", backend),
+    }
+}
+
 fn execute_query(
     corpus: &CorpusEntry,
     corpus_id: &str,
@@ -1188,16 +1275,8 @@ fn execute_query(
     let (effective_language, exec_kind, exec_binary, exec_target, payload, exit_code) =
         match backend.as_str() {
             "pando" => {
-                let effective = if requested_language == "auto" {
-                    "pando-cql".to_string()
-                } else {
-                    requested_language.clone()
-                };
-                let pando_query = if effective == "pando-cql" {
-                    normalize_pando_query(query_text)
-                } else {
-                    query_text.to_string()
-                };
+                let effective = query_language_effective_for_backend("pando", &requested_language)?;
+                let pando_query = normalize_pando_query(query_text);
                 let exec = run_pando_query(corpus, &pando_query, start, size)?;
                 (
                     effective,
@@ -1209,11 +1288,7 @@ fn execute_query(
                 )
             }
             "cqp" => {
-                let effective = if requested_language == "auto" {
-                    "cwb-cql".to_string()
-                } else {
-                    requested_language.clone()
-                };
+                let effective = query_language_effective_for_backend("cqp", &requested_language)?;
                 let prefer_flexicorp = corpus.supports_xml
                     || corpus
                         .settings
@@ -1309,6 +1384,14 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("Failed to bind HTTP server at {addr}"))?;
+    let http_runtime_warning = match write_fqs_http_runtime_file(&db_path, &args.host, args.port) {
+        Ok(()) => None::<String>,
+        Err(e) => Some(format!(
+            "could not write {}: {}",
+            fqs_http_runtime_path(&db_path).display(),
+            e
+        )),
+    };
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -1316,6 +1399,7 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
             "operation": "serve",
             "address": addr,
             "db_path": db_path,
+            "http_runtime_file": fqs_http_runtime_path(&db_path),
             "fcs_database": args.fcs_database,
             "server_name": args.server_name,
             "test_mode": args.test,
@@ -1323,7 +1407,8 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
             "log_max_bytes": args.log_max_bytes,
             "log_keep_files": args.log_keep_files,
             "session_ttl_minutes": args.session_ttl_minutes,
-            "log_warning": request_log_warning
+            "log_warning": request_log_warning,
+            "http_runtime_warning": http_runtime_warning
         }))?
     );
     axum::serve(listener, app).await.context("HTTP server failed")?;
