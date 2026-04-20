@@ -1751,6 +1751,60 @@ fn fcs_resource_pid(corpus: &CorpusEntry) -> String {
         .to_string()
 }
 
+fn fcs_languages(corpus: &CorpusEntry) -> Vec<String> {
+    let mut langs: Vec<String> = Vec::new();
+    let push_lang = |langs: &mut Vec<String>, value: &str| {
+        let t = value.trim();
+        if t.is_empty() {
+            return;
+        }
+        if !langs.iter().any(|x| x == t) {
+            langs.push(t.to_string());
+        }
+    };
+
+    if let Some(arr) = corpus
+        .capabilities
+        .get("fcs")
+        .and_then(|v| v.get("languages"))
+        .and_then(|v| v.as_array())
+    {
+        for v in arr {
+            if let Some(s) = v.as_str() {
+                push_lang(&mut langs, s);
+            }
+        }
+    }
+    if langs.is_empty() {
+        if let Some(s) = corpus
+            .capabilities
+            .get("fcs")
+            .and_then(|v| v.get("language"))
+            .and_then(|v| v.as_str())
+        {
+            push_lang(&mut langs, s);
+        }
+    }
+    if langs.is_empty() {
+        if let Some(arr) = corpus.settings.get("languages").and_then(|v| v.as_array()) {
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    push_lang(&mut langs, s);
+                }
+            }
+        }
+    }
+    if langs.is_empty() {
+        if let Some(s) = corpus.settings.get("language").and_then(|v| v.as_str()) {
+            push_lang(&mut langs, s);
+        }
+    }
+    if langs.is_empty() {
+        langs.push("und".to_string());
+    }
+    langs
+}
+
 fn build_fcs_explain_xml(
     corpora: &[CorpusEntry],
     host: &str,
@@ -1860,13 +1914,18 @@ fn build_fcs_endpoint_description_xml(corpora: &[CorpusEntry]) -> String {
             })
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "word".to_string());
+        let languages_xml = fcs_languages(corpus)
+            .into_iter()
+            .map(|lang| format!("<ed:Language>{}</ed:Language>", xml_escape(&lang)))
+            .collect::<Vec<_>>()
+            .join("");
 
         resources_xml.push_str(&format!(
             "<ed:Resource pid=\"{pid}\">\
 <ed:Title xml:lang=\"en\">{title}</ed:Title>\
 <ed:Description xml:lang=\"en\">{desc_xml}</ed:Description>\
 <ed:LandingPageURI>{landing_xml}</ed:LandingPageURI>\
-<ed:Languages><ed:Language>und</ed:Language></ed:Languages>\
+<ed:Languages>{languages_xml}</ed:Languages>\
 <ed:AvailableDataViews ref=\"{dataviews}\"/>\
 <ed:AvailableLayers ref=\"{layers}\"/>\
 </ed:Resource>"
@@ -2559,29 +2618,49 @@ fn run_pando_probe(corpus: &CorpusEntry) -> Result<Option<i64>> {
         .filter(|s| !s.is_empty())
         .unwrap_or(r#"[word=".*"]"#);
     let query = normalize_pando_query(raw);
-    let binary = resolve_flexicorp_pando_bin(corpus)?;
+    let binaries = resolve_flexicorp_pando_bins(corpus);
     let index_dir = resolve_pando_index_dir(corpus)?;
-    let mut cmd = ProcessCommand::new(&binary);
-    cmd.arg("--index-dir")
-        .arg(&index_dir)
-        .arg("-q")
-        .arg(&query)
-        .arg("--offset")
-        .arg("0")
-        .arg("--limit")
-        .arg("1")
-        .arg("--max-total")
-        .arg("0");
-
-    let output = cmd
-        .output()
-        .with_context(|| format!("Failed to execute flexicorp-pando probe '{}'", binary))?;
+    let mut output = None;
+    let mut used_binary = String::new();
+    let mut spawn_errors: Vec<String> = Vec::new();
+    for binary in &binaries {
+        let mut cmd = ProcessCommand::new(binary);
+        cmd.arg("--index-dir")
+            .arg(&index_dir)
+            .arg("-q")
+            .arg(&query)
+            .arg("--offset")
+            .arg("0")
+            .arg("--limit")
+            .arg("1")
+            .arg("--max-total")
+            .arg("0");
+        match cmd.output() {
+            Ok(out) => {
+                output = Some(out);
+                used_binary = binary.clone();
+                break;
+            }
+            Err(err) => {
+                spawn_errors.push(format!("{binary}: {err}"));
+            }
+        }
+    }
+    let output = if let Some(out) = output {
+        out
+    } else {
+        anyhow::bail!(
+            "Failed to execute flexicorp-pando probe. Tried: {}",
+            spawn_errors.join(" ; ")
+        );
+    };
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
         anyhow::bail!(
-            "flexicorp-pando probe failed (exit {}): stdout='{}' stderr='{}'",
+            "flexicorp-pando probe failed via '{}' (exit {}): stdout='{}' stderr='{}'",
+            used_binary,
             exit_code,
             stdout.trim(),
             stderr.trim()
@@ -2665,29 +2744,49 @@ struct CqpExecResult {
 }
 
 fn run_pando_query(corpus: &CorpusEntry, query_text: &str, start: u32, size: u32) -> Result<PandoExecResult> {
-    let binary = resolve_flexicorp_pando_bin(corpus)?;
+    let binaries = resolve_flexicorp_pando_bins(corpus);
     let index_dir = resolve_pando_index_dir(corpus)?;
-    let mut cmd = ProcessCommand::new(&binary);
-    cmd.arg("--index-dir")
-        .arg(&index_dir)
-        .arg("-q")
-        .arg(query_text)
-        .arg("--offset")
-        .arg(start.to_string())
-        .arg("--limit")
-        .arg(size.to_string())
-        .arg("--max-total")
-        .arg("10000");
-
-    let output = cmd
-        .output()
-        .with_context(|| format!("Failed to execute '{}'", binary))?;
+    let mut output = None;
+    let mut binary = String::new();
+    let mut spawn_errors: Vec<String> = Vec::new();
+    for candidate in &binaries {
+        let mut cmd = ProcessCommand::new(candidate);
+        cmd.arg("--index-dir")
+            .arg(&index_dir)
+            .arg("-q")
+            .arg(query_text)
+            .arg("--offset")
+            .arg(start.to_string())
+            .arg("--limit")
+            .arg(size.to_string())
+            .arg("--max-total")
+            .arg("10000");
+        match cmd.output() {
+            Ok(out) => {
+                output = Some(out);
+                binary = candidate.clone();
+                break;
+            }
+            Err(err) => {
+                spawn_errors.push(format!("{candidate}: {err}"));
+            }
+        }
+    }
+    let output = if let Some(out) = output {
+        out
+    } else {
+        anyhow::bail!(
+            "Failed to execute flexicorp-pando query binary. Tried: {}",
+            spawn_errors.join(" ; ")
+        );
+    };
     let exit_code = output.status.code().unwrap_or(-1);
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
         anyhow::bail!(
-            "flexicorp-pando query failed (exit {}): stdout='{}' stderr='{}'",
+            "flexicorp-pando query failed via '{}' (exit {}): stdout='{}' stderr='{}'",
+            binary,
             exit_code,
             stdout.trim(),
             stderr.trim()
@@ -3017,7 +3116,13 @@ fn parse_cqp_total(stdout: &str) -> Option<i64> {
     })
 }
 
-fn resolve_flexicorp_pando_bin(corpus: &CorpusEntry) -> Result<String> {
+fn resolve_flexicorp_pando_bins(corpus: &CorpusEntry) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push_unique = |value: String| {
+        if !out.iter().any(|v| v == &value) {
+            out.push(value);
+        }
+    };
     if let Some(v) = corpus
         .settings
         .get("pando_cli")
@@ -3025,12 +3130,12 @@ fn resolve_flexicorp_pando_bin(corpus: &CorpusEntry) -> Result<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        return Ok(v.to_string());
+        push_unique(v.to_string());
     }
     if let Ok(v) = std::env::var("FLEXICORP_PANDO_BIN") {
         let vv = v.trim();
         if !vv.is_empty() {
-            return Ok(vv.to_string());
+            push_unique(vv.to_string());
         }
     }
     let repo_default = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -3040,11 +3145,31 @@ fn resolve_flexicorp_pando_bin(corpus: &CorpusEntry) -> Result<String> {
         .join("flexicorp_pando")
         .join("build")
         .join("flexicorp-pando");
-    if repo_default.exists() {
-        return Ok(repo_default.display().to_string());
+    if is_likely_executable_file(&repo_default) {
+        push_unique(repo_default.display().to_string());
     }
     // Final fallback: rely on PATH.
-    Ok("flexicorp-pando".to_string())
+    push_unique("flexicorp-pando".to_string());
+    out
+}
+
+fn is_likely_executable_file(path: &Path) -> bool {
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return (meta.permissions().mode() & 0o111) != 0;
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn resolve_pando_index_dir(corpus: &CorpusEntry) -> Result<PathBuf> {
