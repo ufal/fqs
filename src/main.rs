@@ -46,12 +46,141 @@ enum Command {
     Serve(ServeArgs),
     /// Check DB + HTTP server health (without starting server)
     Status(StatusArgs),
+    /// Reindex queue/history scaffolding (control-plane)
+    Reindex(ReindexArgs),
 }
 
 #[derive(Args, Debug)]
 struct CorporaArgs {
     #[command(subcommand)]
     action: CorporaAction,
+}
+
+#[derive(Args, Debug)]
+struct ReindexArgs {
+    #[command(subcommand)]
+    action: ReindexAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum ReindexAction {
+    /// Enqueue a reindex job (scaffolding only; worker dispatch follows in next phase)
+    Enqueue(ReindexEnqueueArgs),
+    /// List queued/running jobs
+    Queue(ReindexQueueArgs),
+    /// Show reindex history (includes completion timestamps)
+    History(ReindexHistoryArgs),
+    /// Mark a job started (worker scaffolding hook)
+    MarkStarted(ReindexMarkStartedArgs),
+    /// Mark a job finished (worker scaffolding hook)
+    MarkFinished(ReindexMarkFinishedArgs),
+    /// Dispatch queued jobs to healthy workers once (scaffolding scheduler tick)
+    DispatchOnce(ReindexDispatchOnceArgs),
+    /// Worker heartbeat (CLI/testing hook)
+    WorkerHeartbeat(ReindexWorkerHeartbeatArgs),
+}
+
+#[derive(Args, Debug)]
+struct ReindexEnqueueArgs {
+    /// Corpus id from FQS catalog
+    #[arg(long)]
+    corpus: String,
+    /// Comma-separated backend targets (e.g. pando,cqp,clickhouse)
+    #[arg(long)]
+    backends: Option<String>,
+    /// Scheduling priority (higher number = sooner)
+    #[arg(long, default_value_t = 0)]
+    priority: i64,
+    /// Origin tag for diagnostics (e.g. teitok, cli, api)
+    #[arg(long, default_value = "cli")]
+    origin: String,
+    /// Request role (admin required for enqueue)
+    #[arg(long, default_value = "admin")]
+    request_role: String,
+    /// Optional note/message
+    #[arg(long)]
+    note: Option<String>,
+    #[command(flatten)]
+    db: DbPathArg,
+}
+
+#[derive(Args, Debug)]
+struct ReindexQueueArgs {
+    /// Optional status filter: queued|running|completed|failed|cancelled
+    #[arg(long)]
+    status: Option<String>,
+    /// Optional corpus id filter
+    #[arg(long)]
+    corpus: Option<String>,
+    /// Max rows
+    #[arg(long, default_value_t = 100)]
+    limit: usize,
+    #[command(flatten)]
+    db: DbPathArg,
+}
+
+#[derive(Args, Debug)]
+struct ReindexHistoryArgs {
+    /// Optional corpus id filter
+    #[arg(long)]
+    corpus: Option<String>,
+    /// Max rows
+    #[arg(long, default_value_t = 200)]
+    limit: usize,
+    #[command(flatten)]
+    db: DbPathArg,
+}
+
+#[derive(Args, Debug)]
+struct ReindexMarkStartedArgs {
+    #[arg(long)]
+    job_id: String,
+    #[arg(long)]
+    worker_id: Option<String>,
+    #[command(flatten)]
+    db: DbPathArg,
+}
+
+#[derive(Args, Debug)]
+struct ReindexMarkFinishedArgs {
+    #[arg(long)]
+    job_id: String,
+    #[arg(long, default_value_t = false)]
+    ok: bool,
+    #[arg(long)]
+    message: Option<String>,
+    #[arg(long)]
+    error: Option<String>,
+    /// Optional result JSON string
+    #[arg(long)]
+    result_json: Option<String>,
+    #[command(flatten)]
+    db: DbPathArg,
+}
+
+#[derive(Args, Debug)]
+struct ReindexDispatchOnceArgs {
+    /// Default max concurrent jobs per worker when worker heartbeat does not set it
+    #[arg(long, default_value_t = 1)]
+    default_worker_max_concurrent: i64,
+    #[command(flatten)]
+    db: DbPathArg,
+}
+
+#[derive(Args, Debug)]
+struct ReindexWorkerHeartbeatArgs {
+    #[arg(long)]
+    worker_id: String,
+    #[arg(long, default_value_t = 1)]
+    max_concurrent: i64,
+    /// Optional host label for diagnostics
+    #[arg(long)]
+    host: Option<String>,
+    /// Optional capabilities CSV (e.g. pando,cqp,clickhouse)
+    #[arg(long)]
+    capabilities: Option<String>,
+    #[command(flatten)]
+    db: DbPathArg,
 }
 
 #[derive(Subcommand, Debug)]
@@ -191,6 +320,46 @@ struct HttpCorporaQuery {
     request_role: Option<String>,
     /// Filter by browse tag (case-insensitive)
     tag: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HttpReindexJobsQuery {
+    status: Option<String>,
+    corpus: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HttpReindexEnqueueRequest {
+    corpus: String,
+    backends: Option<Vec<String>>,
+    priority: Option<i64>,
+    request_role: Option<String>,
+    origin: Option<String>,
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HttpReindexWorkerHeartbeatRequest {
+    worker_id: String,
+    max_concurrent: Option<i64>,
+    host: Option<String>,
+    capabilities: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HttpReindexMarkStartedRequest {
+    job_id: String,
+    worker_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct HttpReindexMarkFinishedRequest {
+    job_id: String,
+    ok: Option<bool>,
+    message: Option<String>,
+    error: Option<String>,
+    result: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -411,6 +580,49 @@ struct CorpusEntry {
     updated_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReindexJobEntry {
+    job_id: String,
+    corpus_id: String,
+    status: String,
+    priority: i64,
+    requested_backends: Vec<String>,
+    requested_by_role: Option<String>,
+    origin: Option<String>,
+    message: Option<String>,
+    last_error: Option<String>,
+    worker_id: Option<String>,
+    requested_at: String,
+    started_at: Option<String>,
+    finished_at: Option<String>,
+    updated_at: String,
+    request: Value,
+    result: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReindexHistoryEntry {
+    id: i64,
+    corpus_id: String,
+    job_id: Option<String>,
+    event: String,
+    at: String,
+    details: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReindexWorkerEntry {
+    worker_id: String,
+    status: String,
+    max_concurrent: i64,
+    host: Option<String>,
+    capabilities: Vec<String>,
+    running_jobs: i64,
+    last_heartbeat_at: String,
+    created_at: String,
+    updated_at: String,
+}
+
 fn default_environment() -> String {
     "live".to_string()
 }
@@ -577,6 +789,7 @@ async fn main() -> Result<()> {
         Command::Query(args) => handle_query(args)?,
         Command::Serve(args) => run_http_server(args).await?,
         Command::Status(args) => handle_status(args)?,
+        Command::Reindex(args) => handle_reindex(args)?,
     }
     Ok(())
 }
@@ -776,6 +989,131 @@ fn handle_corpora(args: CorporaArgs) -> Result<()> {
                 "results": results
             });
             println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+    }
+    Ok(())
+}
+
+fn handle_reindex(args: ReindexArgs) -> Result<()> {
+    match args.action {
+        ReindexAction::Enqueue(a) => {
+            let conn = open_db(&resolve_db_path(&a.db))?;
+            let role = normalize_role(Some(&a.request_role));
+            if role != "admin" {
+                anyhow::bail!("Reindex enqueue requires admin role (got '{}')", role);
+            }
+            let _ = get_corpus(&conn, &a.corpus)
+                .with_context(|| format!("Corpus '{}' not found in FQS catalog", a.corpus))?;
+            let backends = parse_backend_csv(a.backends.as_deref());
+            let req = json!({
+                "corpus": a.corpus,
+                "reindex_backends": backends,
+                "priority": a.priority,
+                "origin": a.origin,
+                "request_role": role,
+                "note": a.note,
+            });
+            let created = enqueue_reindex_job(
+                &conn,
+                &a.corpus,
+                &backends,
+                a.priority,
+                Some(role.as_str()),
+                Some(a.origin.as_str()),
+                a.note.as_deref(),
+                &req,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "operation": "reindex_enqueue",
+                    "job": created
+                }))?
+            );
+        }
+        ReindexAction::Queue(a) => {
+            let conn = open_db(&resolve_db_path(&a.db))?;
+            let rows = list_reindex_jobs(
+                &conn,
+                a.status.as_deref(),
+                a.corpus.as_deref(),
+                clamp_limit(a.limit, 1, 1000),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&rows)?);
+        }
+        ReindexAction::History(a) => {
+            let conn = open_db(&resolve_db_path(&a.db))?;
+            let rows = list_reindex_history(&conn, a.corpus.as_deref(), clamp_limit(a.limit, 1, 5000))?;
+            println!("{}", serde_json::to_string_pretty(&rows)?);
+        }
+        ReindexAction::MarkStarted(a) => {
+            let conn = open_db(&resolve_db_path(&a.db))?;
+            let updated = mark_reindex_job_started(&conn, &a.job_id, a.worker_id.as_deref())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "operation": "reindex_mark_started",
+                    "job": updated
+                }))?
+            );
+        }
+        ReindexAction::MarkFinished(a) => {
+            let conn = open_db(&resolve_db_path(&a.db))?;
+            let result_val = a
+                .result_json
+                .as_deref()
+                .map(|s| serde_json::from_str::<Value>(s))
+                .transpose()
+                .context("Invalid --result-json payload (must be valid JSON)")?;
+            let updated = mark_reindex_job_finished(
+                &conn,
+                &a.job_id,
+                a.ok,
+                a.message.as_deref(),
+                a.error.as_deref(),
+                result_val.as_ref(),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "operation": "reindex_mark_finished",
+                    "job": updated
+                }))?
+            );
+        }
+        ReindexAction::DispatchOnce(a) => {
+            let db_path = resolve_db_path(&a.db);
+            let assigned = dispatch_reindex_once_path(&db_path, a.default_worker_max_concurrent)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "operation": "reindex_dispatch_once",
+                    "assigned": assigned
+                }))?
+            );
+        }
+        ReindexAction::WorkerHeartbeat(a) => {
+            let conn = open_db(&resolve_db_path(&a.db))?;
+            let caps = parse_backend_csv(a.capabilities.as_deref());
+            let worker = upsert_reindex_worker_heartbeat(
+                &conn,
+                &a.worker_id,
+                a.max_concurrent.max(1),
+                a.host.as_deref(),
+                &caps,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "operation": "reindex_worker_heartbeat",
+                    "worker": worker
+                }))?
+            );
         }
     }
     Ok(())
@@ -1376,9 +1714,22 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         .route("/corpora", get(http_list_corpora))
         .route("/labels", get(http_browse_labels))
         .route("/fcs", get(http_fcs))
+        .route("/reindex/jobs", get(http_reindex_jobs).post(http_reindex_enqueue))
+        .route("/reindex/history", get(http_reindex_history))
+        .route("/reindex/workers/heartbeat", post(http_reindex_worker_heartbeat))
+        .route("/reindex/jobs/mark-started", post(http_reindex_mark_started))
+        .route("/reindex/jobs/mark-finished", post(http_reindex_mark_finished))
         .route("/query", post(http_query))
         .layer(middleware::from_fn_with_state(state.clone(), http_log_middleware))
         .with_state(state);
+
+    let dispatch_db_path = db_path.clone();
+    tokio::spawn(async move {
+        loop {
+            sleep(Duration::from_secs(3)).await;
+            let _ = dispatch_reindex_once_path(&dispatch_db_path, 1);
+        }
+    });
 
     let addr = format!("{}:{}", args.host, args.port);
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -1438,6 +1789,12 @@ async fn http_root_with_state(State(state): State<HttpAppState>) -> Json<Value> 
             {"method":"GET", "path":"/corpora", "description":"List corpora (query params: request_role, environment, include_noncurrent, tag)"},
             {"method":"GET", "path":"/labels", "description":"Distinct browse labels for catalog filtering"},
             {"method":"GET", "path":"/fcs", "description":"FCS/SRU-style endpoint"},
+            {"method":"GET", "path":"/reindex/jobs", "description":"List reindex queue (status/corpus/limit)"},
+            {"method":"POST", "path":"/reindex/jobs", "description":"Enqueue reindex job (admin role)"},
+            {"method":"GET", "path":"/reindex/history", "description":"Reindex history log (corpus/limit)"},
+            {"method":"POST", "path":"/reindex/workers/heartbeat", "description":"Worker heartbeat + capacity"},
+            {"method":"POST", "path":"/reindex/jobs/mark-started", "description":"Worker callback: mark started"},
+            {"method":"POST", "path":"/reindex/jobs/mark-finished", "description":"Worker callback: mark finished"},
             {"method":"POST", "path":"/query", "description":"Run query (JSON body: corpus, query, language?, start?, size?, request_role?)"}
         ]
     }))
@@ -1489,6 +1846,119 @@ async fn http_browse_labels(
     labels.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
     labels.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
     Ok(Json(json!({"ok": true, "role": role, "labels": labels})))
+}
+
+async fn http_reindex_jobs(
+    State(state): State<HttpAppState>,
+    AxumQuery(params): AxumQuery<HttpReindexJobsQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let conn = open_db(&state.db_path).map_err(to_http_err)?;
+    let rows = list_reindex_jobs(
+        &conn,
+        params.status.as_deref(),
+        params.corpus.as_deref(),
+        clamp_limit(params.limit.unwrap_or(100), 1, 1000),
+    )
+    .map_err(to_http_err)?;
+    Ok(Json(json!({"ok": true, "jobs": rows})))
+}
+
+async fn http_reindex_history(
+    State(state): State<HttpAppState>,
+    AxumQuery(params): AxumQuery<HttpReindexJobsQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let conn = open_db(&state.db_path).map_err(to_http_err)?;
+    let rows = list_reindex_history(
+        &conn,
+        params.corpus.as_deref(),
+        clamp_limit(params.limit.unwrap_or(200), 1, 5000),
+    )
+    .map_err(to_http_err)?;
+    Ok(Json(json!({"ok": true, "history": rows})))
+}
+
+async fn http_reindex_enqueue(
+    State(state): State<HttpAppState>,
+    Json(req): Json<HttpReindexEnqueueRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let role = normalize_role(req.request_role.as_deref());
+    if role != "admin" {
+        return Err((StatusCode::FORBIDDEN, "Reindex enqueue requires admin role".to_string()));
+    }
+    let conn = open_db(&state.db_path).map_err(to_http_err)?;
+    let _ = get_corpus(&conn, &req.corpus).map_err(to_http_err)?;
+    let mut backends = req.backends.unwrap_or_default();
+    backends.retain(|x| !x.trim().is_empty());
+    if backends.is_empty() {
+        backends.push("auto".to_string());
+    }
+    let payload = json!({
+        "corpus": req.corpus,
+        "reindex_backends": backends,
+        "priority": req.priority.unwrap_or(0),
+        "request_role": role,
+        "origin": req.origin.clone().unwrap_or_else(|| "http".to_string()),
+        "note": req.note,
+    });
+    let created = enqueue_reindex_job(
+        &conn,
+        &req.corpus,
+        &backends,
+        req.priority.unwrap_or(0),
+        Some(role.as_str()),
+        req.origin.as_deref().or(Some("http")),
+        req.note.as_deref(),
+        &payload,
+    )
+    .map_err(to_http_err)?;
+    Ok(Json(json!({"ok": true, "job": created})))
+}
+
+async fn http_reindex_worker_heartbeat(
+    State(state): State<HttpAppState>,
+    Json(req): Json<HttpReindexWorkerHeartbeatRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if req.worker_id.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "worker_id is required".to_string()));
+    }
+    let conn = open_db(&state.db_path).map_err(to_http_err)?;
+    let caps = req.capabilities.unwrap_or_default();
+    let max_c = req.max_concurrent.unwrap_or(1).max(1);
+    let worker = upsert_reindex_worker_heartbeat(&conn, &req.worker_id, max_c, req.host.as_deref(), &caps)
+        .map_err(to_http_err)?;
+    Ok(Json(json!({"ok": true, "worker": worker})))
+}
+
+async fn http_reindex_mark_started(
+    State(state): State<HttpAppState>,
+    Json(req): Json<HttpReindexMarkStartedRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if req.job_id.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "job_id is required".to_string()));
+    }
+    let conn = open_db(&state.db_path).map_err(to_http_err)?;
+    let updated = mark_reindex_job_started(&conn, &req.job_id, req.worker_id.as_deref()).map_err(to_http_err)?;
+    Ok(Json(json!({"ok": true, "job": updated})))
+}
+
+async fn http_reindex_mark_finished(
+    State(state): State<HttpAppState>,
+    Json(req): Json<HttpReindexMarkFinishedRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if req.job_id.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "job_id is required".to_string()));
+    }
+    let conn = open_db(&state.db_path).map_err(to_http_err)?;
+    let updated = mark_reindex_job_finished(
+        &conn,
+        &req.job_id,
+        req.ok.unwrap_or(false),
+        req.message.as_deref(),
+        req.error.as_deref(),
+        req.result.as_ref(),
+    )
+    .map_err(to_http_err)?;
+    Ok(Json(json!({"ok": true, "job": updated})))
 }
 
 async fn http_query(
@@ -1690,6 +2160,33 @@ fn normalize_role(role: Option<&str>) -> String {
         "admin" | "server_admin" | "corpus_admin" => "admin".to_string(),
         _ => "visitor".to_string(),
     }
+}
+
+fn parse_backend_csv(raw: Option<&str>) -> Vec<String> {
+    let Some(txt) = raw else {
+        return vec!["auto".to_string()];
+    };
+    let mut out: Vec<String> = txt
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if out.is_empty() {
+        out.push("auto".to_string());
+    }
+    out
+}
+
+fn clamp_limit(v: usize, min_v: usize, max_v: usize) -> usize {
+    v.max(min_v).min(max_v)
+}
+
+fn normalize_reindex_status(status: Option<&str>) -> Option<String> {
+    let s = status?.trim().to_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    Some(s)
 }
 
 fn is_http_access_allowed(corpus: &CorpusEntry, role: &str) -> bool {
@@ -2116,6 +2613,50 @@ CREATE TABLE IF NOT EXISTS active_sessions (
   last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_active_sessions_last_seen_at ON active_sessions(last_seen_at);
+
+CREATE TABLE IF NOT EXISTS reindex_jobs (
+  job_id TEXT PRIMARY KEY,
+  corpus_id TEXT NOT NULL,
+  status TEXT NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 0,
+  requested_backends_json TEXT NOT NULL DEFAULT '[]',
+  requested_by_role TEXT,
+  origin TEXT,
+  message TEXT,
+  last_error TEXT,
+  worker_id TEXT,
+  request_json TEXT NOT NULL DEFAULT '{}',
+  result_json TEXT NOT NULL DEFAULT '{}',
+  requested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  started_at TEXT,
+  finished_at TEXT,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_reindex_jobs_status_priority ON reindex_jobs(status, priority DESC, requested_at ASC);
+CREATE INDEX IF NOT EXISTS idx_reindex_jobs_corpus ON reindex_jobs(corpus_id);
+
+CREATE TABLE IF NOT EXISTS reindex_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  corpus_id TEXT NOT NULL,
+  job_id TEXT,
+  event TEXT NOT NULL,
+  details_json TEXT NOT NULL DEFAULT '{}',
+  at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_reindex_history_corpus_at ON reindex_history(corpus_id, at DESC);
+CREATE INDEX IF NOT EXISTS idx_reindex_history_job_at ON reindex_history(job_id, at DESC);
+
+CREATE TABLE IF NOT EXISTS reindex_workers (
+  worker_id TEXT PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'online',
+  max_concurrent INTEGER NOT NULL DEFAULT 1,
+  host TEXT,
+  capabilities_json TEXT NOT NULL DEFAULT '[]',
+  last_heartbeat_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_reindex_workers_heartbeat ON reindex_workers(last_heartbeat_at DESC);
 "#,
     )
     .context("Failed to initialize schema")?;
@@ -2293,6 +2834,433 @@ fn row_to_corpus(row: &rusqlite::Row<'_>) -> rusqlite::Result<CorpusEntry> {
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
     })
+}
+
+fn row_to_reindex_job(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReindexJobEntry> {
+    let requested_backends_json: String = row.get("requested_backends_json")?;
+    let request_json: String = row.get("request_json")?;
+    let result_json: String = row.get("result_json")?;
+    let requested_backends =
+        serde_json::from_str::<Vec<String>>(&requested_backends_json).unwrap_or_default();
+    let request = serde_json::from_str::<Value>(&request_json).unwrap_or_else(|_| json!({}));
+    let result = serde_json::from_str::<Value>(&result_json).unwrap_or_else(|_| json!({}));
+    Ok(ReindexJobEntry {
+        job_id: row.get("job_id")?,
+        corpus_id: row.get("corpus_id")?,
+        status: row.get("status")?,
+        priority: row.get("priority")?,
+        requested_backends,
+        requested_by_role: row.get("requested_by_role")?,
+        origin: row.get("origin")?,
+        message: row.get("message")?,
+        last_error: row.get("last_error")?,
+        worker_id: row.get("worker_id")?,
+        requested_at: row.get("requested_at")?,
+        started_at: row.get("started_at")?,
+        finished_at: row.get("finished_at")?,
+        updated_at: row.get("updated_at")?,
+        request,
+        result,
+    })
+}
+
+fn row_to_reindex_history(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReindexHistoryEntry> {
+    let details_json: String = row.get("details_json")?;
+    let details = serde_json::from_str::<Value>(&details_json).unwrap_or_else(|_| json!({}));
+    Ok(ReindexHistoryEntry {
+        id: row.get("id")?,
+        corpus_id: row.get("corpus_id")?,
+        job_id: row.get("job_id")?,
+        event: row.get("event")?,
+        at: row.get("at")?,
+        details,
+    })
+}
+
+fn row_to_reindex_worker(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReindexWorkerEntry> {
+    let caps_json: String = row.get("capabilities_json")?;
+    let capabilities = serde_json::from_str::<Vec<String>>(&caps_json).unwrap_or_default();
+    let worker_id: String = row.get("worker_id")?;
+    let running_jobs: i64 = row.get("running_jobs")?;
+    Ok(ReindexWorkerEntry {
+        worker_id,
+        status: row.get("status")?,
+        max_concurrent: row.get("max_concurrent")?,
+        host: row.get("host")?,
+        capabilities,
+        running_jobs,
+        last_heartbeat_at: row.get("last_heartbeat_at")?,
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+    })
+}
+
+fn make_reindex_job_id(corpus_id: &str) -> String {
+    let ts = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let cid: String = corpus_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    format!("rj-{}-{}", ts, cid)
+}
+
+fn append_reindex_history_event(
+    conn: &Connection,
+    corpus_id: &str,
+    job_id: Option<&str>,
+    event: &str,
+    details: &Value,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO reindex_history (corpus_id, job_id, event, details_json, at) VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)",
+        params![
+            corpus_id,
+            job_id,
+            event,
+            serde_json::to_string(details).unwrap_or_else(|_| "{}".to_string())
+        ],
+    )
+    .map_err(|e| sqlite_write_err("insert reindex_history", e))?;
+    Ok(())
+}
+
+fn upsert_reindex_worker_heartbeat(
+    conn: &Connection,
+    worker_id: &str,
+    max_concurrent: i64,
+    host: Option<&str>,
+    capabilities: &[String],
+) -> Result<ReindexWorkerEntry> {
+    conn.execute(
+        r#"
+INSERT INTO reindex_workers
+(worker_id, status, max_concurrent, host, capabilities_json, last_heartbeat_at, created_at, updated_at)
+VALUES (?1, 'online', ?2, ?3, ?4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+ON CONFLICT(worker_id) DO UPDATE SET
+  status='online',
+  max_concurrent=excluded.max_concurrent,
+  host=COALESCE(excluded.host, reindex_workers.host),
+  capabilities_json=excluded.capabilities_json,
+  last_heartbeat_at=CURRENT_TIMESTAMP,
+  updated_at=CURRENT_TIMESTAMP
+"#,
+        params![
+            worker_id,
+            max_concurrent.max(1),
+            host,
+            serde_json::to_string(capabilities).unwrap_or_else(|_| "[]".to_string())
+        ],
+    )
+    .map_err(|e| sqlite_write_err("upsert reindex_workers", e))?;
+    get_reindex_worker(conn, worker_id)
+}
+
+fn get_reindex_worker(conn: &Connection, worker_id: &str) -> Result<ReindexWorkerEntry> {
+    conn.query_row(
+        r#"
+SELECT w.worker_id, w.status, w.max_concurrent, w.host, w.capabilities_json,
+       w.last_heartbeat_at, w.created_at, w.updated_at,
+       COALESCE(r.running_jobs, 0) AS running_jobs
+FROM reindex_workers w
+LEFT JOIN (
+  SELECT worker_id, COUNT(1) AS running_jobs
+  FROM reindex_jobs
+  WHERE status = 'running'
+  GROUP BY worker_id
+) r ON r.worker_id = w.worker_id
+WHERE w.worker_id = ?1
+"#,
+        params![worker_id],
+        row_to_reindex_worker,
+    )
+    .with_context(|| format!("Reindex worker '{}' not found", worker_id))
+}
+
+fn list_reindex_workers(conn: &Connection) -> Result<Vec<ReindexWorkerEntry>> {
+    let mut stmt = conn.prepare(
+        r#"
+SELECT w.worker_id, w.status, w.max_concurrent, w.host, w.capabilities_json,
+       w.last_heartbeat_at, w.created_at, w.updated_at,
+       COALESCE(r.running_jobs, 0) AS running_jobs
+FROM reindex_workers w
+LEFT JOIN (
+  SELECT worker_id, COUNT(1) AS running_jobs
+  FROM reindex_jobs
+  WHERE status = 'running'
+  GROUP BY worker_id
+) r ON r.worker_id = w.worker_id
+WHERE w.status = 'online' AND w.last_heartbeat_at >= datetime('now', '-120 seconds')
+ORDER BY w.last_heartbeat_at DESC, w.worker_id ASC
+"#,
+    )?;
+    let rows = stmt
+        .query_map([], row_to_reindex_worker)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn pick_next_queued_job_for_worker(
+    conn: &Connection,
+    worker: &ReindexWorkerEntry,
+) -> Result<Option<ReindexJobEntry>> {
+    let mut stmt = conn.prepare(
+        r#"
+SELECT job_id, corpus_id, status, priority, requested_backends_json, requested_by_role, origin, message, last_error, worker_id, request_json, result_json, requested_at, started_at, finished_at, updated_at
+FROM reindex_jobs
+WHERE status = 'queued'
+ORDER BY priority DESC, requested_at ASC
+LIMIT 50
+"#,
+    )?;
+    let jobs = stmt
+        .query_map([], row_to_reindex_job)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let caps: std::collections::HashSet<String> =
+        worker.capabilities.iter().map(|x| x.trim().to_lowercase()).collect();
+    for job in jobs {
+        if caps.is_empty() || caps.contains("auto") {
+            return Ok(Some(job));
+        }
+        let needed: Vec<String> = if job.requested_backends.is_empty() {
+            vec!["auto".to_string()]
+        } else {
+            job.requested_backends
+                .iter()
+                .map(|x| x.trim().to_lowercase())
+                .filter(|x| !x.is_empty())
+                .collect()
+        };
+        let ok = needed
+            .iter()
+            .all(|b| b == "auto" || caps.contains(b) || (b == "clickql" && caps.contains("clickhouse")));
+        if ok {
+            return Ok(Some(job));
+        }
+    }
+    Ok(None)
+}
+
+fn dispatch_reindex_once(conn: &Connection, default_worker_max_concurrent: i64) -> Result<Vec<ReindexJobEntry>> {
+    let workers = list_reindex_workers(conn)?;
+    let mut assigned: Vec<ReindexJobEntry> = Vec::new();
+    for mut w in workers {
+        if w.max_concurrent <= 0 {
+            w.max_concurrent = default_worker_max_concurrent.max(1);
+        }
+        let available_slots = (w.max_concurrent - w.running_jobs).max(0);
+        if available_slots <= 0 {
+            continue;
+        }
+        for _ in 0..available_slots {
+            let maybe_job = pick_next_queued_job_for_worker(conn, &w)?;
+            let Some(job) = maybe_job else {
+                break;
+            };
+            let started = mark_reindex_job_started(conn, &job.job_id, Some(&w.worker_id))?;
+            append_reindex_history_event(
+                conn,
+                &started.corpus_id,
+                Some(&started.job_id),
+                "dispatched",
+                &json!({
+                    "worker_id": w.worker_id,
+                    "max_concurrent": w.max_concurrent
+                }),
+            )?;
+            assigned.push(started);
+            w.running_jobs += 1;
+        }
+    }
+    Ok(assigned)
+}
+
+fn dispatch_reindex_once_path(db_path: &Path, default_worker_max_concurrent: i64) -> Result<Vec<ReindexJobEntry>> {
+    let conn = open_db(&db_path.to_path_buf())?;
+    dispatch_reindex_once(&conn, default_worker_max_concurrent)
+}
+
+fn enqueue_reindex_job(
+    conn: &Connection,
+    corpus_id: &str,
+    requested_backends: &[String],
+    priority: i64,
+    requested_by_role: Option<&str>,
+    origin: Option<&str>,
+    message: Option<&str>,
+    request: &Value,
+) -> Result<ReindexJobEntry> {
+    let job_id = make_reindex_job_id(corpus_id);
+    conn.execute(
+        r#"
+INSERT INTO reindex_jobs
+(job_id, corpus_id, status, priority, requested_backends_json, requested_by_role, origin, message, request_json, result_json, requested_at, updated_at)
+VALUES (?1, ?2, 'queued', ?3, ?4, ?5, ?6, ?7, ?8, '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+"#,
+        params![
+            job_id,
+            corpus_id,
+            priority,
+            serde_json::to_string(requested_backends).unwrap_or_else(|_| "[]".to_string()),
+            requested_by_role,
+            origin,
+            message,
+            serde_json::to_string(request).unwrap_or_else(|_| "{}".to_string())
+        ],
+    )
+    .map_err(|e| sqlite_write_err("insert reindex_jobs", e))?;
+    append_reindex_history_event(
+        conn,
+        corpus_id,
+        Some(&job_id),
+        "queued",
+        &json!({
+            "priority": priority,
+            "requested_backends": requested_backends,
+            "requested_by_role": requested_by_role,
+            "origin": origin,
+            "message": message
+        }),
+    )?;
+    get_reindex_job(conn, &job_id)
+}
+
+fn get_reindex_job(conn: &Connection, job_id: &str) -> Result<ReindexJobEntry> {
+    conn.query_row(
+        r#"SELECT job_id, corpus_id, status, priority, requested_backends_json, requested_by_role, origin, message, last_error, worker_id, request_json, result_json, requested_at, started_at, finished_at, updated_at
+           FROM reindex_jobs WHERE job_id = ?1"#,
+        params![job_id],
+        row_to_reindex_job,
+    )
+    .with_context(|| format!("Reindex job '{}' not found", job_id))
+}
+
+fn list_reindex_jobs(
+    conn: &Connection,
+    status: Option<&str>,
+    corpus: Option<&str>,
+    limit: usize,
+) -> Result<Vec<ReindexJobEntry>> {
+    let st = normalize_reindex_status(status);
+    let mut sql = String::from(
+        "SELECT job_id, corpus_id, status, priority, requested_backends_json, requested_by_role, origin, message, last_error, worker_id, request_json, result_json, requested_at, started_at, finished_at, updated_at FROM reindex_jobs WHERE 1=1",
+    );
+    if st.is_some() {
+        sql.push_str(" AND status = ?1");
+        if corpus.is_some() {
+            sql.push_str(" AND corpus_id = ?2");
+            sql.push_str(" ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, priority DESC, requested_at ASC LIMIT ?3");
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt
+                .query_map(params![st, corpus, limit as i64], row_to_reindex_job)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            return Ok(rows);
+        }
+        sql.push_str(" ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, priority DESC, requested_at ASC LIMIT ?2");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![st, limit as i64], row_to_reindex_job)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        return Ok(rows);
+    }
+    if corpus.is_some() {
+        sql.push_str(" AND corpus_id = ?1");
+        sql.push_str(" ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, priority DESC, requested_at ASC LIMIT ?2");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![corpus, limit as i64], row_to_reindex_job)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        return Ok(rows);
+    }
+    sql.push_str(
+        " ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, priority DESC, requested_at ASC LIMIT ?1",
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![limit as i64], row_to_reindex_job)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn list_reindex_history(
+    conn: &Connection,
+    corpus: Option<&str>,
+    limit: usize,
+) -> Result<Vec<ReindexHistoryEntry>> {
+    let sql = if corpus.is_some() {
+        "SELECT id, corpus_id, job_id, event, details_json, at FROM reindex_history WHERE corpus_id = ?1 ORDER BY at DESC, id DESC LIMIT ?2"
+    } else {
+        "SELECT id, corpus_id, job_id, event, details_json, at FROM reindex_history ORDER BY at DESC, id DESC LIMIT ?1"
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let rows = if let Some(c) = corpus {
+        stmt.query_map(params![c, limit as i64], row_to_reindex_history)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        stmt.query_map(params![limit as i64], row_to_reindex_history)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    Ok(rows)
+}
+
+fn mark_reindex_job_started(
+    conn: &Connection,
+    job_id: &str,
+    worker_id: Option<&str>,
+) -> Result<ReindexJobEntry> {
+    let existing = get_reindex_job(conn, job_id)?;
+    conn.execute(
+        "UPDATE reindex_jobs SET status='running', worker_id=?2, started_at=COALESCE(started_at, CURRENT_TIMESTAMP), updated_at=CURRENT_TIMESTAMP WHERE job_id=?1",
+        params![job_id, worker_id],
+    )
+    .map_err(|e| sqlite_write_err("update reindex_jobs started", e))?;
+    append_reindex_history_event(
+        conn,
+        &existing.corpus_id,
+        Some(job_id),
+        "started",
+        &json!({"worker_id": worker_id}),
+    )?;
+    get_reindex_job(conn, job_id)
+}
+
+fn mark_reindex_job_finished(
+    conn: &Connection,
+    job_id: &str,
+    ok: bool,
+    message: Option<&str>,
+    error: Option<&str>,
+    result: Option<&Value>,
+) -> Result<ReindexJobEntry> {
+    let existing = get_reindex_job(conn, job_id)?;
+    let status = if ok { "completed" } else { "failed" };
+    conn.execute(
+        "UPDATE reindex_jobs SET status=?2, message=?3, last_error=?4, result_json=?5, finished_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE job_id=?1",
+        params![
+            job_id,
+            status,
+            message,
+            error,
+            serde_json::to_string(&result.cloned().unwrap_or_else(|| json!({}))).unwrap_or_else(|_| "{}".to_string())
+        ],
+    )
+    .map_err(|e| sqlite_write_err("update reindex_jobs finished", e))?;
+    append_reindex_history_event(
+        conn,
+        &existing.corpus_id,
+        Some(job_id),
+        if ok { "completed" } else { "failed" },
+        &json!({"message": message, "error": error}),
+    )?;
+    if ok {
+        append_reindex_history_event(
+            conn,
+            &existing.corpus_id,
+            Some(job_id),
+            "indexed",
+            &json!({"message": message}),
+        )?;
+    }
+    get_reindex_job(conn, job_id)
 }
 
 fn list_corpora(

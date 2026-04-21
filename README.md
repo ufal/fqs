@@ -9,6 +9,14 @@ Current scope:
 - `corpora add` / `corpora list` / `corpora show` commands
 - `query` command with live execution for `pando` corpora (via `flexicorp-pando` CLI)
 - `corpora validate` command (basic + full probe mode)
+- reindex control-plane scaffolding:
+  - `fqs reindex enqueue|queue|history|mark-started|mark-finished`
+  - `fqs reindex dispatch-once` and `fqs reindex worker-heartbeat`
+  - SQLite tables `reindex_jobs` + `reindex_history`
+  - SQLite table `reindex_workers` (heartbeat/capacity)
+  - HTTP routes `GET/POST /reindex/jobs`, `GET /reindex/history`,
+    `POST /reindex/workers/heartbeat`, `POST /reindex/jobs/mark-started`,
+    `POST /reindex/jobs/mark-finished`
 
 This is intentionally minimal: a lightweight test HTTP mode is included. Query execution is currently implemented for `pando` and `cqp`.
 
@@ -64,6 +72,12 @@ Endpoints:
 - `GET /health` — JSON includes `version`, `db_path`, and optional `server_name` (set via `--server-name` or env `FQS_SERVER_NAME`, e.g. to label a deployment or distinguish host vs container)
 - `GET /corpora?request_role=visitor|admin&tag=<browse-label>`
 - `GET /labels` — distinct browse labels (for Kontext-style facets)
+- `GET /reindex/jobs?status=queued&corpus=<id>&limit=100` — queue/running overview
+- `POST /reindex/jobs` — enqueue (`request_role=admin`)
+- `GET /reindex/history?corpus=<id>&limit=200` — history/audit log (includes indexed timestamps)
+- `POST /reindex/workers/heartbeat` — worker liveness/capacity callback
+- `POST /reindex/jobs/mark-started` — worker callback
+- `POST /reindex/jobs/mark-finished` — worker callback
 - `GET /fcs?operation=explain|searchRetrieve|scan&x-corpus=<id>&x-fcs-context=<id>&query=<cql>`
 - `POST /query` with JSON body:
   - `{"corpus":"...","query":"...","language":"auto","start":0,"size":25,"request_role":"visitor","backend":"pando"}`
@@ -94,6 +108,16 @@ cargo run -- query --corpus migrant --q '[word="the"]'
 ```
 
 ## Commands
+
+Reindex scaffolding:
+
+```bash
+cargo run -- reindex enqueue --corpus migrant --backends pando,cqp --priority 10 --origin teitok
+cargo run -- reindex queue --status queued --limit 100
+cargo run -- reindex history --corpus migrant --limit 200
+cargo run -- reindex worker-heartbeat --worker-id worker-a --max-concurrent 2 --capabilities pando,cqp
+cargo run -- reindex dispatch-once --default-worker-max-concurrent 1
+```
 
 Add corpus:
 
