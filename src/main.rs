@@ -4,6 +4,7 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -1723,11 +1724,64 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         .layer(middleware::from_fn_with_state(state.clone(), http_log_middleware))
         .with_state(state);
 
+    let worker_db_path = db_path.clone();
+    let worker_id = format!("fqs-serve-{}", std::process::id());
+    let worker_caps = vec![
+        "auto".to_string(),
+        "manatee".to_string(),
+        "pando".to_string(),
+        "cqp".to_string(),
+        "clickql".to_string(),
+        "clickhouse".to_string(),
+        "blacklab".to_string(),
+        "pmltq".to_string(),
+    ];
+    tokio::spawn(async move {
+        loop {
+            if let Ok(conn) = open_db(&worker_db_path) {
+                let _ = upsert_reindex_worker_heartbeat(
+                    &conn,
+                    &worker_id,
+                    1,
+                    None,
+                    &worker_caps,
+                );
+            }
+            sleep(Duration::from_secs(30)).await;
+        }
+    });
+
     let dispatch_db_path = db_path.clone();
+    let execute_db_path = db_path.clone();
+    let execute_worker_id = format!("fqs-serve-{}", std::process::id());
+    let active_jobs: Arc<Mutex<std::collections::HashSet<String>>> =
+        Arc::new(Mutex::new(std::collections::HashSet::new()));
     tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(3)).await;
-            let _ = dispatch_reindex_once_path(&dispatch_db_path, 1);
+            let assigned = dispatch_reindex_once_path(&dispatch_db_path, 1).unwrap_or_default();
+            for job in assigned {
+                let jid = job.job_id.clone();
+                let mut should_start = false;
+                if let Ok(mut set) = active_jobs.lock() {
+                    if !set.contains(&jid) {
+                        set.insert(jid.clone());
+                        should_start = true;
+                    }
+                }
+                if !should_start {
+                    continue;
+                }
+                let dbp = execute_db_path.clone();
+                let wid = execute_worker_id.clone();
+                let active_jobs_done = Arc::clone(&active_jobs);
+                tokio::task::spawn_blocking(move || {
+                    let _ = execute_reindex_job_for_worker(&dbp, &jid, &wid);
+                    if let Ok(mut set) = active_jobs_done.lock() {
+                        set.remove(&jid);
+                    }
+                });
+            }
         }
     });
 
@@ -1763,6 +1817,176 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         }))?
     );
     axum::serve(listener, app).await.context("HTTP server failed")?;
+    Ok(())
+}
+
+fn truncate_for_job_log(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    s.chars().take(max_chars).collect::<String>() + "…"
+}
+
+fn extract_requested_backends(job: &ReindexJobEntry) -> Vec<String> {
+    if !job.requested_backends.is_empty() {
+        return job
+            .requested_backends
+            .iter()
+            .map(|x| x.trim().to_lowercase())
+            .filter(|x| !x.is_empty())
+            .collect();
+    }
+    if let Some(arr) = job.request.get("reindex_backends").and_then(|v| v.as_array()) {
+        let out: Vec<String> = arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|x| x.trim().to_lowercase())
+            .filter(|x| !x.is_empty())
+            .collect();
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    vec!["auto".to_string()]
+}
+
+fn pick_reindex_cli_backend(corpus: &CorpusEntry, requested_backends: &[String]) -> String {
+    for b in requested_backends {
+        let bb = b.trim().to_lowercase();
+        if bb.is_empty() || bb == "auto" {
+            continue;
+        }
+        return if bb == "clickhouse" {
+            "clickql".to_string()
+        } else {
+            bb
+        };
+    }
+    if let Ok(eff) = resolve_effective_backend(corpus) {
+        return eff;
+    }
+    "flexi".to_string()
+}
+
+fn backend_reindex_dialect(backend: &str) -> (Option<&'static str>, Option<&'static str>) {
+    match backend {
+        "manatee" => (Some("manatee-cql"), Some("manatee")),
+        "cqp" => (Some("cwb-cql"), Some("cwb")),
+        "pando" => (Some("pando-cql"), Some("pando")),
+        "clickql" | "clickhouse" => (Some("clickcql"), Some("clickhouse")),
+        "blacklab" => (Some("bcql"), Some("blacklab")),
+        _ => (None, None),
+    }
+}
+
+fn execute_reindex_job_for_worker(db_path: &Path, job_id: &str, worker_id: &str) -> Result<()> {
+    let conn = open_db(&db_path.to_path_buf())?;
+    let job = get_reindex_job(&conn, job_id)?;
+    if job.status != "running" {
+        return Ok(());
+    }
+    if let Some(w) = job.worker_id.as_deref() {
+        if !w.trim().is_empty() && w != worker_id {
+            return Ok(());
+        }
+    }
+    let corpus = get_corpus(&conn, &job.corpus_id)?;
+    let project_root = resolve_teitok_project_root(&corpus);
+    let requested_backends = extract_requested_backends(&job);
+    let requested_csv = requested_backends.join(",");
+    let backend = pick_reindex_cli_backend(&corpus, &requested_backends);
+    let (query_language, corpus_format) = backend_reindex_dialect(&backend);
+
+    let python_bin = corpus
+        .settings
+        .get("python_bin")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| std::env::var("PYTHON_BIN").ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| "python3".to_string());
+    let flexicorp_module = corpus
+        .settings
+        .get("flexicorp_module")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("flexicorp")
+        .to_string();
+
+    let mut cmd = ProcessCommand::new(&python_bin);
+    cmd.arg("-m")
+        .arg(&flexicorp_module)
+        .arg("reindex")
+        .arg("--api")
+        .arg("--backend")
+        .arg(&backend)
+        .arg("--folder")
+        .arg(&project_root)
+        .arg("--teitok")
+        .arg("yes")
+        .arg("--verbose")
+        .arg("--staging")
+        .arg("--reindex-backends")
+        .arg(&requested_csv);
+    if let Some(ql) = query_language {
+        cmd.arg("--query-language").arg(ql);
+    }
+    if let Some(cf) = corpus_format {
+        cmd.arg("--corpus-format").arg(cf);
+    }
+    let output = cmd
+        .output()
+        .with_context(|| format!("Failed to execute reindex job '{}' via flexicorp CLI", job_id))?;
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout_t = truncate_for_job_log(&stdout, 16000);
+    let stderr_t = truncate_for_job_log(&stderr, 16000);
+    let mut result = json!({
+        "executor": "fqs-serve-worker",
+        "worker_id": worker_id,
+        "command": format!("{python_bin} -m {flexicorp_module} reindex --api --backend {backend} --folder {project_root} --teitok yes --verbose --staging --reindex-backends {requested_csv}"),
+        "exit_code": exit_code,
+        "backend": backend,
+        "reindex_backends": requested_backends,
+        "project_root": project_root,
+        "stdout": stdout_t,
+        "stderr": stderr_t
+    });
+    if let Ok(parsed) = serde_json::from_str::<Value>(&stdout) {
+        result["raw"] = parsed;
+    }
+
+    let conn2 = open_db(&db_path.to_path_buf())?;
+    if output.status.success() {
+        let _ = mark_reindex_job_finished(
+            &conn2,
+            job_id,
+            true,
+            Some("completed"),
+            None,
+            Some(&result),
+        )?;
+    } else {
+        let err_text = if !stderr.trim().is_empty() {
+            truncate_for_job_log(stderr.trim(), 12000)
+        } else if !stdout.trim().is_empty() {
+            truncate_for_job_log(stdout.trim(), 12000)
+        } else {
+            format!("reindex process exited with status {}", exit_code)
+        };
+        let _ = mark_reindex_job_finished(
+            &conn2,
+            job_id,
+            false,
+            Some("failed"),
+            Some(&err_text),
+            Some(&result),
+        )?;
+    }
     Ok(())
 }
 
