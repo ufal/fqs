@@ -1218,7 +1218,11 @@ fn parse_http_url_target(url: &str) -> Option<(String, u16, String)> {
     Some((host, port, p.to_string()))
 }
 
-fn probe_http_health(host: &str, port: u16, health_path: &str) -> Result<(bool, String)> {
+fn probe_http_health_details(
+    host: &str,
+    port: u16,
+    health_path: &str,
+) -> Result<(bool, String, Option<Value>)> {
     let addr = format!("{host}:{port}");
     let sock = addr
         .to_socket_addrs()?
@@ -1241,9 +1245,18 @@ fn probe_http_health(host: &str, port: u16, health_path: &str) -> Result<(bool, 
     stream.write_all(req.as_bytes())?;
     let mut raw = String::new();
     stream.read_to_string(&mut raw)?;
-    let first = raw.lines().next().unwrap_or("").to_string();
+    let mut lines = raw.lines();
+    let first = lines.next().unwrap_or("").to_string();
     let ok = first.contains(" 200 ");
-    Ok((ok, first))
+    let body = if let Some((_, b)) = raw.split_once("\r\n\r\n") {
+        b
+    } else if let Some((_, b)) = raw.split_once("\n\n") {
+        b
+    } else {
+        ""
+    };
+    let health_json = serde_json::from_str::<Value>(body.trim()).ok();
+    Ok((ok, first, health_json))
 }
 
 fn handle_status(args: StatusArgs) -> Result<()> {
@@ -1282,11 +1295,26 @@ fn handle_status(args: StatusArgs) -> Result<()> {
     } else {
         format!("{}/health", base_path.trim_end_matches('/'))
     };
-    let health = probe_http_health(&host, port, &health_path);
-    let (http_ok, status_line, err) = match health {
-        Ok((ok, line)) => (ok, line, String::new()),
-        Err(e) => (false, String::new(), e.to_string()),
+    let health = probe_http_health_details(&host, port, &health_path);
+    let (http_ok, status_line, err, health_json) = match health {
+        Ok((ok, line, details)) => (ok, line, String::new(), details),
+        Err(e) => (false, String::new(), e.to_string(), None),
     };
+    let server_version = health_json
+        .as_ref()
+        .and_then(|v| v.get("version"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let server_name = health_json
+        .as_ref()
+        .and_then(|v| v.get("server_name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let server_db_path = health_json
+        .as_ref()
+        .and_then(|v| v.get("db_path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     // Top-level `ok` matches HTTP reachability (same notion TEITOK uses for FQS query routing).
     // The status command still exits 0 after printing JSON so scripts can parse output; use `ok` for health.
     println!(
@@ -1295,13 +1323,17 @@ fn handle_status(args: StatusArgs) -> Result<()> {
             "ok": http_ok,
             "operation": "status",
             "db_path": db_path,
+            "cli_version": env!("CARGO_PKG_VERSION"),
             "http": {
                 "url": effective_url,
                 "runtime_file": fqs_http_runtime_path(&db_path),
                 "health_path": health_path,
                 "ok": http_ok,
                 "status_line": status_line,
-                "error": err
+                "error": err,
+                "server_version": server_version,
+                "server_name": server_name,
+                "server_db_path": server_db_path
             }
         }))?
     );
@@ -1848,30 +1880,99 @@ fn parse_pgrep_pids(stdout: &str) -> Vec<i32> {
         .collect()
 }
 
-fn collect_matching_serve_pids(host: &str, port: u16) -> Vec<i32> {
-    let pattern = format!("fqs serve --host {} --port {}", host.trim(), port);
-    let out = match ProcessCommand::new("pgrep").arg("-f").arg(&pattern).output() {
-        Ok(o) => o,
-        Err(err) => {
-            eprintln!(
-                "[fqs][serve] --restart: could not run pgrep for '{}': {}",
-                pattern, err
-            );
-            return Vec::new();
-        }
-    };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    let mine = std::process::id() as i32;
-    parse_pgrep_pids(&String::from_utf8_lossy(&out.stdout))
-        .into_iter()
-        .filter(|pid| *pid > 0 && *pid != mine)
+fn parse_pid_lines(stdout: &str) -> Vec<i32> {
+    stdout
+        .lines()
+        .filter_map(|line| line.trim().parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
         .collect()
 }
 
+fn pid_command_line(pid: i32) -> String {
+    if pid <= 0 {
+        return String::new();
+    }
+    match ProcessCommand::new("ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .arg("-o")
+        .arg("command=")
+        .output()
+    {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        _ => String::new(),
+    }
+}
+
+fn is_fqs_serve_command(cmdline: &str) -> bool {
+    let lc = cmdline.to_lowercase();
+    lc.contains("fqs") && lc.contains(" serve")
+}
+
+fn collect_listener_pids_for_port(port: u16) -> Vec<i32> {
+    // Primary probe: lsof (works on macOS and most Linux images that include it).
+    if let Ok(out) = ProcessCommand::new("lsof")
+        .arg("-nP")
+        .arg(format!("-iTCP:{port}"))
+        .arg("-sTCP:LISTEN")
+        .arg("-t")
+        .output()
+    {
+        if out.status.success() {
+            let pids = parse_pid_lines(&String::from_utf8_lossy(&out.stdout));
+            if !pids.is_empty() {
+                return pids;
+            }
+        }
+    }
+    // Fallback: netstat + lsof may be unavailable in minimal containers.
+    // Keep this conservative and return empty on parse issues.
+    Vec::new()
+}
+
+fn collect_matching_serve_pids(host: &str, port: u16) -> Vec<i32> {
+    let patterns = vec![
+        format!("fqs serve --host {} --port {}", host.trim(), port),
+        format!("fqs serve --port {} --host {}", port, host.trim()),
+        format!("fqs serve --port {}", port),
+        "fqs serve".to_string(),
+    ];
+    let mine = std::process::id() as i32;
+    let mut out = std::collections::HashSet::new();
+    for pattern in patterns {
+        let pgrep_out = match ProcessCommand::new("pgrep").arg("-f").arg(&pattern).output() {
+            Ok(o) => o,
+            Err(err) => {
+                eprintln!(
+                    "[fqs][serve] --restart: could not run pgrep for '{}': {}",
+                    pattern, err
+                );
+                continue;
+            }
+        };
+        if !pgrep_out.status.success() {
+            continue;
+        }
+        for pid in parse_pgrep_pids(&String::from_utf8_lossy(&pgrep_out.stdout)) {
+            if pid > 0 && pid != mine {
+                out.insert(pid);
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 fn restart_matching_serve_processes(host: &str, port: u16) {
-    let pids = collect_matching_serve_pids(host, port);
+    let mut pids_set: std::collections::HashSet<i32> =
+        collect_matching_serve_pids(host, port).into_iter().collect();
+    // Also include explicit listener pid(s) on target port when command is fqs serve.
+    for pid in collect_listener_pids_for_port(port) {
+        let cmd = pid_command_line(pid);
+        if is_fqs_serve_command(&cmd) {
+            pids_set.insert(pid);
+        }
+    }
+    let pids: Vec<i32> = pids_set.into_iter().collect();
     if pids.is_empty() {
         return;
     }
