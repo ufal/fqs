@@ -1,10 +1,12 @@
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -1879,6 +1881,125 @@ fn backend_reindex_dialect(backend: &str) -> (Option<&'static str>, Option<&'sta
     }
 }
 
+#[derive(Debug, Clone)]
+struct RuntimeProgress {
+    percent: Option<i64>,
+    phase: Option<String>,
+    message: String,
+    stream: String,
+}
+
+fn try_parse_percent(text: &str) -> Option<i64> {
+    for tok in text.split_whitespace() {
+        if !tok.contains('%') {
+            continue;
+        }
+        let n = tok.trim_matches(|c: char| {
+            c == '%'
+                || c == '('
+                || c == ')'
+                || c == ','
+                || c == '.'
+                || c == ';'
+                || c == ':'
+                || c == '['
+                || c == ']'
+        });
+        if n.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(v) = n.parse::<i64>() {
+                return Some(v.clamp(0, 100));
+            }
+        }
+    }
+    None
+}
+
+fn try_parse_phase(text: &str) -> Option<String> {
+    if let Some(s) = text.find('(') {
+        if let Some(e_rel) = text[s + 1..].find(')') {
+            let phase = text[s + 1..s + 1 + e_rel].trim();
+            if !phase.is_empty() {
+                return Some(phase.to_string());
+            }
+        }
+    }
+    let lower = text.to_ascii_lowercase();
+    for p in [
+        "queued",
+        "running",
+        "encoding",
+        "finalizing",
+        "mkstats",
+        "staging",
+        "copying",
+        "completed",
+        "failed",
+    ] {
+        if lower.contains(p) {
+            return Some(p.to_string());
+        }
+    }
+    None
+}
+
+fn parse_runtime_progress_line(line: &str, stream: &str) -> Option<RuntimeProgress> {
+    let msg = line.trim();
+    if msg.is_empty() {
+        return None;
+    }
+    let percent = try_parse_percent(msg);
+    let phase = try_parse_phase(msg);
+    let looks_progressy = percent.is_some()
+        || phase.is_some()
+        || msg.contains("mkstats")
+        || msg.contains("Compiling")
+        || msg.contains("compile");
+    if !looks_progressy {
+        return None;
+    }
+    Some(RuntimeProgress {
+        percent,
+        phase,
+        message: truncate_for_job_log(msg, 600),
+        stream: stream.to_string(),
+    })
+}
+
+fn update_reindex_job_progress(
+    conn: &Connection,
+    job_id: &str,
+    progress: &RuntimeProgress,
+) -> Result<()> {
+    let existing = get_reindex_job(conn, job_id)?;
+    if existing.status != "running" {
+        return Ok(());
+    }
+    let mut result = existing.result;
+    let mut prog = json!({
+        "message": progress.message,
+        "stream": progress.stream,
+        "updated_at": OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "".to_string()),
+    });
+    if let Some(v) = progress.percent {
+        prog["percent"] = json!(v);
+    }
+    if let Some(ph) = progress.phase.as_deref() {
+        prog["phase"] = json!(ph);
+    }
+    result["progress"] = prog;
+    result["last_log_line"] = json!(progress.message.clone());
+    conn.execute(
+        "UPDATE reindex_jobs SET message=?2, result_json=?3, updated_at=CURRENT_TIMESTAMP WHERE job_id=?1 AND status='running'",
+        params![
+            job_id,
+            progress.message,
+            serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string())
+        ],
+    )
+    .map_err(|e| sqlite_write_err("update reindex_jobs progress", e))?;
+    Ok(())
+}
+
 fn execute_reindex_job_for_worker(db_path: &Path, job_id: &str, worker_id: &str) -> Result<()> {
     let conn = open_db(&db_path.to_path_buf())?;
     let job = get_reindex_job(&conn, job_id)?;
@@ -1936,13 +2057,93 @@ fn execute_reindex_job_for_worker(db_path: &Path, job_id: &str, worker_id: &str)
     if let Some(cf) = corpus_format {
         cmd.arg("--corpus-format").arg(cf);
     }
-    let output = cmd
-        .output()
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("Failed to execute reindex job '{}' via flexicorp CLI", job_id))?;
 
-    let exit_code = output.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let child_stdout = child.stdout.take().context("missing child stdout pipe")?;
+    let child_stderr = child.stderr.take().context("missing child stderr pipe")?;
+    let (tx, rx) = mpsc::channel::<(String, String)>();
+    let tx_out = tx.clone();
+    thread::spawn(move || {
+        let reader = BufReader::new(child_stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            let _ = tx_out.send(("stdout".to_string(), line));
+        }
+    });
+    let tx_err = tx.clone();
+    thread::spawn(move || {
+        let reader = BufReader::new(child_stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            let _ = tx_err.send(("stderr".to_string(), line));
+        }
+    });
+    drop(tx);
+
+    let progress_conn = open_db(&db_path.to_path_buf())?;
+    let mut stdout_lines: Vec<String> = Vec::new();
+    let mut stderr_lines: Vec<String> = Vec::new();
+    let mut last_progress_percent: Option<i64> = None;
+    let mut last_progress_phase: String = String::new();
+    let mut last_progress_write = Instant::now()
+        .checked_sub(Duration::from_secs(2))
+        .unwrap_or_else(Instant::now);
+    let mut channel_closed = false;
+    let mut child_status: Option<std::process::ExitStatus> = None;
+    while !channel_closed {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok((stream, line)) => {
+                if stream == "stderr" {
+                    stderr_lines.push(line.clone());
+                } else {
+                    stdout_lines.push(line.clone());
+                }
+                if let Some(progress) = parse_runtime_progress_line(&line, &stream) {
+                    let percent_changed = progress.percent != last_progress_percent;
+                    let phase_now = progress.phase.clone().unwrap_or_default();
+                    let phase_changed = phase_now != last_progress_phase;
+                    let timed = last_progress_write.elapsed() >= Duration::from_millis(800);
+                    if percent_changed || phase_changed || timed {
+                        let _ = update_reindex_job_progress(&progress_conn, job_id, &progress);
+                        last_progress_percent = progress.percent;
+                        last_progress_phase = phase_now;
+                        last_progress_write = Instant::now();
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                channel_closed = true;
+            }
+        }
+        if channel_closed {
+            break;
+        }
+        if let Some(status) = child.try_wait()? {
+            child_status = Some(status);
+            // child exited; drain remaining queued lines quickly before leaving loop
+            while let Ok((stream, line)) = rx.try_recv() {
+                if stream == "stderr" {
+                    stderr_lines.push(line.clone());
+                } else {
+                    stdout_lines.push(line.clone());
+                }
+                if let Some(progress) = parse_runtime_progress_line(&line, &stream) {
+                    let _ = update_reindex_job_progress(&progress_conn, job_id, &progress);
+                }
+            }
+            channel_closed = true;
+        }
+    }
+    let status = match child_status {
+        Some(s) => s,
+        None => child.wait()?,
+    };
+    let exit_code = status.code().unwrap_or(-1);
+    let stdout = stdout_lines.join("\n");
+    let stderr = stderr_lines.join("\n");
     let stdout_t = truncate_for_job_log(&stdout, 16000);
     let stderr_t = truncate_for_job_log(&stderr, 16000);
     let mut result = json!({
@@ -1954,14 +2155,19 @@ fn execute_reindex_job_for_worker(db_path: &Path, job_id: &str, worker_id: &str)
         "reindex_backends": requested_backends,
         "project_root": project_root,
         "stdout": stdout_t,
-        "stderr": stderr_t
+        "stderr": stderr_t,
+        "progress": {
+            "phase": if status.success() { "completed" } else { "failed" },
+            "percent": if status.success() { 100 } else { last_progress_percent.unwrap_or(0) },
+            "message": if status.success() { "completed" } else { "failed" }
+        }
     });
     if let Ok(parsed) = serde_json::from_str::<Value>(&stdout) {
         result["raw"] = parsed;
     }
 
     let conn2 = open_db(&db_path.to_path_buf())?;
-    if output.status.success() {
+    if status.success() {
         let _ = mark_reindex_job_finished(
             &conn2,
             job_id,
