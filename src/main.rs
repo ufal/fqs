@@ -283,6 +283,9 @@ struct ServeArgs {
     /// Human-readable label for this instance (shown in /health; e.g. "LINDAT live corpus query server")
     #[arg(long = "server-name", env = "FQS_SERVER_NAME")]
     server_name: Option<String>,
+    /// Restart mode: terminate matching existing `fqs serve --host/--port` process before bind
+    #[arg(long, default_value_t = false)]
+    restart: bool,
     #[command(flatten)]
     db: DbPathArg,
 }
@@ -1541,10 +1544,11 @@ async fn http_log_middleware(
     let path = req.uri().path().to_string();
     let started = Instant::now();
     let response = next.run(req).await;
-    if path == "/health" || path == "/query" {
+    let status = response.status().as_u16();
+    let is_polling_jobs = method == "GET" && path == "/reindex/jobs" && (200..300).contains(&status);
+    if path == "/health" || path == "/query" || is_polling_jobs {
         return response;
     }
-    let status = response.status().as_u16();
     let elapsed = started.elapsed().as_millis();
     log_http_request_row(
         &state,
@@ -1687,6 +1691,9 @@ fn execute_query(
 }
 
 async fn run_http_server(args: ServeArgs) -> Result<()> {
+    if args.restart {
+        restart_matching_serve_processes(&args.host, args.port);
+    }
     let db_path = resolve_db_path(&args.db);
     let _ = open_db(&db_path)?;
     run_housekeeping_once(&db_path, args.session_ttl_minutes);
@@ -1726,7 +1733,6 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         .layer(middleware::from_fn_with_state(state.clone(), http_log_middleware))
         .with_state(state);
 
-    let worker_db_path = db_path.clone();
     let worker_id = format!("fqs-serve-{}", std::process::id());
     let worker_caps = vec![
         "auto".to_string(),
@@ -1738,30 +1744,41 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         "blacklab".to_string(),
         "pmltq".to_string(),
     ];
-    tokio::spawn(async move {
-        loop {
-            if let Ok(conn) = open_db(&worker_db_path) {
-                let _ = upsert_reindex_worker_heartbeat(
-                    &conn,
-                    &worker_id,
-                    1,
-                    None,
-                    &worker_caps,
-                );
-            }
-            sleep(Duration::from_secs(30)).await;
-        }
-    });
-
     let dispatch_db_path = db_path.clone();
     let execute_db_path = db_path.clone();
-    let execute_worker_id = format!("fqs-serve-{}", std::process::id());
+    let dispatch_worker_id = worker_id.clone();
+    let dispatch_worker_caps = worker_caps.clone();
+    let execute_worker_id = worker_id.clone();
     let active_jobs: Arc<Mutex<std::collections::HashSet<String>>> =
         Arc::new(Mutex::new(std::collections::HashSet::new()));
     tokio::spawn(async move {
         loop {
-            sleep(Duration::from_secs(3)).await;
-            let assigned = dispatch_reindex_once_path(&dispatch_db_path, 1).unwrap_or_default();
+            if let Ok(conn) = open_db(&dispatch_db_path) {
+                if let Err(err) = upsert_reindex_worker_heartbeat(
+                    &conn,
+                    &dispatch_worker_id,
+                    1,
+                    None,
+                    &dispatch_worker_caps,
+                ) {
+                    eprintln!(
+                        "[fqs][reindex] heartbeat failed for worker {}: {}",
+                        dispatch_worker_id, err
+                    );
+                }
+            } else {
+                eprintln!(
+                    "[fqs][reindex] could not open db for heartbeat/dispatch: {}",
+                    dispatch_db_path.display()
+                );
+            }
+            let assigned = match dispatch_reindex_once_path(&dispatch_db_path, 1) {
+                Ok(rows) => rows,
+                Err(err) => {
+                    eprintln!("[fqs][reindex] dispatch tick failed: {}", err);
+                    Vec::new()
+                }
+            };
             for job in assigned {
                 let jid = job.job_id.clone();
                 let mut should_start = false;
@@ -1784,6 +1801,7 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
                     }
                 });
             }
+            sleep(Duration::from_secs(3)).await;
         }
     });
 
@@ -1809,6 +1827,7 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
             "http_runtime_file": fqs_http_runtime_path(&db_path),
             "fcs_database": args.fcs_database,
             "server_name": args.server_name,
+            "restart": args.restart,
             "test_mode": args.test,
             "log_file": request_log_path,
             "log_max_bytes": args.log_max_bytes,
@@ -1820,6 +1839,53 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
     );
     axum::serve(listener, app).await.context("HTTP server failed")?;
     Ok(())
+}
+
+fn parse_pgrep_pids(stdout: &str) -> Vec<i32> {
+    stdout
+        .lines()
+        .filter_map(|line| line.trim().parse::<i32>().ok())
+        .collect()
+}
+
+fn collect_matching_serve_pids(host: &str, port: u16) -> Vec<i32> {
+    let pattern = format!("fqs serve --host {} --port {}", host.trim(), port);
+    let out = match ProcessCommand::new("pgrep").arg("-f").arg(&pattern).output() {
+        Ok(o) => o,
+        Err(err) => {
+            eprintln!(
+                "[fqs][serve] --restart: could not run pgrep for '{}': {}",
+                pattern, err
+            );
+            return Vec::new();
+        }
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let mine = std::process::id() as i32;
+    parse_pgrep_pids(&String::from_utf8_lossy(&out.stdout))
+        .into_iter()
+        .filter(|pid| *pid > 0 && *pid != mine)
+        .collect()
+}
+
+fn restart_matching_serve_processes(host: &str, port: u16) {
+    let pids = collect_matching_serve_pids(host, port);
+    if pids.is_empty() {
+        return;
+    }
+    for pid in &pids {
+        let _ = ProcessCommand::new("kill").arg(pid.to_string()).status();
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let survivors = collect_matching_serve_pids(host, port);
+    for pid in survivors {
+        let _ = ProcessCommand::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .status();
+    }
 }
 
 fn truncate_for_job_log(s: &str, max_chars: usize) -> String {
@@ -2283,14 +2349,44 @@ async fn http_reindex_jobs(
     AxumQuery(params): AxumQuery<HttpReindexJobsQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let conn = open_db(&state.db_path).map_err(to_http_err)?;
-    let rows = list_reindex_jobs(
-        &conn,
-        params.status.as_deref(),
-        params.corpus.as_deref(),
-        clamp_limit(params.limit.unwrap_or(100), 1, 1000),
-    )
-    .map_err(to_http_err)?;
-    Ok(Json(json!({"ok": true, "jobs": rows})))
+    let limit = clamp_limit(params.limit.unwrap_or(100), 1, 1000);
+    let requested_status = params
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let rows = if requested_status.is_none()
+        || requested_status.is_some_and(|s| s.eq_ignore_ascii_case("active"))
+    {
+        // Default HTTP view is active queue only (running + queued),
+        // so completed/failed items do not clutter "active" dashboards.
+        let mut out =
+            list_reindex_jobs(&conn, Some("running"), params.corpus.as_deref(), limit)
+                .map_err(to_http_err)?;
+        if out.len() < limit {
+            let remaining = limit - out.len();
+            let mut queued = list_reindex_jobs(
+                &conn,
+                Some("queued"),
+                params.corpus.as_deref(),
+                remaining,
+            )
+            .map_err(to_http_err)?;
+            out.append(&mut queued);
+        }
+        out
+    } else if requested_status.is_some_and(|s| s.eq_ignore_ascii_case("all")) {
+        list_reindex_jobs(&conn, None, params.corpus.as_deref(), limit).map_err(to_http_err)?
+    } else {
+        list_reindex_jobs(&conn, requested_status, params.corpus.as_deref(), limit)
+            .map_err(to_http_err)?
+    };
+    let effective_status = match requested_status {
+        None => "active",
+        Some("all") | Some("ALL") => "all",
+        Some(s) => s,
+    };
+    Ok(Json(json!({"ok": true, "status_filter": effective_status, "jobs": rows})))
 }
 
 async fn http_reindex_history(
