@@ -19,7 +19,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum::{extract::Request, response::Response};
 use clap::{Args, Parser, Subcommand};
-use rusqlite::{Connection, Error as SqliteError, params};
+use rusqlite::{Connection, Error as SqliteError, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -1854,6 +1854,24 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
                         dispatch_worker_id, err
                     );
                 }
+                let active_snapshot = if let Ok(set) = active_jobs.lock() {
+                    set.clone()
+                } else {
+                    std::collections::HashSet::new()
+                };
+                match reconcile_orphaned_running_jobs(&conn, &dispatch_worker_id, &active_snapshot) {
+                    Ok(done) if !done.is_empty() => {
+                        eprintln!(
+                            "[fqs][reindex] reconciled {} orphaned running jobs: {}",
+                            done.len(),
+                            done.join(", ")
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        eprintln!("[fqs][reindex] reconcile tick failed: {}", err);
+                    }
+                }
             } else {
                 eprintln!(
                     "[fqs][reindex] could not open db for heartbeat/dispatch: {}",
@@ -2050,6 +2068,152 @@ fn truncate_for_job_log(s: &str, max_chars: usize) -> String {
         return s.to_string();
     }
     s.chars().take(max_chars).collect::<String>() + "…"
+}
+
+fn is_pid_alive(pid: i64) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let pid_s = pid.to_string();
+    // Unix-friendly fast probe.
+    if let Ok(out) = ProcessCommand::new("kill").arg("-0").arg(&pid_s).output() {
+        return out.status.success();
+    }
+    // Fallback probe.
+    if let Ok(out) = ProcessCommand::new("ps").arg("-p").arg(&pid_s).output() {
+        return out.status.success();
+    }
+    false
+}
+
+fn reindex_job_process_pid(job: &ReindexJobEntry) -> Option<i64> {
+    if let Some(pid) = job
+        .result
+        .get("process")
+        .and_then(|p| p.get("pid"))
+        .and_then(|v| v.as_i64())
+    {
+        if pid > 0 {
+            return Some(pid);
+        }
+    }
+    job.result.get("child_pid").and_then(|v| v.as_i64()).filter(|pid| *pid > 0)
+}
+
+fn is_reindex_worker_recent(conn: &Connection, worker_id: &str) -> Result<bool> {
+    let worker_id = worker_id.trim();
+    if worker_id.is_empty() {
+        return Ok(false);
+    }
+    let val: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM reindex_workers WHERE worker_id=?1 AND status='online' AND last_heartbeat_at >= datetime('now', '-120 seconds') LIMIT 1",
+            params![worker_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| sqlite_write_err("read reindex_workers recent heartbeat", e))?;
+    Ok(val.is_some())
+}
+
+fn is_reindex_job_stale(conn: &Connection, job_id: &str, seconds: i64) -> Result<bool> {
+    let sec = seconds.max(1);
+    let threshold = format!("-{} seconds", sec);
+    let stale: Option<i64> = conn
+        .query_row(
+            "SELECT CASE WHEN COALESCE(updated_at, started_at, requested_at) <= datetime('now', ?2) THEN 1 ELSE 0 END FROM reindex_jobs WHERE job_id=?1",
+            params![job_id, threshold],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|e| sqlite_write_err("read reindex_jobs staleness", e))?;
+    Ok(stale.unwrap_or(0) == 1)
+}
+
+fn set_reindex_job_process_started(
+    conn: &Connection,
+    job_id: &str,
+    worker_id: &str,
+    child_pid: i64,
+    command_preview: &str,
+) -> Result<()> {
+    let existing = get_reindex_job(conn, job_id)?;
+    if existing.status != "running" {
+        return Ok(());
+    }
+    let mut result = existing.result;
+    result["process"] = json!({
+        "pid": child_pid,
+        "alive": true,
+        "worker_id": worker_id,
+        "started_at": OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "".to_string()),
+        "command": truncate_for_job_log(command_preview, 1200),
+    });
+    conn.execute(
+        "UPDATE reindex_jobs SET result_json=?2, updated_at=CURRENT_TIMESTAMP WHERE job_id=?1 AND status='running'",
+        params![
+            job_id,
+            serde_json::to_string(&result).unwrap_or_else(|_| "{}".to_string()),
+        ],
+    )
+    .map_err(|e| sqlite_write_err("update reindex_jobs process metadata", e))?;
+    Ok(())
+}
+
+fn reconcile_orphaned_running_jobs(
+    conn: &Connection,
+    worker_id: &str,
+    active_job_ids: &std::collections::HashSet<String>,
+) -> Result<Vec<String>> {
+    let running = list_reindex_jobs(conn, Some("running"), None, 5000)?;
+    let mut reconciled: Vec<String> = Vec::new();
+    for job in running {
+        if active_job_ids.contains(&job.job_id) {
+            continue;
+        }
+        let pid = reindex_job_process_pid(&job);
+        let pid_alive = pid.map(is_pid_alive).unwrap_or(false);
+        let owner = job.worker_id.clone().unwrap_or_default();
+        let owner_recent = is_reindex_worker_recent(conn, &owner)?;
+        // Grace window avoids racing right after "started".
+        let stale = is_reindex_job_stale(conn, &job.job_id, 20)?;
+        if !stale {
+            continue;
+        }
+        let orphaned = if pid.is_some() {
+            !pid_alive
+        } else {
+            !owner_recent
+        };
+        if !orphaned {
+            continue;
+        }
+        let mut result = job.result.clone();
+        result["reconciled"] = json!({
+            "by_worker": worker_id,
+            "at": OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "".to_string()),
+            "reason": "running_job_process_missing",
+            "owner_worker_id": owner,
+            "owner_recent": owner_recent,
+            "pid": pid,
+            "pid_alive": pid_alive,
+        });
+        let err = format!(
+            "running reindex job lost worker process (worker_id={}, pid={})",
+            job.worker_id.as_deref().unwrap_or(""),
+            pid.map(|v| v.to_string()).unwrap_or_else(|| "none".to_string())
+        );
+        let _ = mark_reindex_job_finished(
+            conn,
+            &job.job_id,
+            false,
+            Some("failed"),
+            Some(&err),
+            Some(&result),
+        )?;
+        reconciled.push(job.job_id.clone());
+    }
+    Ok(reconciled)
 }
 
 fn extract_requested_backends(job: &ReindexJobEntry) -> Vec<String> {
@@ -2282,9 +2446,14 @@ fn execute_reindex_job_for_worker(db_path: &Path, job_id: &str, worker_id: &str)
     }
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    let command_preview = format!(
+        "{python_bin} -m {flexicorp_module} reindex --api --backend {backend} --folder {project_root} --teitok yes --verbose --staging --reindex-backends {requested_csv}"
+    );
     let mut child = cmd
         .spawn()
         .with_context(|| format!("Failed to execute reindex job '{}' via flexicorp CLI", job_id))?;
+    let child_pid = child.id() as i64;
+    let _ = set_reindex_job_process_started(&conn, job_id, worker_id, child_pid, &command_preview);
 
     let child_stdout = child.stdout.take().context("missing child stdout pipe")?;
     let child_stderr = child.stderr.take().context("missing child stderr pipe")?;
@@ -2372,7 +2541,12 @@ fn execute_reindex_job_for_worker(db_path: &Path, job_id: &str, worker_id: &str)
     let mut result = json!({
         "executor": "fqs-serve-worker",
         "worker_id": worker_id,
-        "command": format!("{python_bin} -m {flexicorp_module} reindex --api --backend {backend} --folder {project_root} --teitok yes --verbose --staging --reindex-backends {requested_csv}"),
+        "command": command_preview,
+        "process": {
+            "pid": child_pid,
+            "alive": false,
+            "exited_at": OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "".to_string()),
+        },
         "exit_code": exit_code,
         "backend": backend,
         "reindex_backends": requested_backends,

@@ -1,15 +1,15 @@
-# FQS Prototype (Rust)
+# FQS (Rust)
 
-This folder contains an initial Rust scaffold for a future FQS core.
+This folder contains the Rust implementation of FQS used by Flexicorp/TEITOK workflows.
 
-Current scope:
+Current capabilities:
 
 - native CLI executable (`fqs`)
 - SQLite-backed corpus catalog (`fqs.db` by default)
 - `corpora add` / `corpora list` / `corpora show` commands
 - `query` command with live execution for `pando` corpora (via `flexicorp-pando` CLI)
 - `corpora validate` command (basic + full probe mode)
-- reindex control-plane scaffolding:
+- reindex control-plane and execution lifecycle:
   - `fqs reindex enqueue|queue|history|mark-started|mark-finished`
   - `fqs reindex dispatch-once` and `fqs reindex worker-heartbeat`
   - SQLite tables `reindex_jobs` + `reindex_history`
@@ -18,14 +18,14 @@ Current scope:
     `POST /reindex/workers/heartbeat`, `POST /reindex/jobs/mark-started`,
     `POST /reindex/jobs/mark-finished`
 
-This is intentionally minimal: a lightweight test HTTP mode is included. Query execution is currently implemented for `pando` and `cqp`.
+A lightweight test HTTP mode is included (`--test`). Query execution is currently implemented for `pando` and `cqp`.
 
 For `cqp` corpora:
 
 - non-TEITOK/plain CWB entries run through direct `cqp` CLI path.
 - TEITOK-style entries (e.g. `supports_xml=true`) run through `python -m flexicorp query --backend cqp --extract-fragments --api` so XML fragment enrichment is preserved.
 
-HTTP mode is now available for model testing:
+HTTP mode:
 
 ```bash
 cargo run -- serve --host 127.0.0.1 --port 8787
@@ -200,7 +200,7 @@ Remove a catalogue row permanently (destructive):
 cargo run -- corpora delete --id tt-eemc-v1 --force
 ```
 
-Prototype query:
+Query (CLI):
 
 ```bash
 cargo run -- query --corpus migrant --q '[lemma="book"]' --language pando-cql --start 0 --size 25
@@ -312,7 +312,7 @@ Load mixed TEITOK/non-TEITOK local examples:
 cargo run -- corpora upsert-json --json-file corpora-mixed.local.example.json
 ```
 
-## Next steps
+## Notes
 
-- add backend adapter trait and first real backend call
-- add HTTP layer after CLI behavior is validated
+- `fqs query` currently supports `pando` and `cqp`; other backends return `not implemented yet`.
+- The HTTP surface is intended as the primary control/query interface for UI integrations.
