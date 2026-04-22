@@ -691,6 +691,59 @@ fn default_empty_object() -> Value {
     json!({})
 }
 
+fn runtime_health_path_for_base(base_path: &str) -> String {
+    if base_path == "/" {
+        "/health".to_string()
+    } else if base_path.ends_with("/health") {
+        base_path.to_string()
+    } else {
+        format!("{}/health", base_path.trim_end_matches('/'))
+    }
+}
+
+fn runtime_entry_is_healthy(url: &str) -> bool {
+    if let Some((host, port, base_path)) = parse_http_url_target(url) {
+        let health_path = runtime_health_path_for_base(&base_path);
+        if let Ok((ok, _, _)) = probe_http_health_details(&host, port, &health_path) {
+            return ok;
+        }
+    }
+    false
+}
+
+fn discover_db_path_from_runtime_files() -> Option<PathBuf> {
+    let candidates = vec![
+        PathBuf::from("/usr/local/var/fqs/fqs-http.json"),
+        PathBuf::from("/var/lib/fqs/fqs-http.json"),
+    ];
+    for path in candidates {
+        let s = match fs::read_to_string(&path) {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
+        let v: Value = match serde_json::from_str(&s) {
+            Ok(x) => x,
+            Err(_) => continue,
+        };
+        let Some(db_path) = v
+            .get("db_path")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let url = v
+            .get("url")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        if url.is_empty() || runtime_entry_is_healthy(url) {
+            return Some(PathBuf::from(db_path));
+        }
+    }
+    None
+}
+
 fn resolve_db_path(arg: &DbPathArg) -> PathBuf {
     if let Some(path) = &arg.db {
         return path.clone();
@@ -699,6 +752,9 @@ fn resolve_db_path(arg: &DbPathArg) -> PathBuf {
         if !path.trim().is_empty() {
             return PathBuf::from(path);
         }
+    }
+    if let Some(path) = discover_db_path_from_runtime_files() {
+        return path;
     }
     default_db_path()
 }
