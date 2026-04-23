@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::collections::HashMap;
 
 use anyhow::{Context, Result};
 use axum::extract::{Query as AxumQuery, State};
@@ -343,6 +344,8 @@ struct HttpReindexEnqueueRequest {
     request_role: Option<String>,
     origin: Option<String>,
     note: Option<String>,
+    options: Option<HashMap<String, String>>,
+    backend_options: Option<HashMap<String, HashMap<String, String>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2268,6 +2271,72 @@ fn backend_reindex_dialect(backend: &str) -> (Option<&'static str>, Option<&'sta
     }
 }
 
+fn extract_reindex_options_map(job: &ReindexJobEntry, key: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(obj) = job.request.get(key).and_then(|v| v.as_object()) else {
+        return out;
+    };
+    for (k, v) in obj {
+        let kk = k.trim();
+        if kk.is_empty() {
+            continue;
+        }
+        let vv = match v {
+            Value::String(s) => s.trim().to_string(),
+            Value::Bool(b) => {
+                if *b {
+                    "yes".to_string()
+                } else {
+                    "no".to_string()
+                }
+            }
+            Value::Number(n) => n.to_string(),
+            _ => continue,
+        };
+        if vv.is_empty() {
+            continue;
+        }
+        out.insert(kk.to_string(), vv);
+    }
+    out
+}
+
+fn extract_backend_reindex_options(job: &ReindexJobEntry, backend: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(root) = job.request.get("backend_options").and_then(|v| v.as_object()) else {
+        return out;
+    };
+    // Apply wildcard defaults first, backend-specific values override them.
+    for scope in ["*", backend] {
+        let Some(obj) = root.get(scope).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for (k, v) in obj {
+            let kk = k.trim();
+            if kk.is_empty() {
+                continue;
+            }
+            let vv = match v {
+                Value::String(s) => s.trim().to_string(),
+                Value::Bool(b) => {
+                    if *b {
+                        "yes".to_string()
+                    } else {
+                        "no".to_string()
+                    }
+                }
+                Value::Number(n) => n.to_string(),
+                _ => continue,
+            };
+            if vv.is_empty() {
+                continue;
+            }
+            out.insert(kk.to_string(), vv);
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeProgress {
     percent: Option<i64>,
@@ -2404,6 +2473,10 @@ fn execute_reindex_job_for_worker(db_path: &Path, job_id: &str, worker_id: &str)
     let requested_csv = requested_backends.join(",");
     let backend = pick_reindex_cli_backend(&corpus, &requested_backends);
     let (query_language, corpus_format) = backend_reindex_dialect(&backend);
+    let mut reindex_options = extract_reindex_options_map(&job, "options");
+    for (k, v) in extract_backend_reindex_options(&job, &backend) {
+        reindex_options.insert(k, v);
+    }
 
     let python_bin = corpus
         .settings
@@ -2444,10 +2517,23 @@ fn execute_reindex_job_for_worker(db_path: &Path, job_id: &str, worker_id: &str)
     if let Some(cf) = corpus_format {
         cmd.arg("--corpus-format").arg(cf);
     }
+    let mut options_pairs: Vec<(String, String)> = reindex_options.into_iter().collect();
+    options_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    for (k, v) in &options_pairs {
+        cmd.arg("--options").arg(format!("{k}={v}"));
+    }
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+    let options_preview = if options_pairs.is_empty() {
+        String::new()
+    } else {
+        options_pairs
+            .iter()
+            .map(|(k, v)| format!(" --options {k}={v}"))
+            .collect::<String>()
+    };
     let command_preview = format!(
-        "{python_bin} -m {flexicorp_module} reindex --api --backend {backend} --folder {project_root} --teitok yes --verbose --staging --reindex-backends {requested_csv}"
+        "{python_bin} -m {flexicorp_module} reindex --api --backend {backend} --folder {project_root} --teitok yes --verbose --staging --reindex-backends {requested_csv}{options_preview}"
     );
     let mut child = cmd
         .spawn()
@@ -2550,6 +2636,7 @@ fn execute_reindex_job_for_worker(db_path: &Path, job_id: &str, worker_id: &str)
         "exit_code": exit_code,
         "backend": backend,
         "reindex_backends": requested_backends,
+        "options": options_pairs.iter().map(|(k,v)| format!("{k}={v}")).collect::<Vec<_>>(),
         "project_root": project_root,
         "stdout": stdout_t,
         "stderr": stderr_t,
@@ -2756,6 +2843,8 @@ async fn http_reindex_enqueue(
         "request_role": role,
         "origin": req.origin.clone().unwrap_or_else(|| "http".to_string()),
         "note": req.note,
+        "options": req.options,
+        "backend_options": req.backend_options,
     });
     let created = enqueue_reindex_job(
         &conn,
