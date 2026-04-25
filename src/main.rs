@@ -313,6 +313,10 @@ struct HttpQueryRequest {
     language: Option<String>,
     start: Option<u32>,
     size: Option<u32>,
+    window: Option<u32>,
+    context_scope: Option<String>,
+    context_format: Option<String>,
+    flexicorp_fragment_kwic_cpos_span: Option<bool>,
     /// Override FQS backend for this request (pando | cqp) — TEITOK/flexicorp should set from project config
     backend: Option<String>,
     request_role: Option<String>,
@@ -1245,6 +1249,7 @@ fn handle_query(args: QueryArgs) -> Result<()> {
         args.start,
         args.size,
         args.backend.as_deref(),
+        None,
     )?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
@@ -1688,6 +1693,7 @@ fn execute_query(
     start: u32,
     size: u32,
     backend_override: Option<&str>,
+    query_options: Option<&HttpQueryRequest>,
 ) -> Result<Value> {
     let started = Instant::now();
     let requested_language = language.to_string();
@@ -1733,7 +1739,7 @@ fn execute_query(
                         .unwrap_or(false)
                     || corpus.source_kind.contains("teitok");
                 let exec = if prefer_flexicorp {
-                    run_flexicorp_cqp_query(corpus, query_text, start, size)?
+                    run_flexicorp_cqp_query(corpus, query_text, start, size, query_options)?
                 } else {
                     run_cqp_query(corpus, query_text, start, size)?
                 };
@@ -1760,7 +1766,11 @@ fn execute_query(
             "language_effective": effective_language,
             "text": query_text,
             "start": start,
-            "size": size
+            "size": size,
+            "window": query_options.and_then(|q| q.window),
+            "context_scope": query_options.and_then(|q| q.context_scope.clone()),
+            "context_format": query_options.and_then(|q| q.context_format.clone()),
+            "flexicorp_fragment_kwic_cpos_span": query_options.and_then(|q| q.flexicorp_fragment_kwic_cpos_span)
         },
         "corpus": corpus,
         "backend_catalog": corpus.preferred_backend,
@@ -2966,6 +2976,7 @@ async fn http_query(
         start,
         size,
         req.backend.as_deref(),
+        Some(&req),
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -3069,8 +3080,8 @@ async fn http_fcs(
                     ));
                 }
 
-                let response =
-                    execute_query(&corpus, &corpus_id, &query, "auto", start, max, None).map_err(to_http_err)?;
+                let response = execute_query(&corpus, &corpus_id, &query, "auto", start, max, None, None)
+                    .map_err(to_http_err)?;
                 build_fcs_search_xml(&corpus, &query, &response)
             } else {
                 // Compatibility: no context means search all eligible corpora and merge summaries.
@@ -3083,7 +3094,7 @@ async fn http_fcs(
                     .collect::<Vec<_>>();
                 let mut per = Vec::<(CorpusEntry, Value)>::new();
                 for c in eligible {
-                    if let Ok(resp) = execute_query(&c, &c.id, &query, "auto", start, max, None) {
+                    if let Ok(resp) = execute_query(&c, &c.id, &query, "auto", start, max, None, None) {
                         per.push((c, resp));
                     }
                 }
@@ -4870,6 +4881,7 @@ fn run_flexicorp_cqp_query(
     query_text: &str,
     start: u32,
     size: u32,
+    query_options: Option<&HttpQueryRequest>,
 ) -> Result<CqpExecResult> {
     let preferred_python = corpus
         .settings
@@ -4918,6 +4930,22 @@ fn run_flexicorp_cqp_query(
             .arg(size.to_string())
             .arg("--extract-fragments")
             .arg("--api");
+        if let Some(qo) = query_options {
+            if let Some(w) = qo.window {
+                if w > 0 {
+                    cmd.arg("--window").arg(w.to_string());
+                }
+            }
+            if let Some(scope) = qo.context_scope.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                cmd.arg("--context-scope").arg(scope);
+            }
+            if let Some(fmt) = qo.context_format.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                cmd.arg("--context-format").arg(fmt);
+            }
+            if qo.flexicorp_fragment_kwic_cpos_span.unwrap_or(false) {
+                cmd.arg("--flexicorp-fragment-kwic-cpos-span");
+            }
+        }
 
         if let Some(reg_hint) = corpus
             .settings
