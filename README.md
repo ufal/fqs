@@ -312,6 +312,16 @@ Load mixed TEITOK/non-TEITOK local examples:
 cargo run -- corpora upsert-json --json-file corpora-mixed.local.example.json
 ```
 
+## Named queries: reserved name `LAST`
+
+Flexicorp UIs (Frequency, Advanced stats, etc.) should work with **named queries** as a single abstraction: toggles, scope chips, and contrast sets refer to **names**, not ad‑hoc “last search” APIs.
+
+**Do not treat “last query” as a separate code path.** Backends already expose the full set of named queries via their **show named**–style listing (in ClickCQL this surfaces as the `show_named_query` statement type in the AST pipeline). **`LAST`** is simply one row in that list—*the most recently executed query in the active session / corpus context*—not something the UI should fetch from session storage by itself when a named-query list is available.
+
+Corpus WorkBench (CQP) and Pando already include `LAST` in that listing; **FQS should normalize the same behavior** for other backends so every client consumes **one** named-query enumeration and never special-cases “last” beyond recognizing the reserved name `LAST` when it appears.
+
+Renaming or friendly labels belong in UI/config (e.g. flexicorp.php / query library): they are **presentation**, not a second parallel notion of “last”. The canonical slot stays `LAST` unless an explicit alias layer is introduced.
+
 ## Notes
 
 - `fqs query` currently supports `pando` and `cqp`; other backends return `not implemented yet`.
