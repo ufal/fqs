@@ -1685,6 +1685,26 @@ fn query_language_effective_for_backend(backend: &str, requested_language: &str)
     }
 }
 
+fn extract_effective_query_operation(payload: &Value) -> Option<String> {
+    let candidates = [
+        "/operation",
+        "/result/operation",
+        "/done/operation",
+        "/done/result/operation",
+        "/result/result/operation",
+        "/raw/operation",
+    ];
+    for ptr in candidates {
+        if let Some(op) = payload.pointer(ptr).and_then(|v| v.as_str()) {
+            let s = op.trim().to_lowercase();
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
 fn execute_query(
     corpus: &CorpusEntry,
     corpus_id: &str,
@@ -1756,10 +1776,13 @@ fn execute_query(
         };
     let elapsed_ms = started.elapsed().as_millis();
 
+    let operation_effective = extract_effective_query_operation(&payload)
+        .unwrap_or_else(|| "query".to_string());
     let response = json!({
         "ok": true,
         "prototype": false,
         "operation": "query",
+        "operation_effective": operation_effective,
         "query": {
             "corpus": corpus_id,
             "language_requested": requested_language,
@@ -4627,6 +4650,13 @@ fn parse_last_integer(text: &str) -> Option<i64> {
     None
 }
 
+fn pando_query_looks_aggregation(query_text: &str) -> bool {
+    let q = query_text.to_ascii_lowercase();
+    ["freq", "count", "dist", "group", "keyness", "coll", "dcoll"]
+        .iter()
+        .any(|kw| q.contains(kw))
+}
+
 fn update_validation_result(conn: &Connection, id: &str, result: &ValidationResult) -> Result<()> {
     conn.execute(
         r#"
@@ -4675,6 +4705,11 @@ fn run_pando_query(corpus: &CorpusEntry, query_text: &str, start: u32, size: u32
     let mut binary = String::new();
     let mut spawn_errors: Vec<String> = Vec::new();
     for candidate in &binaries {
+        let max_total = if pando_query_looks_aggregation(query_text) {
+            "1000000"
+        } else {
+            "10000"
+        };
         let mut cmd = ProcessCommand::new(candidate);
         cmd.arg("--index-dir")
             .arg(&index_dir)
@@ -4685,7 +4720,7 @@ fn run_pando_query(corpus: &CorpusEntry, query_text: &str, start: u32, size: u32
             .arg("--limit")
             .arg(size.to_string())
             .arg("--max-total")
-            .arg("10000");
+            .arg(max_total);
         match cmd.output() {
             Ok(out) => {
                 output = Some(out);
