@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -26,6 +26,14 @@ use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::time::sleep;
+
+mod hot_corpus;
+mod pando_lib;
+
+use hot_corpus::{
+    pando_query_body, wrap_pando_server_as_fqs_raw, HotCorpusConfig, HotCorpusManager, HotGuard,
+};
+use pando_lib::PandoLib;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -284,6 +292,15 @@ struct ServeArgs {
     /// Human-readable label for this instance (shown in /health; e.g. "LINDAT live corpus query server")
     #[arg(long = "server-name", env = "FQS_SERVER_NAME")]
     server_name: Option<String>,
+    /// Max warm Pando corpora (count + idle eviction; no RSS budget for Pando)
+    #[arg(long, default_value_t = 8)]
+    pando_max_warm: usize,
+    /// Idle TTL seconds before an unused warm Pando handle is closed
+    #[arg(long, default_value_t = 1800)]
+    pando_idle_ttl_secs: u64,
+    /// Disable libflexicorp_pando hot path (force cold CLI)
+    #[arg(long, default_value_t = false)]
+    pando_cli_only: bool,
     /// Restart mode: terminate matching existing `fqs serve --host/--port` process before bind
     #[arg(long, default_value_t = false)]
     restart: bool,
@@ -306,7 +323,7 @@ struct StatusArgs {
     db: DbPathArg,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct HttpQueryRequest {
     corpus: String,
     query: String,
@@ -403,6 +420,92 @@ struct HttpAppState {
     request_log_path: PathBuf,
     request_log_max_bytes: u64,
     request_log_keep_files: usize,
+    /// Warm Pando handles via libflexicorp_pando (None if the library is missing).
+    pando_hcm: Option<Arc<HotCorpusManager>>,
+    /// In-memory corpus catalog (avoids open_db + SELECT on every query).
+    catalog: Arc<CorpusCatalog>,
+}
+
+/// Hot-path corpus lookup: all rows in memory, refreshed periodically from SQLite.
+struct CorpusCatalog {
+    inner: RwLock<HashMap<String, CorpusEntry>>,
+}
+
+impl CorpusCatalog {
+    fn load_from_db(db_path: &Path) -> Result<Self> {
+        let conn = open_db(&db_path.to_path_buf())?;
+        let rows = list_corpora(&conn, None, true, None)?;
+        let mut by_id = HashMap::with_capacity(rows.len());
+        for entry in rows {
+            by_id.insert(entry.id.clone(), entry);
+        }
+        Ok(Self {
+            inner: RwLock::new(by_id),
+        })
+    }
+
+    fn reload(&self, db_path: &Path) -> Result<usize> {
+        let conn = open_db(&db_path.to_path_buf())?;
+        let rows = list_corpora(&conn, None, true, None)?;
+        let n = rows.len();
+        let mut by_id = HashMap::with_capacity(n);
+        for entry in rows {
+            by_id.insert(entry.id.clone(), entry);
+        }
+        *self.inner.write().expect("catalog write lock") = by_id;
+        Ok(n)
+    }
+
+    fn get(&self, id: &str) -> Result<CorpusEntry> {
+        self.inner
+            .read()
+            .expect("catalog read lock")
+            .get(id)
+            .cloned()
+            .with_context(|| format!("Corpus '{id}' not found in catalog"))
+    }
+
+    fn list(
+        &self,
+        environment: Option<&str>,
+        include_noncurrent: bool,
+        tag: Option<&str>,
+    ) -> Vec<CorpusEntry> {
+        let g = self.inner.read().expect("catalog read lock");
+        let mut rows: Vec<CorpusEntry> = g
+            .values()
+            .filter(|c| {
+                if let Some(env) = environment {
+                    if c.environment != env {
+                        return false;
+                    }
+                }
+                if !include_noncurrent && !c.is_current {
+                    return false;
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        if let Some(tag) = tag {
+            let t = tag.trim();
+            if !t.is_empty() {
+                rows.retain(|c| c.labels.iter().any(|l| l.eq_ignore_ascii_case(t)));
+            }
+        }
+        rows.sort_by(|a, b| {
+            let af = a.family_key.as_deref().unwrap_or(&a.id);
+            let bf = b.family_key.as_deref().unwrap_or(&b.id);
+            af.cmp(bf)
+                .then_with(|| a.label.cmp(&b.label))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        rows
+    }
+
+    fn len(&self) -> usize {
+        self.inner.read().expect("catalog read lock").len()
+    }
 }
 
 #[derive(Args, Debug)]
@@ -1250,6 +1353,7 @@ fn handle_query(args: QueryArgs) -> Result<()> {
         args.size,
         args.backend.as_deref(),
         None,
+        None,
     )?;
     println!("{}", serde_json::to_string_pretty(&response)?);
     Ok(())
@@ -1714,6 +1818,7 @@ fn execute_query(
     size: u32,
     backend_override: Option<&str>,
     query_options: Option<&HttpQueryRequest>,
+    pando_hcm: Option<Arc<HotCorpusManager>>,
 ) -> Result<Value> {
     let started = Instant::now();
     let requested_language = language.to_string();
@@ -1739,10 +1844,10 @@ fn execute_query(
             "pando" => {
                 let effective = query_language_effective_for_backend("pando", &requested_language)?;
                 let pando_query = normalize_pando_query(query_text);
-                let exec = run_pando_query(corpus, &pando_query, start, size)?;
+                let exec = run_pando_query(corpus, &pando_query, start, size, query_options, pando_hcm.as_ref())?;
                 (
                     effective,
-                    "flexicorp-pando-cli".to_string(),
+                    exec.kind,
                     exec.binary,
                     exec.index_dir,
                     exec.payload,
@@ -1823,6 +1928,50 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
     run_housekeeping_once(&db_path, args.session_ttl_minutes);
     let (request_log_path, request_log_warning) = prepare_request_log_path(&db_path, args.log_file.clone());
 
+    let pando_hcm = if args.pando_cli_only {
+        eprintln!("[fqs] pando hot path disabled (--pando-cli-only); using cold CLI");
+        None
+    } else {
+        match PandoLib::load() {
+            Ok(lib) => {
+                eprintln!(
+                    "[fqs] loaded libflexicorp_pando api={} build={}",
+                    lib.api_version(),
+                    lib.build_string()
+                );
+                let hcm = HotCorpusManager::new(
+                    lib,
+                    HotCorpusConfig {
+                        max_warm: args.pando_max_warm.max(1),
+                        idle_ttl: Duration::from_secs(args.pando_idle_ttl_secs),
+                    },
+                );
+                // Idle-TTL eviction runs on its own timer, not inline in every
+                // request; a quarter of the TTL (never below 5s) is frequent
+                // enough that a corpus is closed reasonably soon after going
+                // idle, and infrequent enough that it's never the dominant cost
+                // (see hot_corpus.rs) — even at a short TTL in a test setup.
+                hcm.spawn_idle_sweeper(Duration::from_secs((args.pando_idle_ttl_secs / 4).max(5)));
+                Some(hcm)
+            }
+            Err(err) => {
+                eprintln!(
+                    "[fqs] libflexicorp_pando unavailable ({err}); pando queries fall back to cold CLI"
+                );
+                None
+            }
+        }
+    };
+
+    let catalog = Arc::new(
+        CorpusCatalog::load_from_db(&db_path)
+            .with_context(|| format!("Failed to load corpus catalog from {}", db_path.display()))?,
+    );
+    eprintln!(
+        "[fqs] corpus catalog loaded: {} corpora (in-memory)",
+        catalog.len()
+    );
+
     let state = HttpAppState {
         db_path: db_path.clone(),
         test_mode: args.test,
@@ -1833,13 +1982,20 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         request_log_path: request_log_path.clone(),
         request_log_max_bytes: args.log_max_bytes,
         request_log_keep_files: args.log_keep_files,
+        pando_hcm,
+        catalog: catalog.clone(),
     };
     let hk_db_path = db_path.clone();
     let hk_session_ttl = args.session_ttl_minutes;
+    let hk_catalog = catalog.clone();
     tokio::spawn(async move {
         loop {
             sleep(Duration::from_secs(60)).await;
             run_housekeeping_once(&hk_db_path, hk_session_ttl);
+            // Pick up CLI corpora add/delete/upsert without restarting serve.
+            if let Err(err) = hk_catalog.reload(&hk_db_path) {
+                eprintln!("[fqs] catalog reload failed: {err}");
+            }
         }
     });
     let app = Router::new()
@@ -1854,6 +2010,11 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         .route("/reindex/jobs/mark-started", post(http_reindex_mark_started))
         .route("/reindex/jobs/mark-finished", post(http_reindex_mark_finished))
         .route("/query", post(http_query))
+        .route("/backends", get(http_backends))
+        .route("/info", get(http_pando_info))
+        .route("/context", get(http_pando_context))
+        .route("/status", get(http_pando_status))
+        .route("/run", post(http_pando_run))
         .layer(middleware::from_fn_with_state(state.clone(), http_log_middleware))
         .with_state(state);
 
@@ -2714,14 +2875,21 @@ fn execute_reindex_job_for_worker(db_path: &Path, job_id: &str, worker_id: &str)
 }
 
 async fn http_health(State(state): State<HttpAppState>) -> Json<Value> {
-    Json(json!({
+    let mut body = json!({
         "ok": true,
         "service": "fqs",
         "mode": "http",
         "version": env!("CARGO_PKG_VERSION"),
         "server_name": state.server_name,
         "db_path": state.db_path.to_string_lossy(),
-    }))
+        "catalog_corpora": state.catalog.len(),
+    });
+    if let Some(hcm) = &state.pando_hcm {
+        body["pando"] = hcm.status_json();
+    } else {
+        body["pando"] = json!({"available": false});
+    }
+    Json(body)
 }
 
 async fn http_root_with_state(State(state): State<HttpAppState>) -> Json<Value> {
@@ -2742,7 +2910,12 @@ async fn http_root_with_state(State(state): State<HttpAppState>) -> Json<Value> 
             {"method":"POST", "path":"/reindex/workers/heartbeat", "description":"Worker heartbeat + capacity"},
             {"method":"POST", "path":"/reindex/jobs/mark-started", "description":"Worker callback: mark started"},
             {"method":"POST", "path":"/reindex/jobs/mark-finished", "description":"Worker callback: mark finished"},
-            {"method":"POST", "path":"/query", "description":"Run query (JSON body: corpus, query, language?, start?, size?, request_role?)"}
+            {"method":"POST", "path":"/query", "description":"Run query (JSON body: corpus, query, language?, start?, size?, request_role?)"},
+            {"method":"GET", "path":"/backends", "description":"Warm backend / HCM status"},
+            {"method":"GET", "path":"/info", "description":"Pando corpus info (?corpus=)"},
+            {"method":"GET", "path":"/context", "description":"Pando KWIC context (?corpus=&pos=&left=&right=)"},
+            {"method":"GET", "path":"/status", "description":"Pando async total job (?corpus=&job=)"},
+            {"method":"POST", "path":"/run", "description":"Pando CQL program (JSON: corpus, cql|query, …)"}
         ]
     }))
 }
@@ -2751,16 +2924,13 @@ async fn http_list_corpora(
     State(state): State<HttpAppState>,
     AxumQuery(params): AxumQuery<HttpCorporaQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = open_db(&state.db_path).map_err(to_http_err)?;
     let role = normalize_role(params.request_role.as_deref());
     let include_noncurrent = params.include_noncurrent.unwrap_or(false);
-    let corpora = list_corpora(
-        &conn,
+    let corpora = state.catalog.list(
         params.environment.as_deref(),
         include_noncurrent,
         params.tag.as_deref(),
-    )
-    .map_err(to_http_err)?;
+    );
     let filtered = corpora
         .into_iter()
         .filter(|c| is_http_access_allowed(c, &role) && is_http_operation_allowed(c, "catalog"))
@@ -2772,16 +2942,13 @@ async fn http_browse_labels(
     State(state): State<HttpAppState>,
     AxumQuery(params): AxumQuery<HttpCorporaQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let conn = open_db(&state.db_path).map_err(to_http_err)?;
     let role = normalize_role(params.request_role.as_deref());
     let include_noncurrent = params.include_noncurrent.unwrap_or(false);
-    let corpora = list_corpora(
-        &conn,
+    let corpora = state.catalog.list(
         params.environment.as_deref(),
         include_noncurrent,
         None,
-    )
-    .map_err(to_http_err)?;
+    );
     let filtered = corpora
         .into_iter()
         .filter(|c| is_http_access_allowed(c, &role) && is_http_operation_allowed(c, "catalog"))
@@ -2863,7 +3030,7 @@ async fn http_reindex_enqueue(
         return Err((StatusCode::FORBIDDEN, "Reindex enqueue requires admin role".to_string()));
     }
     let conn = open_db(&state.db_path).map_err(to_http_err)?;
-    let _ = get_corpus(&conn, &req.corpus).map_err(to_http_err)?;
+    let _ = state.catalog.get(&req.corpus).map_err(to_http_err)?;
     let mut backends = req.backends.unwrap_or_default();
     backends.retain(|x| !x.trim().is_empty());
     if backends.is_empty() {
@@ -2945,8 +3112,7 @@ async fn http_query(
     Json(req): Json<HttpQueryRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let started = Instant::now();
-    let conn = open_db(&state.db_path).map_err(to_http_err)?;
-    let corpus = get_corpus(&conn, &req.corpus).map_err(to_http_err)?;
+    let corpus = state.catalog.get(&req.corpus).map_err(to_http_err)?;
     let role = normalize_role(req.request_role.as_deref());
     if let Some(sid) = req.session_id.as_deref() {
         touch_active_session(
@@ -2991,18 +3157,29 @@ async fn http_query(
         .to_string();
     let start = req.start.unwrap_or(0);
     let size = req.size.unwrap_or(25);
-    let mut response = match execute_query(
-        &corpus,
-        &req.corpus,
-        &req.query,
-        &language,
-        start,
-        size,
-        req.backend.as_deref(),
-        Some(&req),
-    ) {
-        Ok(r) => r,
-        Err(e) => {
+    let corpus_for_exec = corpus.clone();
+    let corpus_id = req.corpus.clone();
+    let query_text = req.query.clone();
+    let backend_override = req.backend.clone();
+    let query_opts = req.clone();
+    let hcm = state.pando_hcm.clone();
+    let mut response = match tokio::task::spawn_blocking(move || {
+        execute_query(
+            &corpus_for_exec,
+            &corpus_id,
+            &query_text,
+            &language,
+            start,
+            size,
+            backend_override.as_deref(),
+            Some(&query_opts),
+            hcm,
+        )
+    })
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             let err_txt = e.to_string();
             let http = to_http_err(e);
             log_query_request_row(
@@ -3017,6 +3194,12 @@ async fn http_query(
                 Some(&err_txt),
             );
             return Err(http);
+        }
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("query worker join error: {e}"),
+            ));
         }
     };
     if let Some(obj) = response.as_object_mut() {
@@ -3048,17 +3231,189 @@ async fn http_query(
     Ok(Json(response))
 }
 
+#[derive(Debug, Deserialize)]
+struct PandoCorpusQuery {
+    corpus: String,
+    job: Option<String>,
+    pos: Option<String>,
+    left: Option<String>,
+    right: Option<String>,
+    sentence: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PandoRunRequest {
+    corpus: String,
+    #[serde(default)]
+    cql: Option<String>,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
+}
+
+async fn http_backends(State(state): State<HttpAppState>) -> Json<Value> {
+    Json(json!({
+        "ok": true,
+        "pando": state.pando_hcm.as_ref().map(|h| h.status_json()).unwrap_or(json!({"available": false})),
+    }))
+}
+
+async fn pando_dispatch_get(
+    state: &HttpAppState,
+    corpus_id: &str,
+    path: &str,
+    query: &str,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let hcm = state
+        .pando_hcm
+        .clone()
+        .ok_or_else(|| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "libflexicorp_pando hot path not available".to_string(),
+            )
+        })?;
+    // Resolve corpus from the in-memory catalog on the async path; only FFI +
+    // index_dir resolution stay in spawn_blocking.
+    let corpus = state.catalog.get(corpus_id).map_err(to_http_err)?;
+    let index_dir = resolve_pando_index_dir(&corpus).map_err(to_http_err)?;
+    let corpus_id_owned = corpus_id.to_string();
+    let path_owned = path.to_string();
+    let query_owned = query.to_string();
+    let result = tokio::task::spawn_blocking(move || -> Result<(i32, Value)> {
+        let guard = HotGuard::acquire(hcm, &corpus_id_owned, &index_dir, false)?;
+        guard.request("GET", &path_owned, &query_owned, "")
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("worker join: {e}"),
+        )
+    })?
+    .map_err(to_http_err)?;
+    let (status, payload) = result;
+    if status >= 400 {
+        let msg = payload
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pando error")
+            .to_string();
+        return Err((
+            StatusCode::from_u16(status as u16).unwrap_or(StatusCode::BAD_REQUEST),
+            msg,
+        ));
+    }
+    Ok(Json(payload))
+}
+
+async fn http_pando_info(
+    State(state): State<HttpAppState>,
+    AxumQuery(q): AxumQuery<PandoCorpusQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    pando_dispatch_get(&state, &q.corpus, "/info", "").await
+}
+
+async fn http_pando_status(
+    State(state): State<HttpAppState>,
+    AxumQuery(q): AxumQuery<PandoCorpusQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let job = q.job.as_deref().unwrap_or("");
+    if job.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "job is required".to_string()));
+    }
+    let qs = format!("job={job}");
+    pando_dispatch_get(&state, &q.corpus, "/status", &qs).await
+}
+
+async fn http_pando_context(
+    State(state): State<HttpAppState>,
+    AxumQuery(q): AxumQuery<PandoCorpusQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let pos = q.pos.as_deref().unwrap_or("");
+    if pos.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "pos is required".to_string()));
+    }
+    let mut parts = vec![format!("pos={pos}")];
+    if let Some(l) = &q.left {
+        parts.push(format!("left={l}"));
+    }
+    if let Some(r) = &q.right {
+        parts.push(format!("right={r}"));
+    }
+    if let Some(s) = &q.sentence {
+        parts.push(format!("sentence={s}"));
+    }
+    let qs = parts.join("&");
+    pando_dispatch_get(&state, &q.corpus, "/context", &qs).await
+}
+
+async fn http_pando_run(
+    State(state): State<HttpAppState>,
+    Json(req): Json<PandoRunRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let hcm = state.pando_hcm.clone().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "libflexicorp_pando hot path not available".to_string(),
+        )
+    })?;
+    let cql = req
+        .cql
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or(req.query.clone())
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "cql or query required".to_string()))?;
+    let mut body = json!({ "cql": cql });
+    if let Some(obj) = body.as_object_mut() {
+        for (k, v) in req.extra {
+            if k != "corpus" {
+                obj.insert(k, v);
+            }
+        }
+    }
+    let body_s = body.to_string();
+    let corpus = state.catalog.get(&req.corpus).map_err(to_http_err)?;
+    let index_dir = resolve_pando_index_dir(&corpus).map_err(to_http_err)?;
+    let corpus_id = req.corpus.clone();
+    let result = tokio::task::spawn_blocking(move || -> Result<(i32, Value)> {
+        let guard = HotGuard::acquire(hcm, &corpus_id, &index_dir, false)?;
+        guard.request("POST", "/run", "", &body_s)
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("worker join: {e}"),
+        )
+    })?
+    .map_err(to_http_err)?;
+    let (status, payload) = result;
+    if status >= 400 {
+        let msg = payload
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pando error")
+            .to_string();
+        return Err((
+            StatusCode::from_u16(status as u16).unwrap_or(StatusCode::BAD_REQUEST),
+            msg,
+        ));
+    }
+    Ok(Json(payload))
+}
+
 async fn http_fcs(
     State(state): State<HttpAppState>,
     AxumQuery(params): AxumQuery<FcsQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let conn = open_db(&state.db_path).map_err(to_http_err)?;
     let role = normalize_role(params.request_role.as_deref());
     let operation = resolve_fcs_operation(&params);
 
     let xml = match operation.as_str() {
         "explain" => {
-            let corpora = list_corpora(&conn, None, false, None).map_err(to_http_err)?;
+            let corpora = state.catalog.list(None, false, None);
             let visible = corpora
                 .into_iter()
                 .filter(|c| is_http_access_allowed(c, &role) || state.test_mode)
@@ -3085,7 +3440,7 @@ async fn http_fcs(
                 .or_else(|| params.x_corpus.clone());
 
             if let Some(corpus_id) = context {
-                let corpus = get_corpus(&conn, &corpus_id).map_err(to_http_err)?;
+                let corpus = state.catalog.get(&corpus_id).map_err(to_http_err)?;
                 if !is_fcs_enabled(&corpus) {
                     return Err((StatusCode::FORBIDDEN, format!("Corpus '{}' is not FCS-enabled", corpus_id)));
                 }
@@ -3103,12 +3458,23 @@ async fn http_fcs(
                     ));
                 }
 
-                let response = execute_query(&corpus, &corpus_id, &query, "auto", start, max, None, None)
+                let hcm = state.pando_hcm.clone();
+                let response = execute_query(
+                    &corpus,
+                    &corpus_id,
+                    &query,
+                    "auto",
+                    start,
+                    max,
+                    None,
+                    None,
+                    hcm,
+                )
                     .map_err(to_http_err)?;
                 build_fcs_search_xml(&corpus, &query, &response)
             } else {
                 // Compatibility: no context means search all eligible corpora and merge summaries.
-                let corpora = list_corpora(&conn, None, false, None).map_err(to_http_err)?;
+                let corpora = state.catalog.list(None, false, None);
                 let eligible = corpora
                     .into_iter()
                     .filter(|c| is_fcs_enabled(c))
@@ -3116,8 +3482,11 @@ async fn http_fcs(
                     .filter(|c| is_http_operation_allowed(c, "query") || state.test_mode)
                     .collect::<Vec<_>>();
                 let mut per = Vec::<(CorpusEntry, Value)>::new();
+                let hcm = state.pando_hcm.clone();
                 for c in eligible {
-                    if let Ok(resp) = execute_query(&c, &c.id, &query, "auto", start, max, None, None) {
+                    if let Ok(resp) =
+                        execute_query(&c, &c.id, &query, "auto", start, max, None, None, hcm.clone())
+                    {
                         per.push((c, resp));
                     }
                 }
@@ -4683,6 +5052,7 @@ WHERE id = ?1
 
 #[derive(Debug)]
 struct PandoExecResult {
+    kind: String,
     binary: String,
     index_dir: String,
     exit_code: i32,
@@ -4698,9 +5068,55 @@ struct CqpExecResult {
     payload: Value,
 }
 
-fn run_pando_query(corpus: &CorpusEntry, query_text: &str, start: u32, size: u32) -> Result<PandoExecResult> {
-    let binaries = resolve_flexicorp_pando_bins(corpus);
+fn run_pando_query(
+    corpus: &CorpusEntry,
+    query_text: &str,
+    start: u32,
+    size: u32,
+    query_options: Option<&HttpQueryRequest>,
+    pando_hcm: Option<&Arc<HotCorpusManager>>,
+) -> Result<PandoExecResult> {
     let index_dir = resolve_pando_index_dir(corpus)?;
+    let window = query_options.and_then(|q| q.window);
+    let sentence = query_options
+        .and_then(|q| q.context_scope.as_deref())
+        .map(|s| {
+            let t = s.trim().to_lowercase();
+            t == "s" || t == "sentence" || t == "sent"
+        })
+        .unwrap_or(false);
+    // Prefer async when HCM is available so totals can progress in the background;
+    // TEITOK can still poll /status later. Sync true remains the CLI default.
+    let total_mode = if pando_hcm.is_some() { "async" } else { "true" };
+
+    if let Some(hcm) = pando_hcm {
+        let guard = HotGuard::acquire(
+            Arc::clone(hcm),
+            &corpus.id,
+            &index_dir,
+            false,
+        )?;
+        let body = pando_query_body(query_text, start, size, window, sentence, total_mode);
+        let (status, engine) = guard.request("POST", "/query", "", &body)?;
+        if status >= 400 {
+            let err = engine
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pando request failed");
+            anyhow::bail!("pando /query HTTP {status}: {err}");
+        }
+        let payload = wrap_pando_server_as_fqs_raw(engine);
+        return Ok(PandoExecResult {
+            kind: "flexicorp-pando-lib".to_string(),
+            binary: hcm.lib().build_string(),
+            index_dir: index_dir.display().to_string(),
+            exit_code: 0,
+            payload,
+        });
+    }
+
+    // Cold CLI fallback (Path A / library missing)
+    let binaries = resolve_flexicorp_pando_bins(corpus);
     let mut output = None;
     let mut binary = String::new();
     let mut spawn_errors: Vec<String> = Vec::new();
@@ -4721,6 +5137,9 @@ fn run_pando_query(corpus: &CorpusEntry, query_text: &str, start: u32, size: u32
             .arg(size.to_string())
             .arg("--max-total")
             .arg(max_total);
+        if let Some(w) = window {
+            cmd.arg("--context").arg(w.to_string());
+        }
         match cmd.output() {
             Ok(out) => {
                 output = Some(out);
@@ -4757,6 +5176,7 @@ fn run_pando_query(corpus: &CorpusEntry, query_text: &str, start: u32, size: u32
         .with_context(|| "flexicorp-pando output is not valid JSON")?;
 
     Ok(PandoExecResult {
+        kind: "flexicorp-pando-cli".to_string(),
         binary,
         index_dir: index_dir.display().to_string(),
         exit_code,
