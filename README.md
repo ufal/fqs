@@ -322,6 +322,104 @@ Corpus WorkBench (CQP) and Pando already include `LAST` in that listing; **FQS s
 
 Renaming or friendly labels belong in UI/config (e.g. flexicorp.php / query library): they are **presentation**, not a second parallel notion of “last”. The canonical slot stays `LAST` unless an explicit alias layer is introduced.
 
+## Roles, tiers and limits
+
+FQS decides **who** is asking and **how much** they may use; the engine (pando,
+through `libflexicorp_pando` api ≥ 4) enforces what one request may do.
+
+**Roles.** Callers send `request_role`: `visitor` (not logged in), `user`
+(logged in), `admin` (corpus / server admin; `corpus_admin`, `server_admin`
+are accepted too). With a shared secret (`--jwt-secret`, env `FQS_SECRET` —
+the one TEITOK already signs its `Authorization: Bearer` HS256 tokens with) the
+role comes **only** from a valid, unexpired token's `role` claim, and a request
+without one is a visitor; `/health` → `limits.role_trust: "jwt"`. Without a
+secret the `request_role` field is believed (`"unverified"`) — only acceptable
+when FQS is reachable from the front-ends alone.
+
+**Tiers** (`--limits FILE`, env `FQS_LIMITS`): one object per role.
+
+```json
+{"heavy_slots": 8, "default_tier": "visitor",
+ "tiers": {
+   "visitor": {"slots": 2, "per_user": 1, "queue_ms": 3000,
+               "timeout_ms": 20000, "total_timeout_ms": 60000, "max_count_hits": 2000000,
+               "max_hits": 500000, "threads": 1, "deny": ["transitive", "regex_no_prefix"]},
+   "user":    {"slots": 4, "per_user": 2, "queue_ms": 10000,
+               "timeout_ms": 60000, "total_timeout_ms": 300000, "max_count_hits": 20000000,
+               "max_hits": 5000000, "threads": 4},
+   "admin":   {"per_user": 4, "queue_ms": 30000, "threads": 8}},
+ "pando": {"query_threads": 4, "session_max_hits": 5000000, "session_memory_mb": 4096}}
+```
+
+* FQS side — **admission** of heavy requests (a `/run` program, a `/query`
+  with a `;` program): `slots` per tier and `heavy_slots` overall, waiting at
+  most `queue_ms` (then **503** `{"busy": true, "retry_after_s": …}`), and
+  `per_user` heavy requests at once per user (then **429**). The user is the
+  token's `user` claim (without a secret: the `user` field), else the
+  `session_id`, else the client address. Pages, `/status`, `/info`,
+  `/context` and sessions never queue. Keep `heavy_slots × threads` at or
+  below the cores.
+* **Process slots** — every search that runs as a child process takes one of
+  `process_slots` (default half the CPUs, at least 2), pages included, waiting
+  at most `process_queue_ms` (default 30000, then **503** busy). That covers the
+  CQP backend (`python -m flexicorp` + `cqp` per search) and pando without
+  libflexicorp_pando (the cold CLI); FCS searchRetrieve too. A burst of CWB
+  searches queues instead of starting one process each. Hot pando searches run
+  inside FQS and never take one. `/health` → `limits.process_slots_free`.
+* Engine side — the same tier objects go to pando, and FQS puts `"tier"` into
+  every engine request (dropping any a client sent): `timeout_ms` (408; a
+  request's own `timeout_ms` can only lower it), `total_timeout_ms`
+  (background totals stop, `timed_out`), `max_count_hits` (413 for count /
+  freq / coll / sort / … over more hits), `max_hits` (sorted sets), `threads`,
+  `deny` (403 `{"denied": "<feature>"}`: `transitive`, `unbounded_repeat`,
+  `regex_no_prefix`, `regex`, `parallel`, `negated_relation`). See pando's
+  wiki CLI-Reference, "Limits by tier".
+* Engine errors keep their status (403 / 408 / 413 / 404 / 429 / 503); the
+  body is the engine's JSON.
+
+**Per corpus**: a catalog entry's `settings.limits` overrides the file for that
+corpus's engine — `{"tiers": {"visitor": {"max_count_hits": 500000}}, "pando":
+{"query_threads": 8}}` (tier members replaced one by one). A warm corpus keeps the
+options it was opened with until FQS closes and reopens it.
+
+`/health` → `limits` shows the tiers, free slots and the role trust mode.
+
+## Activity log
+
+`fqs serve --activity-log FILE` (or `FQS_ACTIVITY_LOG`) writes one JSON object
+per line, for looking back at what the server did. It is off unless given, and
+rotates like the request log (`--log-max-bytes`, `--log-keep-files`).
+
+| Event | Fields |
+| --- | --- |
+| `start` | pid, version, `max_warm`, `idle_ttl_secs`, whether tiers are configured |
+| `query` | a `/query`, `/run` or FCS searchRetrieve: `endpoint`, `corpus`, `query`, `role`, `tier`, `user`, `status`, `elapsed_ms`, `queued_ms` (admission wait, heavy requests), `warm` (false = the corpus had to be opened, `open_ms`), `hits` / `total` when answered, `error` and `denied` / `limit` / `busy` / `timed_out` when refused |
+| `warm_open` | `corpus`, `open_ms`, `warm` (open corpora now) |
+| `warm_close` | `corpus`, `reason` (`lru`: room for another corpus; `idle`: idle TTL), `age_secs`, `idle_secs`, `requests` served |
+| `warm_full` | no room could be made (all open corpora in use, or the oldest still counting): FQS goes over `--pando-max-warm` for a while |
+| `warm_state` | every `--activity-state-secs` (default 300; 0 = none): the open corpora with age, idle time and requests, and the process's `rss_bytes` |
+
+`--activity-events queries|warm|all` (default all) picks what is logged.
+`--activity-log-users hash|plain|none` (default hash): the user is the identity
+the limits use (JWT `sub`, the request's `user`, else `session:…` or `ip:…`);
+hashed, it is 12 hex digits of a salted SHA-256, comparable within one run, or
+across runs with a fixed `--activity-salt` / `FQS_ACTIVITY_SALT`.
+
+    fqs serve --activity-log /var/log/fqs/activity.jsonl
+    jq -c 'select(.event=="warm_close")' /var/log/fqs/activity.jsonl
+
+## Pando hit-set sessions
+
+`/query` with `session_id` and `name` stores the result in that session
+(pando creates the session on first use, same id); `/query` with
+`session_id` + `from: "<name>"` pages the stored set (sorted sets in their
+sorted order); `/run` with `session_id` runs commands on the stored sets
+(`sort Q1 by lemma`, `count Q1 by lemma`, `coll Q1`, `size Q1`). Sessions live
+in the corpus handle: when FQS closes an idle corpus, its sessions go too, and
+a request then gets **404** `unknown_session` / `unknown_hitset` — run the query
+again. `POST /session {corpus, session_id?, ttl_s?}`, `GET /session?corpus=&session_id=`,
+`POST /session/close {corpus, session_id}`, `GET /sessions?corpus=`.
+
 ## Notes
 
 - `fqs query` currently supports `pando` and `cqp`; other backends return `not implemented yet`.

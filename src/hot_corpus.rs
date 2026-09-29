@@ -23,18 +23,36 @@
 //!     warm corpora that are all actively in use costs N `Instant::elapsed()`
 //!     calls and zero engine calls.
 
+use crate::activity::{fields, process_memory, ActivityLog};
 use crate::pando_lib::PandoLib;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+thread_local! {
+    /// Set by `acquire` on this thread: Some(ms) when it opened the corpus.
+    static LAST_OPEN_MS: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// Run `f` (one request's engine work, on a blocking thread) and report whether
+/// it had to open its corpus, and how long that took (for the activity log).
+pub fn track_open<T>(f: impl FnOnce() -> T) -> (T, Option<u64>) {
+    LAST_OPEN_MS.with(|c| c.set(None));
+    let r = f();
+    (r, LAST_OPEN_MS.with(|c| c.take()))
+}
 
 #[derive(Clone, Debug)]
 pub struct HotCorpusConfig {
     pub max_warm: usize,
     pub idle_ttl: Duration,
+    /// Pando server options for every handle (limits by tier, sessions, …;
+    /// `flexicorp_pando_open_opts`, api_version >= 4). None = the defaults.
+    pub open_options: Option<String>,
 }
 
 impl Default for HotCorpusConfig {
@@ -42,6 +60,7 @@ impl Default for HotCorpusConfig {
         Self {
             max_warm: 8,
             idle_ttl: Duration::from_secs(30 * 60),
+            open_options: None,
         }
     }
 }
@@ -53,6 +72,9 @@ struct WarmEntry {
     last_used: Instant,
     /// In-flight FQS request refs (spawn_blocking / HotGuard).
     refs: usize,
+    opened_at: Instant,
+    /// Requests served since it was opened.
+    requests: u64,
 }
 
 // SAFETY: ServerApi handles are concurrent-safe for queries; we only move ctx
@@ -63,6 +85,7 @@ pub struct HotCorpusManager {
     lib: Arc<PandoLib>,
     cfg: HotCorpusConfig,
     inner: Mutex<HashMap<String, WarmEntry>>,
+    activity: OnceLock<Arc<ActivityLog>>,
 }
 
 impl HotCorpusManager {
@@ -71,7 +94,73 @@ impl HotCorpusManager {
             lib,
             cfg,
             inner: Mutex::new(HashMap::new()),
+            activity: OnceLock::new(),
         })
+    }
+
+    /// Log opens / closes / snapshots to `log` (`serve --activity-log`).
+    pub fn set_activity(&self, log: Arc<ActivityLog>) {
+        let _ = self.activity.set(log);
+    }
+
+    fn log_warm(&self, event: &str, f: Vec<(&str, Value)>) {
+        if let Some(a) = self.activity.get() {
+            a.warm(event, fields(f));
+        }
+    }
+
+    fn log_close(&self, e: &WarmEntry, reason: &str, engine_idle: Option<f64>, warm_after: usize) {
+        self.log_warm("warm_close", vec![
+            ("corpus", json!(e.corpus_id)),
+            ("reason", json!(reason)),
+            ("age_secs", json!(e.opened_at.elapsed().as_secs())),
+            ("idle_secs", json!(e.last_used.elapsed().as_secs())),
+            ("engine_idle_secs", engine_idle.filter(|v| *v < 1e12).map(|v| json!(v.round())).unwrap_or(Value::Null)),
+            ("requests", json!(e.requests)),
+            ("warm", json!(warm_after)),
+        ]);
+    }
+
+    /// A `warm_state` record: the warm corpora and the process's memory.
+    pub fn log_state(&self) {
+        let Some(a) = self.activity.get() else { return };
+        if !a.logs_warm() {
+            return;
+        }
+        let entries: Vec<Value> = {
+            let g = self.inner.lock().expect("hcm lock");
+            let mut v: Vec<&WarmEntry> = g.values().collect();
+            v.sort_by_key(|e| e.last_used);
+            v.iter().rev().map(|e| json!({
+                "corpus": e.corpus_id,
+                "refs": e.refs,
+                "age_secs": e.opened_at.elapsed().as_secs(),
+                "idle_secs": e.last_used.elapsed().as_secs(),
+                "requests": e.requests,
+            })).collect()
+        };
+        let (rss, peak) = process_memory();
+        a.warm("warm_state", fields(vec![
+            ("warm", json!(entries.len())),
+            ("max_warm", json!(self.cfg.max_warm)),
+            ("corpora", Value::Array(entries)),
+            ("rss_bytes", rss.map(|v| json!(v)).unwrap_or(Value::Null)),
+            ("peak_rss_bytes", peak.map(|v| json!(v)).unwrap_or(Value::Null)),
+        ]));
+    }
+
+    /// Log a `warm_state` record every `interval` (the activity log's snapshots).
+    pub fn spawn_state_logger(self: &Arc<Self>, interval: Duration) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let t = Arc::clone(&this);
+                let _ = tokio::task::spawn_blocking(move || t.log_state()).await;
+            }
+        });
     }
 
     pub fn lib(&self) -> &Arc<PandoLib> {
@@ -95,6 +184,8 @@ impl HotCorpusManager {
                     "busy": busy,
                     "idle_secs": idle,
                     "fqs_idle_secs": e.last_used.elapsed().as_secs(),
+                    "age_secs": e.opened_at.elapsed().as_secs(),
+                    "requests": e.requests,
                 })
             })
             .collect();
@@ -103,6 +194,9 @@ impl HotCorpusManager {
             "engine_build": self.lib.build_string(),
             "api_version": self.lib.api_version(),
             "max_warm": self.cfg.max_warm,
+            "engine_options": self.cfg.open_options.as_deref()
+                .and_then(|o| serde_json::from_str::<Value>(o).ok()),
+            "engine_options_applied": self.cfg.open_options.is_none() || self.lib.has_open_opts(),
             "idle_ttl_secs": self.cfg.idle_ttl.as_secs(),
             "warm": entries,
         });
@@ -113,26 +207,53 @@ impl HotCorpusManager {
     }
 
     /// Borrow a warm handle for one request. Caller must `release` when done.
-    pub fn acquire(&self, corpus_id: &str, index_dir: &Path, preload: bool) -> Result<()> {
+    /// `open_options`: engine options for this corpus when it has to be opened
+    /// (None = the manager's default). A warm handle keeps the options it was opened with.
+    pub fn acquire(&self, corpus_id: &str, index_dir: &Path, preload: bool,
+                   open_options: Option<&str>) -> Result<()> {
         let mut g = self.inner.lock().expect("hcm lock");
         if let Some(e) = g.get_mut(corpus_id) {
             e.last_used = Instant::now();
             e.refs += 1;
+            e.requests += 1;
             return Ok(());
         }
         // Make room only for a genuinely new corpus (never inline in release()).
-        self.make_room_locked(&mut g);
-        let ctx = self.lib.open(index_dir, preload)?;
+        self.make_room_locked(&mut g, corpus_id);
+        let opts = open_options.or(self.cfg.open_options.as_deref());
+        let t0 = Instant::now();
+        let ctx = match self.lib.open_with(index_dir, preload, opts) {
+            Ok(c) => c,
+            Err(err) => {
+                self.log_warm("warm_open_failed", vec![
+                    ("corpus", json!(corpus_id)),
+                    ("error", json!(err.to_string())),
+                    ("warm", json!(g.len())),
+                ]);
+                return Err(err);
+            }
+        };
+        let open_ms = t0.elapsed().as_millis() as u64;
+        LAST_OPEN_MS.with(|c| c.set(Some(open_ms)));
+        let now = Instant::now();
         g.insert(
             corpus_id.to_string(),
             WarmEntry {
                 corpus_id: corpus_id.to_string(),
                 index_dir: index_dir.to_path_buf(),
                 ctx,
-                last_used: Instant::now(),
+                last_used: now,
                 refs: 1,
+                opened_at: now,
+                requests: 1,
             },
         );
+        self.log_warm("warm_open", vec![
+            ("corpus", json!(corpus_id)),
+            ("open_ms", json!(open_ms)),
+            ("warm", json!(g.len())),
+            ("max_warm", json!(self.cfg.max_warm)),
+        ]);
         Ok(())
     }
 
@@ -174,7 +295,7 @@ impl HotCorpusManager {
     /// work, this stops rather than searching for a second one: acquire() may
     /// then briefly exceed `max_warm` (harmless — a busy corpus would refuse
     /// eviction under any ordering) and the next acquire or sweep tries again.
-    fn make_room_locked(&self, g: &mut HashMap<String, WarmEntry>) {
+    fn make_room_locked(&self, g: &mut HashMap<String, WarmEntry>, for_corpus: &str) {
         let max = self.cfg.max_warm.max(1);
         while g.len() >= max {
             let victim = g
@@ -182,16 +303,32 @@ impl HotCorpusManager {
                 .filter(|(_, e)| e.refs == 0)
                 .min_by_key(|(_, e)| e.last_used)
                 .map(|(id, _)| id.clone());
-            let Some(id) = victim else { break };
+            let Some(id) = victim else {
+                self.log_warm("warm_full", vec![
+                    ("corpus", json!(for_corpus)),
+                    ("reason", json!("in_use")),
+                    ("warm", json!(g.len())),
+                    ("max_warm", json!(max)),
+                ]);
+                break;
+            };
             let busy = match g.get(&id) {
                 Some(e) => self.lib.busy(e.ctx),
                 None => break,
             };
             if busy != 0 {
+                self.log_warm("warm_full", vec![
+                    ("corpus", json!(for_corpus)),
+                    ("reason", json!("busy")),
+                    ("busy_corpus", json!(id)),
+                    ("warm", json!(g.len())),
+                    ("max_warm", json!(max)),
+                ]);
                 break;
             }
             if let Some(e) = g.remove(&id) {
                 self.lib.close(e.ctx);
+                self.log_close(&e, "lru", None, g.len());
             }
         }
     }
@@ -221,6 +358,7 @@ impl HotCorpusManager {
             }
             if let Some(e) = g.remove(&id) {
                 self.lib.close(e.ctx);
+                self.log_close(&e, "idle", Some(engine_idle), g.len());
             }
         }
     }
@@ -249,8 +387,12 @@ impl HotCorpusManager {
 impl Drop for HotCorpusManager {
     fn drop(&mut self) {
         if let Ok(mut g) = self.inner.lock() {
-            for (_, e) in g.drain() {
+            let entries: Vec<WarmEntry> = g.drain().map(|(_, e)| e).collect();
+            let mut left = entries.len();
+            for e in entries {
                 self.lib.close(e.ctx);
+                left -= 1;
+                self.log_close(&e, "shutdown", None, left);
             }
         }
     }
@@ -268,8 +410,9 @@ impl HotGuard {
         corpus_id: &str,
         index_dir: &Path,
         preload: bool,
+        open_options: Option<&str>,
     ) -> Result<Self> {
-        hcm.acquire(corpus_id, index_dir, preload)?;
+        hcm.acquire(corpus_id, index_dir, preload, open_options)?;
         Ok(Self {
             hcm,
             corpus_id: corpus_id.to_string(),
@@ -313,6 +456,7 @@ pub fn pando_query_body(
     window: Option<u32>,
     sentence: bool,
     total: &str,
+    extra: &serde_json::Map<String, Value>,
 ) -> String {
     let mut body = json!({
         "query": query,
@@ -330,6 +474,11 @@ pub fn pando_query_body(
     });
     if total == "true" {
         body["max_total"] = json!(0);
+    }
+    if let Some(o) = body.as_object_mut() {
+        for (k, v) in extra {
+            o.insert(k.clone(), v.clone());
+        }
     }
     body.to_string()
 }

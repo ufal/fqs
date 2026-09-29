@@ -2,6 +2,7 @@
 //!
 //! api_version >= 2: flexicorp_pando_request
 //! api_version >= 3: busy, idle_seconds, build_json (ServerApi embedding contract)
+//! api_version >= 4: open_opts (server options JSON: limits by tier, sessions, …)
 
 use anyhow::{anyhow, bail, Context, Result};
 use libloading::{Library, Symbol};
@@ -15,6 +16,7 @@ type ApiVersionFn = unsafe extern "C" fn() -> c_int;
 type BuildStringFn = unsafe extern "C" fn() -> *const c_char;
 type BuildJsonFn = unsafe extern "C" fn() -> *const c_char;
 type OpenFn = unsafe extern "C" fn(*const c_char, *const c_char, c_int) -> *mut c_void;
+type OpenOptsFn = unsafe extern "C" fn(*const c_char, *const c_char, *const c_char) -> *mut c_void;
 type CloseFn = unsafe extern "C" fn(*mut c_void);
 type RequestFn = unsafe extern "C" fn(
     *mut c_void,
@@ -34,6 +36,7 @@ pub struct PandoLib {
     build_string_fn: BuildStringFn,
     build_json_fn: Option<BuildJsonFn>,
     open: OpenFn,
+    open_opts_fn: Option<OpenOptsFn>,
     close: CloseFn,
     request: RequestFn,
     free: FreeFn,
@@ -78,6 +81,11 @@ impl PandoLib {
             } else {
                 None
             };
+            let open_opts_fn = if ver >= 4 {
+                lib.get::<OpenOptsFn>(b"flexicorp_pando_open_opts\0").ok().map(|s| *s)
+            } else {
+                None
+            };
             let idle_seconds_fn = if ver >= 3 {
                 lib.get::<IdleSecondsFn>(b"flexicorp_pando_idle_seconds\0")
                     .ok()
@@ -96,6 +104,7 @@ impl PandoLib {
                 build_string_fn: *build_string_fn,
                 build_json_fn,
                 open: *open,
+                open_opts_fn,
                 close: *close,
                 request: *request,
                 free: *free,
@@ -142,6 +151,34 @@ impl PandoLib {
             if ctx.is_null() {
                 let err = self.last_error_ptr(std::ptr::null_mut());
                 bail!("flexicorp_pando_open failed: {err}");
+            }
+            Ok(ctx)
+        }
+    }
+
+    /// Whether the library takes server options (limits by tier, sessions, …).
+    pub fn has_open_opts(&self) -> bool {
+        self.open_opts_fn.is_some()
+    }
+
+    /// Open with pando server options (api_version >= 4); falls back to `open`
+    /// (options ignored) with an older library.
+    pub fn open_with(&self, index_dir: &Path, preload: bool, options_json: Option<&str>) -> Result<*mut c_void> {
+        let (Some(f), Some(opts)) = (self.open_opts_fn, options_json) else {
+            return self.open(index_dir, preload);
+        };
+        let mut v: Value = serde_json::from_str(opts).unwrap_or_else(|_| Value::Object(Default::default()));
+        if preload {
+            v["preload"] = Value::Bool(true);
+        }
+        let dir = CString::new(index_dir.to_string_lossy().as_bytes())
+            .map_err(|_| anyhow!("index_dir contains NUL"))?;
+        let opts_c = CString::new(v.to_string())?;
+        unsafe {
+            let ctx = f(std::ptr::null(), dir.as_ptr(), opts_c.as_ptr());
+            if ctx.is_null() {
+                let err = self.last_error_ptr(std::ptr::null_mut());
+                bail!("flexicorp_pando_open_opts failed: {err}");
             }
             Ok(ctx)
         }

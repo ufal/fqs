@@ -1,0 +1,37 @@
+{
+  "heavy_slots": 8,
+  "default_tier": "visitor",
+  "tiers": {
+    "visitor": {
+      "slots": 2,
+      "per_user": 1,
+      "queue_ms": 3000,
+      "timeout_ms": 20000,
+      "total_timeout_ms": 60000,
+      "max_count_hits": 2000000,
+      "max_hits": 500000,
+      "threads": 1,
+      "deny": ["transitive", "regex_no_prefix"]
+    },
+    "user": {
+      "slots": 4,
+      "per_user": 2,
+      "queue_ms": 10000,
+      "timeout_ms": 60000,
+      "total_timeout_ms": 300000,
+      "max_count_hits": 20000000,
+      "max_hits": 5000000,
+      "threads": 4
+    },
+    "admin": {
+      "per_user": 4,
+      "queue_ms": 30000,
+      "threads": 8
+    }
+  },
+  "pando": {
+    "query_threads": 4,
+    "session_max_hits": 5000000,
+    "session_memory_mb": 4096
+  }
+}
