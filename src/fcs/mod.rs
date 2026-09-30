@@ -294,7 +294,9 @@ fn expand_link(t: &str, r: &Resource, h: &engine::Hit, rank: u64, link_query: Op
 /// Run the plan (resources one after the other, records numbered across them).
 pub fn search(req: &Request, ep: &Endpoint, plan: Plan, engine_for: &dyn Fn(&Resource) -> Result<Box<dyn Engine>, String>) -> String {
     let mut diags = plan.diagnostics;
-    let want_adv = req.dataviews.iter().any(|d| d == "adv") && req.version == Version::V2_0;
+    // the Advanced view on request, and always for an Advanced Search (FCS-QL)
+    let want_adv = req.version == Version::V2_0
+        && (req.dataviews.iter().any(|d| d == "adv") || req.query_type == QueryType::Fcs);
     let offset = req.start - 1;
     let mut cum = 0u64; // records in the resources before this one
     let mut exact = true;

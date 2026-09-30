@@ -103,10 +103,13 @@ pub fn esc(s: &str) -> String {
 const XML_DECL: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
 
 fn diagnostics_xml(v: Version, diags: &[Diagnostic]) -> String {
+    diagnostics_xml_in(v, v.prefix(), diags)
+}
+
+fn diagnostics_xml_in(v: Version, p: &str, diags: &[Diagnostic]) -> String {
     if diags.is_empty() {
         return String::new();
     }
-    let p = v.prefix();
     let mut o = format!("<{p}:diagnostics>\n");
     for d in diags {
         o.push_str(&format!("<diag:diagnostic xmlns:diag=\"{}\">\n<diag:uri>{}</diag:uri>\n", v.diag_ns(), esc(&d.uri)));
@@ -352,18 +355,23 @@ pub fn search_response(
 
 /// A response that carries only (fatal) diagnostics, for any operation.
 pub fn diagnostic_response(v: Version, operation: &str, diags: &[Diagnostic]) -> String {
-    let p = v.prefix();
     let el = match operation {
         "searchRetrieve" => "searchRetrieveResponse",
         "scan" => "scanResponse",
         _ => "explainResponse",
     };
+    // SRU 2.0 puts scan in its own namespace (1.2: the same one as the rest)
+    let (p, ns) = if el == "scanResponse" && v == Version::V2_0 {
+        ("scan", "http://docs.oasis-open.org/ns/search-ws/scan")
+    } else {
+        (v.prefix(), v.ns())
+    };
     let mut o = String::from(XML_DECL);
-    o.push_str(&format!("<{p}:{el} xmlns:{p}=\"{}\">\n<{p}:version>{}</{p}:version>\n", v.ns(), v.as_str()));
+    o.push_str(&format!("<{p}:{el} xmlns:{p}=\"{ns}\">\n<{p}:version>{}</{p}:version>\n", v.as_str()));
     if el == "searchRetrieveResponse" {
         o.push_str(&format!("<{p}:numberOfRecords>0</{p}:numberOfRecords>\n"));
     }
-    o.push_str(&diagnostics_xml(v, diags));
+    o.push_str(&diagnostics_xml_in(v, p, diags));
     o.push_str(&format!("</{p}:{el}>\n"));
     o
 }
