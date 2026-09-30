@@ -76,11 +76,16 @@ fn param<'a>(p: &'a HashMap<String, String>, k: &str) -> Option<&'a str> {
 }
 
 pub fn parse_request(p: &HashMap<String, String>, ep: &Endpoint) -> Result<Request, Refusal> {
+    // `operation` exists only in SRU 1.x: with it and no (or a bad) version, answer 1.2
+    let legacy = param(p, "operation").is_some();
     let version = match param(p, "version") {
-        None | Some("2.0") => Version::V2_0,
+        Some("2.0") => Version::V2_0,
         Some("1.2") | Some("1.1") => Version::V1_2,
+        None if legacy => Version::V1_2,
+        None => Version::V2_0,
         Some(v) => {
-            return Err((Version::V2_0, Operation::Explain, Diagnostic::sru(5, Some("2.0"), &format!("Unsupported version {v}"))));
+            let answer = if legacy { Version::V1_2 } else { Version::V2_0 };
+            return Err((answer, Operation::Explain, Diagnostic::sru(5, Some(answer.as_str()), &format!("Unsupported version {v}"))));
         }
     };
     let operation = match param(p, "operation") {
@@ -426,6 +431,10 @@ mod tests {
         assert!(refusal_xml(&e).contains("<sruResponse:numberOfRecords>0</sruResponse:numberOfRecords>"));
         assert!(parse_request(&params(&[("query", "x"), ("startRecord", "0")]), &ep()).is_err());
         assert!(parse_request(&params(&[("version", "3.0")]), &ep()).is_err());
+        // SRU 1.x style (operation, no version) → 1.2; bad version with operation → answered in 1.2
+        assert_eq!(parse_request(&params(&[("operation", "explain")]), &ep()).unwrap().version, Version::V1_2);
+        assert_eq!(parse_request(&params(&[]), &ep()).unwrap().version, Version::V2_0);
+        assert_eq!(parse_request(&params(&[("operation", "explain"), ("version", "9.9")]), &ep()).err().unwrap().0, Version::V1_2);
         // endpoint-tester cases
         let e = parse_request(&params(&[("query", "x"), ("recordXMLEscaping", "invalid")]), &ep()).err().unwrap();
         assert_eq!(e.2.uri, "info:srw/diagnostic/1/71");

@@ -113,8 +113,10 @@ around it.
   view not available → FCS 4, busy → SRU 2. `scan` → SRU 4.
 - **Engines** (the query is translated per engine; `settings.fcs.engine` or the
   corpus's backend picks one):
-  - *pando*: the warm library (libflexicorp_pando), or any `pando-server` over
-    HTTP with `settings.pando_server: "http://host:port"`. pando has no `|`
+  - *pando*: `settings.pando_server: "http://host:port"` (any `pando-server`),
+    else the warm library (libflexicorp_pando), else pando's own command line
+    (`settings.pando_binary`, `PANDO_BINARY` or `pando` on the PATH; one process
+    per request, under the process slots). pando has no `|`
     between sequences and no quantified groups: those are expanded into several
     queries whose union is the result (at most 32).
   - *CWB*: `cqp` run directly (`size` + `tabulate`), with `settings.registry_hint`
@@ -276,27 +278,30 @@ In `--full` mode, `cqp` corpora run a small CQP probe; `pando` corpora run `flex
 
 ## Database
 
-Default DB path follows OS conventions:
+Which catalog `fqs` uses (every command, `serve` included) is the first of:
 
-- macOS: `/usr/local/var/fqs/fqs.db`
-- Linux/Unix: `/var/lib/fqs/fqs.db`
-- Windows: `%APPDATA%/fqs/fqs.db`
+1. `--db <file>`
+2. `FQS_DB_PATH`
+3. `"db_path"` in the system config file `/etc/fqs/fqs.json` (or the file named by `FQS_CONFIG`)
+4. the catalog of a running `fqs serve` (its `fqs-http.json` in `/var/lib/fqs` or `/usr/local/var/fqs`)
+5. the default: `/var/lib/fqs/fqs.db` on Linux, `/usr/local/var/fqs/fqs.db` on macOS, `%APPDATA%/fqs/fqs.db` on Windows
 
-For Apache/service deployments, ensure the parent directory exists and is writable by the runtime user (e.g. `www-data`, `apache`), or set `FQS_DB_PATH` explicitly.
+For a server, write the config file once, so the service, an admin shell and TEITOK's PHP
+(`fqs corpora upsert-json` as `www-data`) all use the same catalog, whatever their environment:
+
+```bash
+sudo mkdir -p /etc/fqs /var/lib/fqs
+echo '{"db_path": "/var/lib/fqs/fqs.db"}' | sudo tee /etc/fqs/fqs.json
+```
+
+`fqs status` prints `db_path` and `db_source` (which rule chose it), `/health` shows the same for
+the server, and `fqs serve` logs it at start. When the chosen file does not exist yet, every
+command says so on stderr (it then creates a new, empty catalog): the usual sign that it is not the
+catalog you meant.
+
+For Apache/service deployments, ensure the parent directory exists and is writable by the runtime user (e.g. `www-data`, `apache`).
 
 If you see **`attempt to write a readonly database`** (SQLite error 8), the UID running `fqs` cannot write the `.db` file or the directory that holds it. Typical fixes: create the parent dir and `chown`/`chmod` it for the web server user, or point `FQS_DB_PATH` at a file under your TEITOK project (or `/tmp`) that that user can write—same requirement for `fqs corpora upsert-json` when invoked from PHP.
-
-Override with `--db` on commands, for example:
-
-```bash
-cargo run -- corpora list --db /tmp/fqs.db
-```
-
-Or set one default once for your shell/server process:
-
-```bash
-export FQS_DB_PATH=/var/lib/fqs/fqs.db
-```
 
 Schema includes fields needed for catalog concerns from the start:
 

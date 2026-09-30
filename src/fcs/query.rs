@@ -239,6 +239,10 @@ impl CqlParser {
                 // index relation term?
                 if let Some(CTok::Rel(r)) = self.peek().cloned() {
                     self.i += 1;
+                    // a missing term is a syntax error, whatever the index
+                    if !matches!(self.peek(), Some(CTok::Word(_)) | Some(CTok::Quoted(_))) {
+                        return syn("missing search term after relation");
+                    }
                     let idx = w.to_ascii_lowercase();
                     let ok_index = matches!(idx.as_str(), "cql.serverchoice" | "serverchoice" | "text" | "word" | "fcs.text");
                     if !ok_index {
@@ -643,6 +647,8 @@ mod tests {
         assert!(matches!(parse_cql("cat NOT dog"), Err(QueryError::Unsupported(_))));
         assert!(matches!(parse_cql("(cat"), Err(QueryError::Syntax(_))));
         assert!(matches!(parse_cql(""), Err(QueryError::Syntax(_))));
+        // the endpoint tester's "invalid query"
+        assert!(matches!(parse_cql("\"abc\" ="), Err(QueryError::Syntax(_))));
     }
 
     #[test]

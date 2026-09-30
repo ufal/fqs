@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -899,19 +899,67 @@ fn discover_db_path_from_runtime_files() -> Option<PathBuf> {
     None
 }
 
-fn resolve_db_path(arg: &DbPathArg) -> PathBuf {
+/// Where the catalog came from (for `fqs status`, `/health` and the serve log).
+static DB_SOURCE: OnceLock<String> = OnceLock::new();
+
+fn db_source() -> String {
+    DB_SOURCE.get().cloned().unwrap_or_else(|| "unknown".to_string())
+}
+
+/// System-wide settings for every `fqs` (service, shell, TEITOK's PHP):
+/// `FQS_CONFIG`, else `/etc/fqs/fqs.json`, e.g. `{"db_path": "/var/lib/fqs/fqs.db"}`.
+fn fqs_config_path() -> PathBuf {
+    std::env::var("FQS_CONFIG")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/etc/fqs/fqs.json"))
+}
+
+fn db_path_from_config() -> Option<PathBuf> {
+    let s = fs::read_to_string(fqs_config_path()).ok()?;
+    let v: Value = serde_json::from_str(&s).ok()?;
+    v.get("db_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The catalog, first found of: `--db`, `FQS_DB_PATH`, `db_path` in the config
+/// file, the database of a running `fqs serve` (its fqs-http.json), the platform
+/// default (Linux: /var/lib/fqs/fqs.db).
+fn resolve_db_path_with_source(arg: &DbPathArg) -> (PathBuf, String) {
     if let Some(path) = &arg.db {
-        return path.clone();
+        return (path.clone(), "--db".into());
     }
     if let Ok(path) = std::env::var("FQS_DB_PATH") {
         if !path.trim().is_empty() {
-            return PathBuf::from(path);
+            return (PathBuf::from(path), "FQS_DB_PATH".into());
         }
     }
-    if let Some(path) = discover_db_path_from_runtime_files() {
-        return path;
+    if let Some(path) = db_path_from_config() {
+        return (path, format!("db_path in {}", fqs_config_path().display()));
     }
-    default_db_path()
+    if let Some(path) = discover_db_path_from_runtime_files() {
+        return (path, "the running fqs serve (fqs-http.json)".into());
+    }
+    (default_db_path(), "the default location".into())
+}
+
+fn resolve_db_path(arg: &DbPathArg) -> PathBuf {
+    let (path, source) = resolve_db_path_with_source(arg);
+    if !path.exists() {
+        // the usual reason for "which catalog was that?": a new, empty one
+        eprintln!(
+            "[fqs] note: no catalog at {} (from {source}); creating a new, empty one. \
+             Use --db, FQS_DB_PATH or \"db_path\" in {} for an existing one.",
+            path.display(),
+            fqs_config_path().display()
+        );
+    }
+    let _ = DB_SOURCE.set(source);
+    path
 }
 
 /// Sidecar JSON written on successful `fqs serve` bind so clients (TEITOK PHP, shell) can discover
@@ -1536,6 +1584,8 @@ fn handle_status(args: StatusArgs) -> Result<()> {
             "ok": http_ok,
             "operation": "status",
             "db_path": db_path,
+            "db_source": db_source(),
+            "config_file": fqs_config_path(),
             "cli_version": env!("CARGO_PKG_VERSION"),
             "http": {
                 "url": effective_url,
@@ -2151,7 +2201,9 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
             .with_context(|| format!("Failed to load corpus catalog from {}", db_path.display()))?,
     );
     eprintln!(
-        "[fqs] corpus catalog loaded: {} corpora (in-memory)",
+        "[fqs] corpus catalog {} (from {}): {} corpora",
+        db_path.display(),
+        db_source(),
         catalog.len()
     );
 
@@ -3080,6 +3132,7 @@ async fn http_health(State(state): State<HttpAppState>) -> Json<Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "server_name": state.server_name,
         "db_path": state.db_path.to_string_lossy(),
+        "db_source": db_source(),
         "catalog_corpora": state.catalog.len(),
     });
     if let Some(a) = &state.activity {
