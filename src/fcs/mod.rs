@@ -166,6 +166,15 @@ pub fn explain(req: &Request, ep: &Endpoint, resources: &[Resource]) -> String {
     sru::explain_response(req.version, ep, resources, req.endpoint_description, &[])
 }
 
+/// A refused explain still carries the explain record (SRU requires `record` in an
+/// explainResponse; strict clients reject one with diagnostics only).
+pub fn explain_refusal_xml(r: &Refusal, ep: &Endpoint, resources: &[Resource]) -> String {
+    if r.1 == Operation::Explain {
+        return sru::explain_response(r.0, ep, resources, false, std::slice::from_ref(&r.2));
+    }
+    refusal_xml(r)
+}
+
 pub fn refusal_xml(r: &Refusal) -> String {
     sru::diagnostic_response(r.0, r.1.as_str(), std::slice::from_ref(&r.2))
 }
@@ -431,6 +440,9 @@ mod tests {
         assert!(refusal_xml(&e).contains("<sruResponse:numberOfRecords>0</sruResponse:numberOfRecords>"));
         assert!(parse_request(&params(&[("query", "x"), ("startRecord", "0")]), &ep()).is_err());
         assert!(parse_request(&params(&[("version", "3.0")]), &ep()).is_err());
+        let e = parse_request(&params(&[("operation", "explain"), ("version", "9.9")]), &ep()).err().unwrap();
+        let x = explain_refusal_xml(&e, &ep(), &rs);
+        assert!(x.find("<sru:record>").unwrap() < x.find("<sru:diagnostics>").unwrap(), "{x}");
         // SRU 1.x style (operation, no version) → 1.2; bad version with operation → answered in 1.2
         assert_eq!(parse_request(&params(&[("operation", "explain")]), &ep()).unwrap().version, Version::V1_2);
         assert_eq!(parse_request(&params(&[]), &ep()).unwrap().version, Version::V2_0);

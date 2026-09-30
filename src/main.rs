@@ -4085,14 +4085,14 @@ async fn http_fcs(
     AxumQuery(params): AxumQuery<HashMap<String, String>>,
 ) -> Response {
     let ep = fcs_endpoint(&state);
-    let req = match fcs::parse_request(&params, &ep) {
-        Ok(r) => r,
-        Err(refusal) => return fcs_xml(fcs::refusal_xml(&refusal)),
-    };
     // FCS clients (the aggregator) are anonymous unless a front end signs a token
     let caller = state.limits.caller(&headers, None, None, None, &header_client_ip(&headers));
     let visible = fcs_resources(&state, &caller.role);
     let resources: Vec<fcs::Resource> = visible.iter().map(|(r, _)| r.clone()).collect();
+    let req = match fcs::parse_request(&params, &ep) {
+        Ok(r) => r,
+        Err(refusal) => return fcs_xml(fcs::explain_refusal_xml(&refusal, &ep, &resources)),
+    };
     match req.operation {
         fcs::Operation::Explain => return fcs_xml(fcs::explain(&req, &ep, &resources)),
         fcs::Operation::Scan => {
