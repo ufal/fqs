@@ -3983,7 +3983,8 @@ fn fcs_endpoint(state: &HttpAppState) -> fcs::Endpoint {
 }
 
 /// The `pando` command line for FCS without the warm library: `settings.pando_binary`,
-/// else `PANDO_BINARY`, else `pando` on the PATH.
+/// else `PANDO_BINARY`, else next to the fqs binary, /usr/local/bin, /usr/bin,
+/// /opt/pando/bin or ~/.local/bin (install.sh), else `pando` on the PATH.
 fn fcs_pando_binary(corpus: &CorpusEntry) -> String {
     corpus
         .settings
@@ -3993,6 +3994,22 @@ fn fcs_pando_binary(corpus: &CorpusEntry) -> String {
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .or_else(|| std::env::var("PANDO_BINARY").ok().filter(|s| !s.trim().is_empty()))
+        .or_else(|| {
+            // services often run with a minimal PATH: look where pando is usually installed
+            let mut c: Vec<PathBuf> = Vec::new();
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(d) = exe.parent() {
+                    c.push(d.join("pando"));
+                }
+            }
+            c.push(PathBuf::from("/usr/local/bin/pando"));
+            c.push(PathBuf::from("/usr/bin/pando"));
+            c.push(PathBuf::from("/opt/pando/bin/pando"));
+            if let Ok(h) = std::env::var("HOME") {
+                c.push(PathBuf::from(h).join(".local/bin/pando"));
+            }
+            c.into_iter().find(|p| p.is_file()).map(|p| p.display().to_string())
+        })
         .unwrap_or_else(|| "pando".to_string())
 }
 
