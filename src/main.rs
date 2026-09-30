@@ -29,6 +29,7 @@ use time::format_description::well_known::Rfc3339;
 use tokio::time::sleep;
 
 mod activity;
+mod fcs;
 mod hot_corpus;
 mod limits;
 mod pando_lib;
@@ -279,6 +280,10 @@ struct ServeArgs {
     /// FCS database name shown in SRU explain
     #[arg(long, default_value = "fqs-endpoint")]
     fcs_database: String,
+    /// Public URL of the FCS endpoint (e.g. https://lindat.cz/services/test-kontext/fcs);
+    /// used for default resource PIDs and layer identifiers
+    #[arg(long, env = "FQS_FCS_BASE_URL")]
+    fcs_base_url: Option<String>,
     /// Test mode: report policy blocks but still execute queries
     #[arg(long, default_value_t = false)]
     test: bool,
@@ -378,6 +383,12 @@ struct HttpQueryRequest {
     timeout_ms: Option<u64>,
     /// User id for per-user limits (believed only without --jwt-secret)
     user: Option<String>,
+    /// pando: a random sample of this many hits (KonText "random sample"), in corpus order
+    sample: Option<u64>,
+    /// pando: the hits (or the sample) in a random order (KonText "shuffle")
+    shuffle: Option<bool>,
+    /// pando: seed for sample / shuffle (the same seed: the same sample / order on every page)
+    seed: Option<u32>,
     /// Set by FQS (never from the client): the caller's engine tier
     #[serde(skip_deserializing, default)]
     engine_tier: Option<String>,
@@ -437,23 +448,6 @@ struct HttpReindexMarkFinishedRequest {
     result: Option<Value>,
 }
 
-#[derive(Debug, Deserialize)]
-struct FcsQuery {
-    operation: Option<String>,
-    query: Option<String>,
-    #[serde(rename = "x-corpus")]
-    x_corpus: Option<String>,
-    #[serde(rename = "x-fcs-context")]
-    x_fcs_context: Option<String>,
-    request_role: Option<String>,
-    #[serde(rename = "x-fcs-endpoint-description")]
-    x_fcs_endpoint_description: Option<bool>,
-    #[serde(rename = "startRecord")]
-    start_record: Option<u32>,
-    #[serde(rename = "maximumRecords")]
-    maximum_records: Option<u32>,
-}
-
 #[derive(Clone)]
 struct HttpAppState {
     db_path: PathBuf,
@@ -461,6 +455,8 @@ struct HttpAppState {
     host: String,
     port: u16,
     fcs_database: String,
+    /// public URL of /fcs (default PIDs, layer ids)
+    fcs_base_url: Option<String>,
     server_name: Option<String>,
     request_log_path: PathBuf,
     request_log_max_bytes: u64,
@@ -2165,6 +2161,7 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         host: args.host.clone(),
         port: args.port,
         fcs_database: args.fcs_database.clone(),
+        fcs_base_url: args.fcs_base_url.as_deref().map(|u| u.trim_end_matches('/').to_string()),
         server_name: args.server_name.clone(),
         request_log_path: request_log_path.clone(),
         request_log_max_bytes: args.log_max_bytes,
@@ -3796,139 +3793,283 @@ async fn http_pando_sessions(
     pando_dispatch(&state, &q.corpus, "GET", "/sessions", String::new(), String::new()).await
 }
 
-async fn http_fcs(
-    State(state): State<HttpAppState>,
-    AxumQuery(params): AxumQuery<FcsQuery>,
-) -> Result<Response, (StatusCode, String)> {
-    let search = resolve_fcs_operation(&params) == "searchretrieve";
-    let mut rec = QueryRec::new("/fcs", params.x_corpus.as_deref().unwrap_or("*"),
-                                params.query.as_deref().unwrap_or(""));
-    if search {
-        rec.set("role", json!(normalize_role(params.request_role.as_deref())));
-        if let Some(v) = params.start_record {
-            rec.set("start", json!(v));
-        }
-        if let Some(v) = params.maximum_records {
-            rec.set("size", json!(v));
+// ── FCS (CLARIN Federated Content Search, SRU 1.2 / 2.0) ───────────────
+//
+// The endpoint itself is `fcs::*` (query parsing, translation, engines, SRU
+// XML) and knows nothing about FQS. This part only maps catalogue rows to FCS
+// resources and engines, and applies FQS's access rules and admission.
+
+/// `capabilities.fcs` overlaid by `settings.fcs`.
+fn fcs_config(corpus: &CorpusEntry) -> Value {
+    let mut o = corpus.capabilities.get("fcs").and_then(Value::as_object).cloned().unwrap_or_default();
+    if let Some(s) = corpus.settings.get("fcs").and_then(Value::as_object) {
+        for (k, v) in s {
+            o.insert(k.clone(), v.clone());
         }
     }
-    let r = http_fcs_inner(state.clone(), params).await.map(|x| x.into_response());
-    if search {
-        // (one corpus or all: a corpus open is not attributed to the request here)
-        match &r {
-            Ok(resp) => rec.finish_status(&state, resp.status().as_u16(), None, None),
-            Err((code, msg)) => rec.finish_status(&state, code.as_u16(), Some(msg), None),
-        }
-    }
-    r
+    Value::Object(o)
 }
 
-async fn http_fcs_inner(
-    state: HttpAppState,
-    params: FcsQuery,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let role = normalize_role(params.request_role.as_deref());
-    let operation = resolve_fcs_operation(&params);
+/// Which engine answers FCS for a corpus: `fcs.engine` (pando | cwb | kontext),
+/// else a `settings.kontext` block, else the corpus's query backend.
+fn fcs_dialect(corpus: &CorpusEntry, fcs_cfg: &Value) -> Option<fcs::translate::Dialect> {
+    use fcs::translate::Dialect;
+    let named = fcs_cfg.get("engine").and_then(Value::as_str).map(str::to_ascii_lowercase);
+    let kind = match named.as_deref() {
+        Some(k) => k.to_string(),
+        None if corpus.settings.get("kontext").and_then(|k| k.get("url")).is_some() => "kontext".into(),
+        None => resolve_effective_backend(corpus).ok()?,
+    };
+    match kind.as_str() {
+        "pando" => Some(Dialect::Pando),
+        "cqp" | "cwb" => Some(Dialect::Cwb),
+        "kontext" | "manatee" | "noske" => Some(Dialect::Manatee),
+        _ => None,
+    }
+}
 
-    let xml = match operation.as_str() {
-        "explain" => {
-            let corpora = state.catalog.list(None, false, None);
-            let visible = corpora
-                .into_iter()
-                .filter(|c| is_http_access_allowed(c, &role) || state.test_mode)
-                .filter(|c| is_fcs_enabled(c))
-                .collect::<Vec<_>>();
-            build_fcs_explain_xml(
-                &visible,
-                &state.host,
-                state.port,
-                &state.fcs_database,
-                params.x_fcs_endpoint_description.unwrap_or(false),
-            )
+/// KonText base URL and corpus name for a Manatee resource: `settings.kontext
+/// {url, corpname}`, else the `hit_link` of a kontext preset (`base`, `corpus`).
+fn fcs_kontext_settings(corpus: &CorpusEntry) -> (Option<String>, String) {
+    let k = corpus.settings.get("kontext");
+    let cfg = fcs_config(corpus);
+    let link = cfg.get("hit_link").filter(|l| {
+        l.get("frontend").and_then(Value::as_str).is_some_and(|f| f.starts_with("kontext"))
+    });
+    let url = k
+        .and_then(|k| k.get("url"))
+        .or_else(|| link.and_then(|l| l.get("base")))
+        .and_then(Value::as_str)
+        .map(|s| s.trim_end_matches('/').to_string());
+    let corpname = k
+        .and_then(|k| k.get("corpname"))
+        .or_else(|| link.and_then(|l| l.get("corpus")))
+        .or_else(|| corpus.settings.get("corpus_name"))
+        .and_then(Value::as_str)
+        .unwrap_or(&corpus.id)
+        .to_string();
+    (url, corpname)
+}
+
+fn fcs_resource(state: &HttpAppState, corpus: &CorpusEntry) -> Option<fcs::Resource> {
+    let cfg = fcs_config(corpus);
+    let dialect = fcs_dialect(corpus, &cfg)?;
+    let default_hit_link = match dialect {
+        fcs::translate::Dialect::Manatee => {
+            let (url, corpname) = fcs_kontext_settings(corpus);
+            url.map(|u| fcs::config::HitLink {
+                template: format!("{u}/view?corpname={}&q=q{{cql}}", fcs::engine::url_encode(&corpname)),
+                dialect: fcs::translate::Dialect::Manatee,
+            })
         }
-        "searchretrieve" => {
-            let query = params
-                .query
-                .clone()
-                .ok_or_else(|| (StatusCode::BAD_REQUEST, "FCS searchRetrieve requires query".to_string()))?;
-            let start = params.start_record.unwrap_or(1).saturating_sub(1);
-            let max = params.maximum_records.unwrap_or(10);
-            let context = params
-                .x_fcs_context
-                .clone()
-                .or_else(|| params.x_corpus.clone());
+        _ => None,
+    };
+    Some(fcs::Resource::from_spec(&fcs::ResourceSpec {
+        id: &corpus.id,
+        label: &corpus.label,
+        landing_page: corpus.project_url.as_deref(),
+        fcs: &cfg,
+        dialect,
+        base_url: state.fcs_base_url.as_deref(),
+        default_hit_link,
+    }))
+}
 
-            if let Some(corpus_id) = context {
-                let corpus = state.catalog.get(&corpus_id).map_err(to_http_err)?;
-                if !is_fcs_enabled(&corpus) {
-                    return Err((StatusCode::FORBIDDEN, format!("Corpus '{}' is not FCS-enabled", corpus_id)));
-                }
-                let mut policy_reasons = Vec::<String>::new();
-                if !is_http_access_allowed(&corpus, &role) {
-                    policy_reasons.push("http access blocked".to_string());
-                }
-                if !is_http_operation_allowed(&corpus, "query") {
-                    policy_reasons.push("query op not allowed".to_string());
-                }
-                if !policy_reasons.is_empty() && !state.test_mode {
-                    return Err((
-                        StatusCode::FORBIDDEN,
-                        format!("Policy blocked FCS searchRetrieve: {}", policy_reasons.join("; ")),
-                    ));
-                }
+/// The FCS resources a caller may search (FCS-enabled, current, HTTP-visible).
+fn fcs_resources(state: &HttpAppState, role: &str) -> Vec<(fcs::Resource, CorpusEntry)> {
+    state
+        .catalog
+        .list(None, false, None)
+        .into_iter()
+        .filter(|c| is_fcs_enabled(c))
+        .filter(|c| state.test_mode || (is_http_access_allowed(c, role) && is_http_operation_allowed(c, "query")))
+        .filter_map(|c| fcs_resource(state, &c).map(|r| (r, c)))
+        .collect()
+}
 
-                let hcm = state.pando_hcm.clone();
-                let permit = if spawns_process(&state, &corpus, None) {
-                    Some(state.limits.admit_process(&role).await?)
+fn fcs_endpoint(state: &HttpAppState) -> fcs::Endpoint {
+    fcs::Endpoint {
+        host: state.host.clone(),
+        port: state.port,
+        database: state.fcs_database.clone(),
+        base_url: state.fcs_base_url.clone(),
+        title: state.server_name.clone().unwrap_or_else(|| "FQS corpus search".to_string()),
+        description: "CLARIN-FCS endpoint of FQS (Flexicorp Query Server)".to_string(),
+        default_records: 50,
+        max_records: 1000,
+    }
+}
+
+/// An engine for one resource, built inside the blocking worker.
+fn fcs_engine(
+    corpus: &CorpusEntry,
+    dialect: fcs::translate::Dialect,
+    hcm: Option<Arc<HotCorpusManager>>,
+    extra: &serde_json::Map<String, Value>,
+    open_options: Option<String>,
+) -> std::result::Result<Box<dyn fcs::Engine>, String> {
+    use fcs::translate::Dialect;
+    let timeout = Duration::from_secs(
+        corpus.settings.get("fcs_timeout_secs").and_then(Value::as_u64).unwrap_or(120),
+    );
+    match dialect {
+        Dialect::Pando => {
+            let transport: fcs::engine::PandoTransport =
+                if let Some(url) = corpus.settings.get("pando_server").and_then(Value::as_str) {
+                    fcs::engine::pando_http_transport(url, timeout)
+                } else if let Some(hcm) = hcm {
+                    let index_dir = resolve_pando_index_dir(corpus).map_err(|e| e.to_string())?;
+                    let guard = HotGuard::acquire(hcm, &corpus.id, &index_dir, false, open_options.as_deref())
+                        .map_err(|e| e.to_string())?;
+                    Box::new(move |body: &str| {
+                        guard
+                            .request("POST", "/query", "", body)
+                            .map(|(st, v)| (st.clamp(0, 999) as u16, v))
+                            .map_err(|e| e.to_string())
+                    })
                 } else {
-                    None
+                    return Err("pando needs the warm library (libflexicorp_pando) or settings.pando_server".into());
                 };
-                let (c2, id2, q2) = (corpus.clone(), corpus_id.clone(), query.clone());
-                let response = tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    execute_query(&c2, &id2, &q2, "auto", start, max, None, None, hcm)
-                })
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("worker join: {e}")))?
-                .map_err(to_http_err)?;
-                build_fcs_search_xml(&corpus, &query, &response)
-            } else {
-                // Compatibility: no context means search all eligible corpora and merge summaries.
-                let corpora = state.catalog.list(None, false, None);
-                let eligible = corpora
-                    .into_iter()
-                    .filter(|c| is_fcs_enabled(c))
-                    .filter(|c| is_http_access_allowed(c, &role) || state.test_mode)
-                    .filter(|c| is_http_operation_allowed(c, "query") || state.test_mode)
-                    .collect::<Vec<_>>();
-                let hcm = state.pando_hcm.clone();
-                // one slot for the whole sweep (it runs the corpora one after the other)
-                let permit = if eligible.iter().any(|c| spawns_process(&state, c, None)) {
-                    Some(state.limits.admit_process(&role).await?)
-                } else {
-                    None
-                };
-                let q2 = query.clone();
-                let per = tokio::task::spawn_blocking(move || {
-                    let _permit = permit;
-                    let mut per = Vec::<(CorpusEntry, Value)>::new();
-                    for c in eligible {
-                        if let Ok(resp) = execute_query(&c, &c.id, &q2, "auto", start, max, None, None, hcm.clone()) {
-                            per.push((c, resp));
-                        }
-                    }
-                    per
-                })
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("worker join: {e}")))?;
-                build_fcs_search_xml_multi(&query, &per)
+            Ok(Box::new(fcs::engine::PandoEngine { transport, extra: extra.clone() }))
+        }
+        Dialect::Cwb => {
+            let corpus_name = corpus
+                .settings
+                .get("corpus_name")
+                .and_then(Value::as_str)
+                .or_else(|| corpus.settings.get("cqp_corpus").and_then(Value::as_str))
+                .unwrap_or(&corpus.id)
+                .to_string();
+            let cqp = corpus
+                .settings
+                .get("cqp_binary")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| std::env::var("CQP_BINARY").ok().filter(|s| !s.trim().is_empty()))
+                .unwrap_or_else(|| "cqp".to_string());
+            let (_, registry) = resolve_cqp_registry(corpus);
+            Ok(Box::new(fcs::engine::CwbEngine {
+                cqp,
+                registry,
+                corpus: corpus_name,
+                cwd: Some(resolve_cqp_cwd(corpus)),
+            }))
+        }
+        Dialect::Manatee => {
+            let (url, corpname) = fcs_kontext_settings(corpus);
+            let url = url.ok_or("settings.kontext.url is not set")?;
+            let k = corpus.settings.get("kontext");
+            let extra_params = k
+                .and_then(|k| k.get("params"))
+                .and_then(Value::as_object)
+                .map(|m| m.iter().filter_map(|(a, b)| b.as_str().map(|b| (a.clone(), b.to_string()))).collect())
+                .unwrap_or_default();
+            Ok(Box::new(fcs::engine::KontextEngine {
+                url,
+                corpname,
+                action: k.and_then(|k| k.get("action")).and_then(Value::as_str).unwrap_or("view").to_string(),
+                timeout,
+                extra_params,
+            }))
+        }
+    }
+}
+
+fn fcs_xml(xml: String) -> Response {
+    ([(header::CONTENT_TYPE, "application/xml; charset=utf-8")], xml).into_response()
+}
+
+async fn http_fcs(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    AxumQuery(params): AxumQuery<HashMap<String, String>>,
+) -> Response {
+    let ep = fcs_endpoint(&state);
+    let req = match fcs::parse_request(&params, &ep) {
+        Ok(r) => r,
+        Err(refusal) => return fcs_xml(fcs::refusal_xml(&refusal)),
+    };
+    // FCS clients (the aggregator) are anonymous unless a front end signs a token
+    let caller = state.limits.caller(&headers, None, None, None, &header_client_ip(&headers));
+    let visible = fcs_resources(&state, &caller.role);
+    let resources: Vec<fcs::Resource> = visible.iter().map(|(r, _)| r.clone()).collect();
+    match req.operation {
+        fcs::Operation::Explain => return fcs_xml(fcs::explain(&req, &ep, &resources)),
+        fcs::Operation::Scan => {
+            return fcs_xml(fcs::refusal_xml(&(
+                req.version,
+                req.operation,
+                fcs::Diagnostic::sru(4, Some("scan"), "Unsupported operation"),
+            )));
+        }
+        fcs::Operation::SearchRetrieve => {}
+    }
+    let mut rec = QueryRec::new("/fcs", &req.context.join(","), &req.query);
+    rec.caller(&caller);
+    rec.set("start", json!(req.start));
+    rec.set("size", json!(req.max));
+    rec.set("query_type", json!(if req.query_type == fcs::QueryType::Fcs { "fcs" } else { "cql" }));
+    let plan = match fcs::prepare_search(&req, &resources) {
+        Ok(p) => p,
+        Err(refusal) => {
+            rec.finish_status(&state, 200, Some(&refusal.2.message), None);
+            return fcs_xml(fcs::refusal_xml(&refusal));
+        }
+    };
+    rec.set("resources", json!(plan.parts.iter().map(|p| p.resource.id.clone()).collect::<Vec<_>>()));
+    rec.set("native", json!(plan.parts.iter().map(|p| p.native.queries.clone()).collect::<Vec<_>>()));
+    // cqp runs as a child process: one process slot for the whole request
+    let spawns = plan.parts.iter().any(|p| p.resource.dialect == fcs::translate::Dialect::Cwb);
+    let t0 = Instant::now();
+    let permit = if spawns {
+        match state.limits.admit_process(&caller.tier).await {
+            Ok(p) => Some(p),
+            Err((code, msg)) => {
+                rec.finish_status(&state, code.as_u16(), Some(&msg), None);
+                return fcs_xml(fcs::refusal_xml(&(
+                    req.version,
+                    req.operation,
+                    fcs::Diagnostic::sru(2, Some("server busy"), "System temporarily unavailable; try again shortly"),
+                )));
             }
         }
-        "scan" => build_fcs_scan_not_implemented_xml(),
-        _ => build_fcs_diagnostic_xml(&format!("Unsupported FCS operation '{}'", operation)),
+    } else {
+        None
     };
-
-    Ok(([(header::CONTENT_TYPE, "application/xml; charset=utf-8")], xml))
+    rec.queued(t0);
+    let corpora: HashMap<String, CorpusEntry> = visible.into_iter().map(|(r, c)| (r.id, c)).collect();
+    let hcm = state.pando_hcm.clone();
+    let mut extra = serde_json::Map::new();
+    if state.limits.has_tiers() && !caller.tier.is_empty() {
+        extra.insert("tier".into(), json!(caller.tier));
+    }
+    let limits = state.limits.clone();
+    let xml = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let engine_for = |r: &fcs::Resource| {
+            let c = corpora.get(&r.id).ok_or_else(|| format!("corpus '{}' is gone", r.id))?;
+            fcs_engine(c, r.dialect, hcm.clone(), &extra, Some(limits.engine_options_for(&c.settings)))
+        };
+        fcs::search(&req, &ep, plan, &engine_for)
+    })
+    .await;
+    match xml {
+        Ok(x) => {
+            let n = x.split("numberOfRecords>").nth(1).and_then(|s| s.split('<').next()).and_then(|s| s.parse::<u64>().ok());
+            if let Some(n) = n {
+                rec.set("total", json!(n));
+            }
+            let diag = x.contains("<diag:uri>");
+            rec.finish_status(&state, 200, diag.then_some("diagnostic"), None);
+            fcs_xml(x)
+        }
+        Err(e) => {
+            rec.finish_status(&state, 500, Some(&e.to_string()), None);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("worker join: {e}")).into_response()
+        }
+    }
 }
 
 fn to_http_err(err: anyhow::Error) -> (StatusCode, String) {
@@ -4060,325 +4201,12 @@ fn looks_like_aggregation(query: &str) -> bool {
         || q.contains("frequenc")
 }
 
-fn resolve_fcs_operation(params: &FcsQuery) -> String {
-    if let Some(op) = params.operation.as_deref() {
-        let norm = op.trim().to_lowercase();
-        if !norm.is_empty() {
-            return norm;
-        }
-    }
-    if params.query.as_deref().map(str::trim).filter(|q| !q.is_empty()).is_some() {
-        return "searchretrieve".to_string();
-    }
-    "explain".to_string()
-}
-
 fn normalize_pando_query(query: &str) -> String {
     query.trim_end().trim_end_matches(';').trim_end().to_string()
 }
 
 fn is_fcs_enabled(corpus: &CorpusEntry) -> bool {
-    corpus
-        .capabilities
-        .get("fcs")
-        .and_then(|v| v.get("enabled"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-}
-
-fn fcs_resource_pid(corpus: &CorpusEntry) -> String {
-    corpus
-        .capabilities
-        .get("fcs")
-        .and_then(|v| v.get("resource_pid"))
-        .and_then(|v| v.as_str())
-        .unwrap_or(&corpus.id)
-        .to_string()
-}
-
-fn fcs_languages(corpus: &CorpusEntry) -> Vec<String> {
-    let mut langs: Vec<String> = Vec::new();
-    let push_lang = |langs: &mut Vec<String>, value: &str| {
-        let t = value.trim();
-        if t.is_empty() {
-            return;
-        }
-        if !langs.iter().any(|x| x == t) {
-            langs.push(t.to_string());
-        }
-    };
-
-    if let Some(arr) = corpus
-        .capabilities
-        .get("fcs")
-        .and_then(|v| v.get("languages"))
-        .and_then(|v| v.as_array())
-    {
-        for v in arr {
-            if let Some(s) = v.as_str() {
-                push_lang(&mut langs, s);
-            }
-        }
-    }
-    if langs.is_empty() {
-        if let Some(s) = corpus
-            .capabilities
-            .get("fcs")
-            .and_then(|v| v.get("language"))
-            .and_then(|v| v.as_str())
-        {
-            push_lang(&mut langs, s);
-        }
-    }
-    if langs.is_empty() {
-        if let Some(arr) = corpus.settings.get("languages").and_then(|v| v.as_array()) {
-            for v in arr {
-                if let Some(s) = v.as_str() {
-                    push_lang(&mut langs, s);
-                }
-            }
-        }
-    }
-    if langs.is_empty() {
-        if let Some(s) = corpus.settings.get("language").and_then(|v| v.as_str()) {
-            push_lang(&mut langs, s);
-        }
-    }
-    if langs.is_empty() {
-        langs.push("und".to_string());
-    }
-    langs
-}
-
-fn build_fcs_explain_xml(
-    corpora: &[CorpusEntry],
-    host: &str,
-    port: u16,
-    database: &str,
-    include_endpoint_description: bool,
-) -> String {
-    let host_xml = xml_escape(host);
-    let db_xml = xml_escape(database);
-    let title_en = "FlexiCorp corpora";
-    let title_local = "FlexiCorp Corpora";
-    let desc_en = format!("Search in {} corpora via FCS.", corpora.len());
-    let desc_local = "Search in FlexiCorp corpora.";
-    let extra = if include_endpoint_description {
-        build_fcs_endpoint_description_xml(corpora)
-    } else {
-        String::new()
-    };
-
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-<sruResponse:explainResponse xmlns:sruResponse=\"http://docs.oasis-open.org/ns/search-ws/sruResponse\">\
-<sruResponse:version>2.0</sruResponse:version>\
-<sruResponse:record>\
-<sruResponse:recordSchema>http://explain.z3950.org/dtd/2.0/</sruResponse:recordSchema>\
-<sruResponse:recordXMLEscaping>xml</sruResponse:recordXMLEscaping>\
-<sruResponse:recordData>\
-<zr:explain xmlns:zr=\"http://explain.z3950.org/dtd/2.0/\">\
-<zr:serverInfo protocol=\"SRU\" version=\"2.0\" transport=\"http\">\
-<zr:host>{host_xml}</zr:host>\
-<zr:port>{port}</zr:port>\
-<zr:database>{db_xml}</zr:database>\
-</zr:serverInfo>\
-<zr:databaseInfo>\
-<zr:title lang=\"en\" primary=\"true\">{title_en}</zr:title>\
-<zr:title lang=\"local\">{title_local}</zr:title>\
-<zr:description lang=\"en\" primary=\"true\">{desc_en}</zr:description>\
-<zr:description lang=\"local\">{desc_local}</zr:description>\
-<zr:author lang=\"en\" primary=\"true\">FlexiCorp</zr:author>\
-</zr:databaseInfo>\
-<zr:indexInfo>\
-<zr:set identifier=\"http://clarin.eu/fcs/resource\" name=\"fcs\">\
-<zr:title lang=\"en\" primary=\"true\">CLARIN Content Search</zr:title>\
-</zr:set>\
-<zr:index search=\"true\" scan=\"false\" sort=\"false\">\
-<zr:title lang=\"en\" primary=\"true\">Words</zr:title>\
-<zr:map primary=\"true\"><zr:name set=\"fcs\">words</zr:name></zr:map>\
-</zr:index>\
-</zr:indexInfo>\
-<zr:schemaInfo>\
-<zr:schema identifier=\"http://clarin.eu/fcs/resource\" name=\"fcs\">\
-<zr:title lang=\"en\" primary=\"true\">CLARIN Content Search</zr:title>\
-</zr:schema>\
-</zr:schemaInfo>\
-<zr:configInfo>\
-<zr:default type=\"numberOfRecords\">250</zr:default>\
-<zr:setting type=\"maximumRecords\">1000</zr:setting>\
-</zr:configInfo>\
-</zr:explain>\
-</sruResponse:recordData>\
-</sruResponse:record>\
-<sruResponse:echoedExplainRequest>\
-<sruResponse:version>2.0</sruResponse:version>\
-</sruResponse:echoedExplainRequest>\
-{extra}\
-</sruResponse:explainResponse>"
-    )
-}
-
-fn build_fcs_endpoint_description_xml(corpora: &[CorpusEntry]) -> String {
-    let mut resources_xml = String::new();
-    for corpus in corpora {
-        let pid = xml_escape(&fcs_resource_pid(corpus));
-        let title = xml_escape(&corpus.label);
-        let desc = corpus
-            .capabilities
-            .get("fcs")
-            .and_then(|v| v.get("description"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let desc_xml = xml_escape(desc);
-        let landing = corpus.project_url.clone().unwrap_or_default();
-        let landing_xml = xml_escape(&landing);
-        let dataviews = corpus
-            .capabilities
-            .get("fcs")
-            .and_then(|v| v.get("supports_dataviews"))
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "hits".to_string());
-        let layers = corpus
-            .capabilities
-            .get("fcs")
-            .and_then(|v| v.get("supported_layers"))
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "word".to_string());
-        let languages_xml = fcs_languages(corpus)
-            .into_iter()
-            .map(|lang| format!("<ed:Language>{}</ed:Language>", xml_escape(&lang)))
-            .collect::<Vec<_>>()
-            .join("");
-
-        resources_xml.push_str(&format!(
-            "<ed:Resource pid=\"{pid}\">\
-<ed:Title xml:lang=\"en\">{title}</ed:Title>\
-<ed:Description xml:lang=\"en\">{desc_xml}</ed:Description>\
-<ed:LandingPageURI>{landing_xml}</ed:LandingPageURI>\
-<ed:Languages>{languages_xml}</ed:Languages>\
-<ed:AvailableDataViews ref=\"{dataviews}\"/>\
-<ed:AvailableLayers ref=\"{layers}\"/>\
-</ed:Resource>"
-        ));
-    }
-
-    format!(
-        "<sruResponse:extraResponseData>\
-<ed:EndpointDescription xmlns:ed=\"http://clarin.eu/fcs/endpoint-description\" version=\"2\">\
-<ed:Capabilities>\
-<ed:Capability>http://clarin.eu/fcs/capability/basic-search</ed:Capability>\
-</ed:Capabilities>\
-<ed:SupportedDataViews>\
-<ed:SupportedDataView id=\"hits\" delivery-policy=\"send-by-default\">application/x-clarin-fcs-hits+xml</ed:SupportedDataView>\
-</ed:SupportedDataViews>\
-<ed:SupportedLayers>\
-<ed:SupportedLayer id=\"word\" qualifier=\"word\" result-id=\"http://clarin.dk/ns/fcs/layer/word\">text</ed:SupportedLayer>\
-</ed:SupportedLayers>\
-<ed:Resources>{resources_xml}</ed:Resources>\
-</ed:EndpointDescription>\
-</sruResponse:extraResponseData>"
-    )
-}
-
-fn build_fcs_search_xml(corpus: &CorpusEntry, query: &str, response: &Value) -> String {
-    let total = response
-        .get("raw")
-        .and_then(|r| r.get("done"))
-        .and_then(|d| d.get("result"))
-        .and_then(|r| r.get("total"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    let pid = xml_escape(&fcs_resource_pid(corpus));
-    let q = xml_escape(query);
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-<sru:searchRetrieveResponse xmlns:sru=\"http://docs.oasis-open.org/ns/search-ws/sruResponse\" \
-xmlns:fcs=\"http://clarin.eu/fcs/resource\">\
-<sru:version>2.0</sru:version>\
-<sru:numberOfRecords>{total}</sru:numberOfRecords>\
-<sru:echoedSearchRetrieveRequest><sru:query>{q}</sru:query></sru:echoedSearchRetrieveRequest>\
-<sru:records>\
-<sru:record>\
-<sru:recordSchema>http://clarin.eu/fcs/resource</sru:recordSchema>\
-<sru:recordData><fcs:Resource pid=\"{pid}\"><fcs:DataView type=\"hits\"/></fcs:Resource></sru:recordData>\
-</sru:record>\
-</sru:records>\
-</sru:searchRetrieveResponse>"
-    )
-}
-
-fn build_fcs_search_xml_multi(query: &str, results: &[(CorpusEntry, Value)]) -> String {
-    let mut records_xml = String::new();
-    let mut total_sum: i64 = 0;
-    for (corpus, response) in results {
-        let total = response
-            .get("raw")
-            .and_then(|r| r.get("done"))
-            .and_then(|d| d.get("result"))
-            .and_then(|r| r.get("total"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
-        total_sum += total;
-        let pid = xml_escape(&fcs_resource_pid(corpus));
-        records_xml.push_str(&format!(
-            "<sru:record><sru:recordSchema>http://clarin.eu/fcs/resource</sru:recordSchema>\
-<sru:recordData><fcs:Resource pid=\"{pid}\"><fcs:DataView type=\"hits\"/></fcs:Resource></sru:recordData></sru:record>"
-        ));
-    }
-    let q = xml_escape(query);
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-<sru:searchRetrieveResponse xmlns:sru=\"http://docs.oasis-open.org/ns/search-ws/sruResponse\" \
-xmlns:fcs=\"http://clarin.eu/fcs/resource\">\
-<sru:version>2.0</sru:version>\
-<sru:numberOfRecords>{total_sum}</sru:numberOfRecords>\
-<sru:echoedSearchRetrieveRequest><sru:query>{q}</sru:query></sru:echoedSearchRetrieveRequest>\
-<sru:records>{records_xml}</sru:records>\
-</sru:searchRetrieveResponse>"
-    )
-}
-
-fn build_fcs_scan_not_implemented_xml() -> String {
-    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-<sru:scanResponse xmlns:sru=\"http://docs.oasis-open.org/ns/search-ws/sruResponse\">\
-<sru:version>2.0</sru:version>\
-<sru:diagnostics><sru:diagnostic>scan is not implemented yet</sru:diagnostic></sru:diagnostics>\
-</sru:scanResponse>"
-        .to_string()
-}
-
-fn build_fcs_diagnostic_xml(msg: &str) -> String {
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-<sru:diagnostics xmlns:sru=\"http://docs.oasis-open.org/ns/search-ws/sruResponse\">\
-<sru:diagnostic>{}</sru:diagnostic>\
-</sru:diagnostics>",
-        xml_escape(msg)
-    )
-}
-
-fn xml_escape(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    fcs_config(corpus).get("enabled").and_then(Value::as_bool).unwrap_or(false)
 }
 
 fn open_db(path: &PathBuf) -> Result<Connection> {
@@ -5603,6 +5431,15 @@ fn run_pando_query(
             }
             if let Some(ms) = q.timeout_ms {
                 extra.insert("timeout_ms".into(), json!(ms));
+            }
+            if let Some(n) = q.sample.filter(|n| *n > 0) {
+                extra.insert("sample".into(), json!(n));
+            }
+            if q.shuffle == Some(true) {
+                extra.insert("shuffle".into(), json!(true));
+            }
+            if let Some(sd) = q.seed {
+                extra.insert("seed".into(), json!(sd));
             }
             // hit-set session: only when the caller stores or pages a set
             let sid = q.session_id.as_deref().map(str::trim).unwrap_or("");

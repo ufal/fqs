@@ -78,7 +78,7 @@ Endpoints:
 - `POST /reindex/workers/heartbeat` — worker liveness/capacity callback
 - `POST /reindex/jobs/mark-started` — worker callback
 - `POST /reindex/jobs/mark-finished` — worker callback
-- `GET /fcs?operation=explain|searchRetrieve|scan&x-corpus=<id>&x-fcs-context=<id>&query=<cql>`
+- `GET /fcs` — CLARIN-FCS 2.0 endpoint (SRU 1.2 + 2.0): `explain`, `searchRetrieve` with `query`, `queryType=cql|fcs`, `x-fcs-context`, `x-fcs-dataviews=adv`, `startRecord`, `maximumRecords` (see *FCS endpoint* below)
 - `POST /query` with JSON body:
   - `{"corpus":"...","query":"...","language":"auto","start":0,"size":25,"request_role":"visitor","backend":"pando"}`
   - optional **`backend`**: `pando` or `cqp` — TEITOK/flexicorp should set from project config; catalogue `preferred_backend` may be `auto`
@@ -87,15 +87,53 @@ In `--test` mode, `/query` adds a `policy` block:
 - `would_block`: whether normal locked mode would reject
 - `reasons`: policy reasons
 
-FCS notes (base implementation):
+### FCS endpoint
 
-- `explain` lists corpora where `capabilities.fcs.enabled=true`
-- `searchRetrieve` delegates to existing backend query path and returns basic SRU/FCS XML envelope
-- if `operation` is omitted and `query` is present, FQS infers `searchRetrieve` (SRU-friendly default)
-- `x-fcs-context` is accepted as an alias for `x-corpus`
-- if no context is provided, FQS runs a compatibility search over all FCS-enabled, policy-eligible corpora
-- `scan` currently returns a not-implemented diagnostic
-- `x-fcs-endpoint-description=true` on `operation=explain` adds `extraResponseData` with `ed:EndpointDescription` and `ed:Resources`
+`/fcs` is a CLARIN-FCS Core 2.0 endpoint (SRU 2.0, and SRU 1.2 / FCS 1.0 for
+older clients). The code is `src/fcs/` and does not depend on the rest of FQS
+or on flexicorp: FQS hands it the resources (catalogue rows with
+`fcs.enabled`), an engine per resource, and does access control and admission
+around it.
+
+- **explain**: ZeeRex record; with `x-fcs-endpoint-description=true` the
+  Endpoint Description (version 2 for SRU 2.0, 1 for 1.2): Basic + Advanced
+  Search, Hits + Advanced views, layers `word lemma pos …`, one resource per
+  corpus (PID, titles, descriptions, institution, landing page, ISO 639-3
+  languages).
+- **searchRetrieve**: Basic Search (CQL: terms, `"phrases"`, `*` / `?` masking,
+  `AND` = same sentence, `OR`, parentheses) and Advanced Search (FCS-QL: segments
+  with `& | !`, `=` / `!=`, regex flags `/c /l /d`, `[]`, quantifiers, `|`,
+  groups, `within s|p|text|…`). One record per hit with the Hits view, plus the
+  Advanced view (text, lemma, pos …; match highlighted) when `x-fcs-dataviews=adv`.
+  `x-fcs-context` takes PIDs or corpus ids; without it all resources are searched
+  one after the other and records are numbered across them.
+- **Diagnostics** instead of engine errors: CQL syntax → SRU 10, unsupported CQL
+  → SRU 48, FCS-QL syntax → FCS 5, unsupported FCS-QL (layer / scope the corpus
+  does not have, a construction the engine cannot run) → FCS 6, bad PID → FCS 1,
+  view not available → FCS 4, busy → SRU 2. `scan` → SRU 4.
+- **Engines** (the query is translated per engine; `settings.fcs.engine` or the
+  corpus's backend picks one):
+  - *pando*: the warm library (libflexicorp_pando), or any `pando-server` over
+    HTTP with `settings.pando_server: "http://host:port"`. pando has no `|`
+    between sequences and no quantified groups: those are expanded into several
+    queries whose union is the result (at most 32).
+  - *CWB*: `cqp` run directly (`size` + `tabulate`), with `settings.registry_hint`
+    (or `CWB_REGISTRY`), `corpus_name` / `cqp_corpus`, `cqp_binary`. TEITOK CWB
+    corpora work the same way (no flexicorp CLI).
+  - *Manatee*: through KonText's JSON concordance (`view?…&format=json`, old and
+    new KonText): `settings.kontext: {"url": "https://…/kontext", "corpname": "x"}`
+    (or the `base` / `corpus` of a `kontext` hit link). No Python in FQS.
+- Records' `ref`: the landing page for the resource, `hit_link` per hit
+  (presets `kontext`, `kontext_create_view`, `teitok`, `cqpweb`, `korp`, or a
+  template with `{pos} {end} {doc} {tokid} {cql} {id} {pid}`).
+- `--fcs-base-url` / `FQS_FCS_BASE_URL`: the public URL of `/fcs` (default PIDs
+  `<base>/resource/<id>`, layer ids `<base>/layers/<layer>`).
+- FCS requests are anonymous (visitor, or the role of a signed token); `cqp`
+  takes a process slot; the activity log records them with `query_type`,
+  `resources`, the `native` queries and `total`.
+- Test: `tests/fcs_same_data.py <fcs-url> <resource>…` sends a set of Basic and
+  Advanced queries to resources that hold the same corpus and flags differing
+  totals or first pages.
 
 ## Quickstart
 
@@ -278,21 +316,25 @@ Schema includes fields needed for catalog concerns from the start:
 - `corpus_size` + `corpus_size_updated_at` (populated by validation/probe when available)
 - `last_validated_at` + `last_validation_ok` + `last_validation_message`
 
-### FCS from day one (metadata convention)
+### FCS metadata (`settings.fcs`)
 
-FQS can represent FCS availability for any corpus (TEITOK or non-TEITOK) by storing FCS metadata in `capabilities.fcs`, e.g.:
+A corpus is an FCS resource when `settings.fcs.enabled` (or the older
+`capabilities.fcs.enabled`) is true; `settings.fcs` overrides `capabilities.fcs`
+member by member. Schema: `dev/FQS-FCS2-IMPLEMENTATION.md` §4, e.g.:
 
 ```json
-{
-  "fcs": {
-    "enabled": true,
-    "resource_pid": "local:my_corpus",
-    "supports_dataviews": ["hits", "kwic"]
-  }
+"fcs": {
+  "enabled": true,
+  "pid": "http://hdl.handle.net/11234/1-5287",
+  "title": {"en": "UD 2.18"}, "description": {"en": "…"}, "institution": {"en": "ÚFAL"},
+  "landing_page": "https://…", "languages": ["en"],
+  "layers": {"text": "form", "lemma": "lemma", "pos": {"attr": "upos"}},
+  "dataviews": ["hits", "adv"],
+  "sentence": "s", "within": {"text": "doc"},
+  "hit_link": {"frontend": "kontext", "base": "https://…/kontext", "corpus": "ud_pando"},
+  "engine": "pando | cwb | kontext", "context": 5, "doc_attr": "text_id", "tokid_attr": "id"
 }
 ```
-
-This keeps cataloging and policy ready for an eventual `/fcs` HTTP surface even before server-side FCS query execution is implemented.
 
 Export current corpus set as JSON:
 
@@ -419,6 +461,13 @@ in the corpus handle: when FQS closes an idle corpus, its sessions go too, and
 a request then gets **404** `unknown_session` / `unknown_hitset` — run the query
 again. `POST /session {corpus, session_id?, ttl_s?}`, `GET /session?corpus=&session_id=`,
 `POST /session/close {corpus, session_id}`, `GET /sessions?corpus=`.
+
+## Random samples and shuffled concordances (pando)
+
+`/query` passes `sample` (a random N of the hits, in corpus order), `shuffle`
+(the hits in a random order) and `seed` (the same seed: the same sample / order
+on every page) to pando-server (KonText's *Random sample* / *Shuffle*). Both go
+through every hit per request and are not stored in sessions.
 
 ## Notes
 
