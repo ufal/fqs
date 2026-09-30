@@ -124,8 +124,13 @@ around it.
     new KonText): `settings.kontext: {"url": "https://…/kontext", "corpname": "x"}`
     (or the `base` / `corpus` of a `kontext` hit link). No Python in FQS.
 - Records' `ref`: the landing page for the resource, `hit_link` per hit
-  (presets `kontext`, `kontext_create_view`, `teitok`, `cqpweb`, `korp`, or a
-  template with `{pos} {end} {doc} {tokid} {cql} {id} {pid}`).
+  (presets `kontext`, `kontext_first`, `teitok`, `cqpweb`, `korp`, or a
+  template with `{n} {pos} {end} {doc} {tokid} {cql} {id} {pid}`). `kontext`
+  (KonText ≥ 0.16) links each hit to its own concordance line,
+  `{base}/create_view?corpname={corpus}&q=q<query>&pagesize=1&fromp={n}`, and
+  gives the resource `{base}/query?corpname={corpus}` as landing page unless
+  `landing_page` is set. A Manatee resource without a `hit_link` gets the same
+  from `settings.kontext` (`public_url`, else `url`).
 - `--fcs-base-url` / `FQS_FCS_BASE_URL`: the public URL of `/fcs` (default PIDs
   `<base>/resource/<id>`, layer ids `<base>/layers/<layer>`).
 - FCS requests are anonymous (visitor, or the role of a signed token); `cqp`

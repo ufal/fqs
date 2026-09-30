@@ -3854,20 +3854,31 @@ fn fcs_kontext_settings(corpus: &CorpusEntry) -> (Option<String>, String) {
 fn fcs_resource(state: &HttpAppState, corpus: &CorpusEntry) -> Option<fcs::Resource> {
     let cfg = fcs_config(corpus);
     let dialect = fcs_dialect(corpus, &cfg)?;
-    let default_hit_link = match dialect {
-        fcs::translate::Dialect::Manatee => {
-            let (url, corpname) = fcs_kontext_settings(corpus);
-            url.map(|u| fcs::config::HitLink {
-                template: format!("{u}/view?corpname={}&q=q{{cql}}", fcs::engine::url_encode(&corpname)),
+    // links for users go to KonText's public URL (`settings.kontext.public_url`),
+    // which can differ from the one FQS queries (`url`, e.g. a local address)
+    let (mut default_hit_link, mut landing) = (None, corpus.project_url.clone());
+    if dialect == fcs::translate::Dialect::Manatee {
+        let (url, corpname) = fcs_kontext_settings(corpus);
+        let public = corpus
+            .settings
+            .get("kontext")
+            .and_then(|k| k.get("public_url"))
+            .and_then(Value::as_str)
+            .map(|s| s.trim_end_matches('/').to_string())
+            .or(url);
+        if let Some(u) = public {
+            let c = fcs::engine::url_encode(&corpname);
+            default_hit_link = Some(fcs::config::HitLink {
+                template: format!("{u}/create_view?corpname={c}&q=q{{cql}}&pagesize=1&fromp={{n}}"),
                 dialect: fcs::translate::Dialect::Manatee,
-            })
+            });
+            landing = landing.or(Some(format!("{u}/query?corpname={c}")));
         }
-        _ => None,
-    };
+    }
     Some(fcs::Resource::from_spec(&fcs::ResourceSpec {
         id: &corpus.id,
         label: &corpus.label,
-        landing_page: corpus.project_url.as_deref(),
+        landing_page: landing.as_deref(),
         fcs: &cfg,
         dialect,
         base_url: state.fcs_base_url.as_deref(),
@@ -3887,17 +3898,49 @@ fn fcs_resources(state: &HttpAppState, role: &str) -> Vec<(fcs::Resource, Corpus
         .collect()
 }
 
+/// Public host, port and path of `--fcs-base-url` (explain's serverInfo), if given.
+fn fcs_public_address(base: &str) -> Option<(String, u16, String)> {
+    let (scheme, rest) = base.split_once("://")?;
+    let (hostport, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let default_port = if scheme.eq_ignore_ascii_case("https") { 443 } else { 80 };
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => (h, p.parse().ok()?),
+        _ => (hostport, default_port),
+    };
+    Some((host.to_string(), port, path.trim_matches('/').to_string()))
+}
+
 fn fcs_endpoint(state: &HttpAppState) -> fcs::Endpoint {
+    // serverInfo names the public endpoint, not FQS's bind address
+    let (host, port, database) = state
+        .fcs_base_url
+        .as_deref()
+        .and_then(fcs_public_address)
+        .unwrap_or_else(|| (state.host.clone(), state.port, state.fcs_database.clone()));
     fcs::Endpoint {
-        host: state.host.clone(),
-        port: state.port,
-        database: state.fcs_database.clone(),
+        host,
+        port,
+        database,
         base_url: state.fcs_base_url.clone(),
         title: state.server_name.clone().unwrap_or_else(|| "FQS corpus search".to_string()),
         description: "CLARIN-FCS endpoint of FQS (Flexicorp Query Server)".to_string(),
         default_records: 50,
         max_records: 1000,
     }
+}
+
+/// The `pando` command line for FCS without the warm library: `settings.pando_binary`,
+/// else `PANDO_BINARY`, else `pando` on the PATH.
+fn fcs_pando_binary(corpus: &CorpusEntry) -> String {
+    corpus
+        .settings
+        .get("pando_binary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| std::env::var("PANDO_BINARY").ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| "pando".to_string())
 }
 
 /// An engine for one resource, built inside the blocking worker.
@@ -3928,7 +3971,9 @@ fn fcs_engine(
                             .map_err(|e| e.to_string())
                     })
                 } else {
-                    return Err("pando needs the warm library (libflexicorp_pando) or settings.pando_server".into());
+                    // no warm library: pando's own command line, one process per request
+                    let index_dir = resolve_pando_index_dir(corpus).map_err(|e| e.to_string())?;
+                    fcs::engine::pando_cli_transport(fcs_pando_binary(corpus), index_dir)
                 };
             Ok(Box::new(fcs::engine::PandoEngine { transport, extra: extra.clone() }))
         }
@@ -4021,7 +4066,15 @@ async fn http_fcs(
     rec.set("resources", json!(plan.parts.iter().map(|p| p.resource.id.clone()).collect::<Vec<_>>()));
     rec.set("native", json!(plan.parts.iter().map(|p| p.native.queries.clone()).collect::<Vec<_>>()));
     // cqp runs as a child process: one process slot for the whole request
-    let spawns = plan.parts.iter().any(|p| p.resource.dialect == fcs::translate::Dialect::Cwb);
+    let spawns = plan.parts.iter().any(|p| match p.resource.dialect {
+        fcs::translate::Dialect::Cwb => true,
+        // pando without the warm library or a pando-server runs its command line
+        fcs::translate::Dialect::Pando => {
+            state.pando_hcm.is_none()
+                && visible.iter().any(|(r, c)| r.id == p.resource.id && c.settings.get("pando_server").is_none())
+        }
+        fcs::translate::Dialect::Manatee => false,
+    });
     let t0 = Instant::now();
     let permit = if spawns {
         match state.limits.admit_process(&caller.tier).await {
@@ -5985,5 +6038,15 @@ fn parse_entries_from_json(payload: &str) -> Result<Vec<CorpusEntry>> {
             Ok(vec![entry])
         }
         _ => anyhow::bail!("JSON input must be an object or an array of objects"),
+    }
+}
+
+#[cfg(test)]
+mod fcs_address_tests {
+    #[test]
+    fn public_address() {
+        assert_eq!(super::fcs_public_address("https://lindat.cz/services/test-kontext/fcs"),
+                   Some(("lindat.cz".into(), 443, "services/test-kontext/fcs".into())));
+        assert_eq!(super::fcs_public_address("http://localhost:8797/fcs"), Some(("localhost".into(), 8797, "fcs".into())));
     }
 }

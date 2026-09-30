@@ -50,7 +50,8 @@ pub struct Resource {
 
 /// A link template and the query language its `{cql}` placeholder takes.
 ///
-/// Placeholders: `{base}` `{corpus}` (from the preset), `{pos}` / `{start}`,
+/// Placeholders: `{base}` `{corpus}` (from the preset), `{n}` (the hit's rank in
+/// this resource's result, 1-based), `{pos}` / `{start}`,
 /// `{end}`, `{doc}`, `{tokid}`, `{cql}` / `{query}` (URL-encoded), `{id}`,
 /// `{pid}`. A link with a placeholder the hit cannot fill is left out.
 #[derive(Clone, Debug, PartialEq)]
@@ -61,8 +62,8 @@ pub struct HitLink {
 
 impl HitLink {
     /// `"none"`, `"landing"`, a template string, or `{frontend, base, corpus, template}`
-    /// with the presets kontext (LINDAT KonText), kontext_create_view (KonText ≥ 0.16),
-    /// teitok, cqpweb, korp.
+    /// with the presets kontext (KonText ≥ 0.16, `create_view`), kontext_first (older
+    /// KonText), teitok, cqpweb, korp.
     pub fn from_value(v: &Value, own: Dialect, landing: Option<&str>) -> Option<HitLink> {
         match v {
             Value::String(s) if s == "none" || s.is_empty() => None,
@@ -74,8 +75,15 @@ impl HitLink {
                 let (preset, dialect) = match frontend {
                     "none" => return None,
                     "landing" => return landing.map(|l| HitLink { template: l.to_string(), dialect: own }),
-                    "kontext" => ("{base}/first?corpname={corpus}&queryselector=cqlrow&cql={cql}", Dialect::Manatee),
-                    "kontext_create_view" => ("{base}/create_view?corpname={corpus}&q=q{cql}", Dialect::Manatee),
+                    // KonText ≥ 0.16: create_view is its entry for external links; the
+                    // concordance is in corpus order like the FCS records, so hit {n}
+                    // is line {n} (one line per page: exactly that hit)
+                    "kontext" | "kontext_create_view" => (
+                        "{base}/create_view?corpname={corpus}&q=q{cql}&pagesize=1&fromp={n}",
+                        Dialect::Manatee,
+                    ),
+                    // older KonText forks (first_form + CQL row)
+                    "kontext_first" => ("{base}/first?corpname={corpus}&queryselector=cqlrow&cql={cql}", Dialect::Manatee),
                     "teitok" => ("{base}/index.php?action=file&cid={doc}&jmp={tokid}", Dialect::Cwb),
                     "cqpweb" => ("{base}/concordance.php?c={corpus}&qmode=cqp&theData={cql}", Dialect::Cwb),
                     "korp" => ("{base}/#?corpus={corpus}&search=cqp&cqp={cql}", Dialect::Cwb),
@@ -220,7 +228,21 @@ impl Resource {
                 }
             }
         }
-        let landing_page = g("landing_page").and_then(Value::as_str).map(str::to_string).or(s.landing_page.map(str::to_string));
+        // a KonText hit link also gives the resource a landing page: its query form
+        let kontext_landing = g("hit_link").and_then(|l| {
+            let f = l.get("frontend").and_then(Value::as_str)?;
+            if !f.starts_with("kontext") {
+                return None;
+            }
+            let base = l.get("base").and_then(Value::as_str)?.trim_end_matches('/');
+            let corpus = l.get("corpus").and_then(Value::as_str)?;
+            Some(format!("{base}/query?corpname={corpus}"))
+        });
+        let landing_page = g("landing_page")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or(kontext_landing)
+            .or(s.landing_page.map(str::to_string));
         let hit_link = match g("hit_link") {
             Some(v) => HitLink::from_value(v, s.dialect, landing_page.as_deref()),
             None => s.default_hit_link.clone(),
@@ -284,6 +306,7 @@ mod tests {
         assert_eq!(r.mapping.structure("text"), Some("doc"));
         assert_eq!(r.mapping.structure("s"), Some("s"));
         assert!(!r.advanced);
-        assert_eq!(r.hit_link, Some(HitLink { template: "https://k/first?corpname=c&queryselector=cqlrow&cql={cql}".into(), dialect: Dialect::Manatee }));
+        assert_eq!(r.hit_link, Some(HitLink { template: "https://k/create_view?corpname=c&q=q{cql}&pagesize=1&fromp={n}".into(), dialect: Dialect::Manatee }));
+        assert_eq!(r.landing_page.as_deref(), Some("https://k/query?corpname=c"));
     }
 }

@@ -117,6 +117,31 @@ pub fn pando_http_transport(base: &str, timeout: Duration) -> PandoTransport {
     })
 }
 
+/// A transport that runs the `pando` command line (same JSON as `/query`), one
+/// process per request: for hosts without the warm library or a pando-server.
+pub fn pando_cli_transport(binary: String, index_dir: PathBuf) -> PandoTransport {
+    Box::new(move |body: &str| {
+        let b: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+        let s = |k: &str| b.get(k).map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()));
+        let mut cmd = Command::new(&binary);
+        cmd.arg(&index_dir)
+            .arg(s("query").unwrap_or_default())
+            .args(["--json", "--api", "--total", "--strict-quoted-strings"]);
+        for (k, flag) in [("offset", "--offset"), ("limit", "--limit"), ("context", "--context"), ("attrs", "--attrs")] {
+            if let Some(v) = s(k).filter(|v| !v.is_empty() && v != "null") {
+                cmd.arg(flag).arg(v);
+            }
+        }
+        let out = cmd.output().map_err(|e| format!("cannot run {binary}: {e}"))?;
+        let v: Value = serde_json::from_slice(&out.stdout).map_err(|_| {
+            format!("pando CLI: {}", String::from_utf8_lossy(&out.stderr).trim().chars().take(300).collect::<String>())
+        })?;
+        // the CLI exits 0 with {"ok": false, …} for a bad query
+        let status = if v.get("ok").and_then(Value::as_bool) == Some(false) { 400 } else { 200 };
+        Ok((status, v))
+    })
+}
+
 impl PandoEngine {
     fn one(&self, q: &str, offset: u64, limit: u64, a: &SearchArgs<'_>) -> Result<(u64, bool, Vec<Hit>), EngineError> {
         let mut attrs: Vec<&str> = a.layers.iter().map(|(_, v)| v.as_str()).collect();
@@ -137,7 +162,12 @@ impl PandoEngine {
         }
         let (status, v) = (self.transport)(&body.to_string()).map_err(EngineError::System)?;
         if status >= 400 || v.get("ok").and_then(Value::as_bool) == Some(false) {
-            let msg = v.get("error").and_then(Value::as_str).unwrap_or("pando error").to_string();
+            // pando-server: "error": "…"; the pando CLI: "error": {"stage", "message"}
+            let msg = v
+                .get("error")
+                .and_then(|e| e.as_str().or_else(|| e.get("message").and_then(Value::as_str)))
+                .unwrap_or("pando error")
+                .to_string();
             return Err(if status == 400 { EngineError::Query(msg) } else { EngineError::System(msg) });
         }
         let res = v.get("result").unwrap_or(&v);
@@ -524,6 +554,15 @@ impl Engine for KontextEngine {
     fn search(&self, a: &SearchArgs<'_>) -> Result<Page, EngineError> {
         let q = a.queries.first().ok_or_else(|| EngineError::System("no query".into()))?;
         let other: Vec<Layer> = a.layers.iter().skip(1).map(|(l, _)| *l).collect();
+        // past the end: learn the size first (KonText / Manatee fail on huge page numbers)
+        if a.offset > 0 {
+            let probe = self.page(q, 1, 1, a)?;
+            let total = probe.get("concsize").and_then(Value::as_u64).unwrap_or(0);
+            if a.offset >= total || a.limit == 0 {
+                let exact = probe.get("finished").and_then(Value::as_bool).unwrap_or(true);
+                return Ok(Page { total, exact, hits: vec![] });
+            }
+        }
         // KonText pages are aligned to the page size: read one or two pages
         let ps = a.limit.max(1);
         let first = a.offset / ps + 1;

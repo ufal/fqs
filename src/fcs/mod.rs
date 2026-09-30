@@ -114,11 +114,21 @@ pub fn parse_request(p: &HashMap<String, String>, ep: &Endpoint) -> Result<Reque
         Some("fcs") if version == Version::V2_0 => QueryType::Fcs,
         Some(q) => return refuse(Diagnostic::sru(6, Some("queryType"), &format!("Unsupported query type '{q}'"))),
     };
-    // records are only sent as XML
+    // records are only sent as XML (SRU 71: unsupported record packing)
     for k in ["recordXMLEscaping", "recordPacking"] {
         if let Some(v) = param(p, k) {
             if v != "xml" {
-                return refuse(Diagnostic::sru(6, Some(k), "Only XML records are supported"));
+                return refuse(Diagnostic::sru(71, Some(v), "Unsupported record packing"));
+            }
+        }
+    }
+    if operation == Operation::Scan {
+        // FCS 2.0 has no scan; still check its arguments first (SRU 6), as clients test that
+        for k in ["maximumTerms", "responsePosition"] {
+            if let Some(v) = param(p, k) {
+                if v.parse::<u64>().is_err() {
+                    return refuse(Diagnostic::sru(6, Some(k), &format!("Unsupported parameter value for {k}")));
+                }
             }
         }
     }
@@ -241,10 +251,11 @@ pub fn prepare_search(req: &Request, resources: &[Resource]) -> Result<Plan, Ref
     Ok(Plan { parts, diagnostics })
 }
 
-fn expand_link(t: &str, r: &Resource, h: &engine::Hit, link_query: Option<&str>) -> Option<String> {
+fn expand_link(t: &str, r: &Resource, h: &engine::Hit, rank: u64, link_query: Option<&str>) -> Option<String> {
     let n = |v: Option<u64>| v.map(|x| x.to_string());
     let enc = |v: Option<&str>| v.map(engine::url_encode);
-    let vars: [(&str, Option<String>); 10] = [
+    let vars: [(&str, Option<String>); 11] = [
+        ("{n}", Some(rank.to_string())),
         ("{pos}", n(h.start)),
         ("{start}", n(h.start)),
         ("{end}", n(h.end)),
@@ -306,8 +317,9 @@ pub fn search(req: &Request, ep: &Endpoint, plan: Plan, engine_for: &dyn Fn(&Res
                 if want_adv && !r.advanced {
                     diags.push(Diagnostic::fcs(4, Some("application/x-clarin-fcs-adv+xml"), "Requested Data View not valid for this resource"));
                 }
-                for h in page.hits {
-                    let link = r.hit_link.as_ref().and_then(|l| expand_link(&l.template, r, &h, part.link_query.as_deref()));
+                for (k, h) in page.hits.into_iter().enumerate() {
+                    let rank = local_off + k as u64 + 1;
+                    let link = r.hit_link.as_ref().and_then(|l| expand_link(&l.template, r, &h, rank, part.link_query.as_deref()));
                     records.push((i, h, link, adv));
                 }
             }
@@ -323,7 +335,7 @@ pub fn search(req: &Request, ep: &Endpoint, plan: Plan, engine_for: &dyn Fn(&Res
             }
         }
     }
-    if records.is_empty() && cum > 0 && offset >= cum {
+    if records.is_empty() && req.start > 1 && offset >= cum {
         diags.push(Diagnostic::sru(61, Some(&req.start.to_string()), "First record position out of range"));
     }
     let recs: Vec<sru::Record<'_>> = records
@@ -414,5 +426,14 @@ mod tests {
         assert!(refusal_xml(&e).contains("<sruResponse:numberOfRecords>0</sruResponse:numberOfRecords>"));
         assert!(parse_request(&params(&[("query", "x"), ("startRecord", "0")]), &ep()).is_err());
         assert!(parse_request(&params(&[("version", "3.0")]), &ep()).is_err());
+        // endpoint-tester cases
+        let e = parse_request(&params(&[("query", "x"), ("recordXMLEscaping", "invalid")]), &ep()).err().unwrap();
+        assert_eq!(e.2.uri, "info:srw/diagnostic/1/71");
+        let e = parse_request(&params(&[("scanClause", "fcs.resource=root"), ("maximumTerms", "invalid")]), &ep()).err().unwrap();
+        assert_eq!((e.1, e.2.uri.as_str()), (Operation::Scan, "info:srw/diagnostic/1/6"));
+        let req = parse_request(&params(&[("query", "nothing"), ("startRecord", "2147483647")]), &ep()).unwrap();
+        let plan = prepare_search(&req, &rs).unwrap();
+        let x = search(&req, &ep(), plan, &|_| Ok(Box::new(Fake(0))));
+        assert!(x.contains("info:srw/diagnostic/1/61"), "{x}");
     }
 }
