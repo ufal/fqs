@@ -423,6 +423,7 @@ mod tests {
         assert!(x.contains("a&lt; <hits:Hit>w2</hits:Hit>"));
         assert!(x.contains("ref=\"http://x/a?p=2&amp;q=%5Bform%3D%22house%22%5D\""), "{x}");
         assert!(x.contains("<adv:Span ref=\"s2\" highlight=\"h1\">l</adv:Span>"));
+        assert!(x.contains("<adv:Advanced xmlns:adv=\"http://clarin.eu/fcs/dataview/advanced\" unit=\"item\">"));
         assert!(x.contains("<adv:Segment id=\"s2\" start=\"4\" end=\"5\"/>"), "{x}");
 
         // context by id, 1.2

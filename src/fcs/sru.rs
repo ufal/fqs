@@ -270,7 +270,7 @@ fn adv_view(h: &Hit, r: &Resource, ep: &Endpoint) -> String {
         .chain(h.kwic.iter().map(|t| (t, true)))
         .chain(h.right.iter().map(|t| (t, false)))
         .collect();
-    let mut o = String::from("<fcs:DataView type=\"application/x-clarin-fcs-adv+xml\">\n<adv:Advanced xmlns:adv=\"http://clarin.eu/fcs/dataview/advanced\">\n<adv:Segments unit=\"item\">\n");
+    let mut o = String::from("<fcs:DataView type=\"application/x-clarin-fcs-adv+xml\">\n<adv:Advanced xmlns:adv=\"http://clarin.eu/fcs/dataview/advanced\" unit=\"item\">\n<adv:Segments>\n");
     // unit="item": 1-based, inclusive character offsets in the tokens joined by spaces
     let mut at = 1usize;
     for (i, (t, _)) in all.iter().enumerate() {
@@ -287,8 +287,9 @@ fn adv_view(h: &Hit, r: &Resource, ep: &Endpoint) -> String {
             } else {
                 t.layers.iter().find(|(x, _)| *x == l).map(|(_, v)| v.as_str())
             };
-            // context tokens carry the text only; the other layers leave them out
-            let Some(value) = value else { continue };
+            // every layer has a span for every segment (clients need at least one per
+            // layer and line layers up by segment): empty where the engine gave no value
+            let value = value.unwrap_or("");
             let hl = if *kw { " highlight=\"h1\"" } else { "" };
             o.push_str(&format!("<adv:Span ref=\"s{}\"{hl}>{}</adv:Span>\n", i + 1, esc(value)));
         }
