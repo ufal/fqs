@@ -202,6 +202,15 @@ impl Limits {
         !self.tiers.is_empty()
     }
 
+    pub fn has_jwt(&self) -> bool {
+        self.jwt_secret.is_some()
+    }
+
+    /// The loaded limits JSON (tiers, `pando`, slots) — never includes the JWT secret.
+    pub fn file_config(&self) -> &Value {
+        &self.config
+    }
+
     /// Options for `flexicorp_pando_open_opts`: the file's `pando` object plus the
     /// tiers (FQS-only members are ignored by the engine), trusted tier.
     pub fn engine_options(&self) -> Option<String> {
@@ -274,6 +283,12 @@ impl Limits {
             .or_else(|| session_id.filter(|s| !s.is_empty()).map(|s| format!("session:{s}")))
             .unwrap_or_else(|| format!("ip:{client_ip}"));
         Caller { role, tier, user, verified }
+    }
+
+    /// Verified HS256 claims from `Authorization: Bearer` (signature + optional exp).
+    /// Used by the admin gate, which applies stricter aud/iat/exp rules on top.
+    pub fn verified_bearer_claims(&self, headers: &HeaderMap) -> Option<Map<String, Value>> {
+        bearer_claims(headers, self.jwt_secret.as_ref()?)
     }
 
     /// Admission for a heavy request of `caller`.
@@ -364,7 +379,7 @@ fn b64url(s: &str) -> Option<Vec<u8>> {
 }
 
 /// The claims of a valid HS256 `Authorization: Bearer` token (signature, `exp`).
-fn bearer_claims(headers: &HeaderMap, secret: &[u8]) -> Option<Map<String, Value>> {
+pub fn bearer_claims(headers: &HeaderMap, secret: &[u8]) -> Option<Map<String, Value>> {
     let auth = headers.get("authorization")?.to_str().ok()?;
     let token = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer "))?.trim();
     let mut parts = token.split('.');

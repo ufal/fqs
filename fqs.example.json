@@ -1,0 +1,11 @@
+{
+  "db_path": "/var/lib/fqs/fqs.db",
+  "scan_roots": [
+    "/srv/teitok",
+    "/data/corpora",
+    "/data/pando"
+  ],
+  "fqs": {
+    "update_check": false
+  }
+}

@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>FQS as a multi-engine CLARIN FCS endpoint</title>
+<style>
+  :root {
+    --bg: #f7f6f3;
+    --paper: #fff;
+    --text: #1a1a1a;
+    --muted: #5c5c5c;
+    --rule: #d8d4cc;
+    --accent: #1f4b6e;
+    --code-bg: #f0eee8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 2rem 1.25rem 3rem;
+    font: 16px/1.5 "Iowan Old Style", "Palatino Linotype", Palatino, "Book Antiqua", Georgia, serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  main {
+    max-width: 42rem;
+    margin: 0 auto;
+    background: var(--paper);
+    padding: 2.25rem 2.5rem 2.5rem;
+    border: 1px solid var(--rule);
+  }
+  @media (max-width: 640px) {
+    main { padding: 1.5rem 1.25rem; }
+  }
+  h1 {
+    font-size: 1.65rem;
+    font-weight: 700;
+    line-height: 1.25;
+    margin: 0 0 0.75rem;
+    letter-spacing: -0.02em;
+    color: var(--accent);
+  }
+  h2 {
+    font-size: 1.05rem;
+    font-weight: 700;
+    margin: 1.75rem 0 0.6rem;
+    color: var(--accent);
+  }
+  p, li { margin: 0 0 0.75rem; }
+  .lede {
+    font-size: 1.05rem;
+    color: var(--muted);
+    margin-bottom: 1.25rem;
+  }
+  .oneline {
+    margin-top: 1.5rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--rule);
+    font-style: italic;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.92rem;
+    margin: 0.5rem 0 1rem;
+  }
+  th, td {
+    text-align: left;
+    vertical-align: top;
+    padding: 0.4rem 0.5rem 0.4rem 0;
+    border-bottom: 1px solid var(--rule);
+  }
+  th {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    font-weight: 600;
+  }
+  code, .path {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.86em;
+    background: var(--code-bg);
+    padding: 0.1em 0.35em;
+    border-radius: 3px;
+  }
+  pre {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    line-height: 1.4;
+    background: var(--code-bg);
+    border: 1px solid var(--rule);
+    padding: 0.85rem 1rem;
+    overflow-x: auto;
+    margin: 0.5rem 0 1rem;
+  }
+  ul { margin: 0.25rem 0 0.75rem; padding-left: 1.25rem; }
+  li { margin-bottom: 0.35rem; }
+  .hint {
+    font-size: 0.85rem;
+    color: var(--muted);
+    margin-top: 1.5rem;
+  }
+  /* Print: one page-ish */
+  @media print {
+    body { background: #fff; padding: 0; }
+    main { border: none; max-width: none; padding: 0; }
+    .hint { display: none; }
+  }
+</style>
+</head>
+<body>
+<main contenteditable="true" spellcheck="true">
+
+  <h1>FQS as a multi-engine CLARIN FCS endpoint</h1>
+
+  <p class="lede"><strong>FlexiCorp Query Server (FQS)</strong> is the institutional front door for corpus search: one HTTP service, one corpus catalogue, and—when finished—one <strong>CLARIN Federated Content Search (FCS&nbsp;/&nbsp;SRU)</strong> URL that can answer aggregator and client queries against corpora backed by <strong>Manatee, CWB&nbsp;(CQP), BlackLab, or Pando</strong>. Clients never talk to those engines directly; FQS owns protocol, policy, and result shape.</p>
+
+  <h2>What the client sees</h2>
+  <p>A single FCS base URL (e.g. <code>https://query.example.org/fcs</code>) implements the usual SRU operations:</p>
+  <table>
+    <thead>
+      <tr><th>Operation</th><th>Role</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><strong>explain</strong></td><td>Advertises FCS-enabled resources (PID, title, languages, capabilities)</td></tr>
+      <tr><td><strong>searchRetrieve</strong></td><td>Runs a query and returns hits/KWIC in FCS/SRU XML</td></tr>
+      <tr><td><strong>scan</strong></td><td>(Completed design) term/value browsing where a backend supports it</td></tr>
+    </tbody>
+  </table>
+  <p>Corpus selection uses FCS context (<code>x-fcs-context</code> / resource PID). With no context, FQS can search all policy-eligible, FCS-enabled corpora and merge summaries—useful for institute-wide discovery.</p>
+
+  <h2>One catalogue, many engines</h2>
+  <p>Each <strong>publication</strong> (corpus + content version) is one catalogue row—not one row per engine. The row carries:</p>
+  <ul>
+    <li>paths / connection settings for whichever index exists</li>
+    <li><code>preferred_backend</code> (<code>pando</code> | <code>cqp</code> / Manatee | <code>blacklab</code> | <code>auto</code>)</li>
+    <li><code>capabilities.fcs</code> (<code>enabled</code>, <code>resource_pid</code>, dataviews, caps)</li>
+  </ul>
+  <p>Manatee, CWB, BlackLab, and Pando are <strong>execution backends</strong>, not separate FCS endpoints. Turning FCS on is a catalogue flag plus policy (public / capped / login-gated), independent of the TEITOK UI.</p>
+
+  <h2>Request path (completed FQS)</h2>
+<pre>FCS client / CLARIN aggregator
+        │  SRU/FCS XML
+        ▼
+   FQS  /fcs
+        │  1. Resolve resource → catalogue entry + policy
+        │  2. Translate FCS-QL → backend dialect
+        │  3. Dispatch to warm backend pool
+        │  4. Normalise hits → FCS XML (hits / KWIC dataviews)
+        ▼
+   Manatee │ CWB/CQP │ BlackLab │ Pando</pre>
+  <ol>
+    <li><strong>Protocol</strong> — Parse SRU parameters; enforce FCS-enabled and result caps (often stricter for anonymous FCS than for logged-in UI users).</li>
+    <li><strong>Translate</strong> — Map a documented FCS-QL subset into the dialect of the selected backend (Manatee-CQL, CWB-CQL, BCQL, Pando-CQL). Unsupported constructs fail clearly rather than silently degrading.</li>
+    <li><strong>Execute</strong> — Reuse the same warm-pool path as the native JSON API (LRU-warm processes/handles per corpus; no per-request cold CLI spawn).</li>
+    <li><strong>Serialise</strong> — Map engine hits into a common internal hit model, then into FCS XML so aggregators see one shape regardless of engine.</li>
+  </ol>
+  <p>Native <code>/query</code> JSON and <code>/fcs</code> XML therefore share catalogue, auth/policy, and backends; only the wire format differs.</p>
+
+  <h2>Why this works across engines</h2>
+  <table>
+    <thead>
+      <tr><th>Concern</th><th>Handled by</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>“Is this corpus in FCS?”</td><td>Catalogue <code>capabilities.fcs</code></td></tr>
+      <tr><td>“Which engine runs it?”</td><td><code>preferred_backend</code> / <code>auto</code> + settings</td></tr>
+      <tr><td>“What may an external client see?”</td><td>FQS policy + FCS result caps</td></tr>
+      <tr><td>“How do aggregators discover us?”</td><td><code>explain</code> (+ optional EndpointDescription)</td></tr>
+      <tr><td>“Do clients learn Manatee vs Pando?”</td><td>No — only FQS and FCS-QL</td></tr>
+    </tbody>
+  </table>
+  <p>Institutes can expose a mixed estate (legacy Manatee/CWB, BlackLab, new Pando) under <strong>one</strong> FCS registration, without rewriting aggregator config when a corpus migrates engine.</p>
+
+  <h2>Status toward “completed”</h2>
+  <p><strong>Already sketched / partially live:</strong> <code>/fcs</code> with <code>explain</code> / <code>searchRetrieve</code>, catalogue FCS metadata, policy hooks, and a shared query path (Pando-first; CQP path exists).</p>
+  <p><strong>To finish the multi-engine story:</strong> production adapters for Manatee and BlackLab on the same pool; fuller FCS-QL→dialect translation; robust <code>scan</code>; stable PIDs and caps for aggregator use; optional Mode&nbsp;A (central institute FQS) vs Mode&nbsp;B (per-project PHP shim) deployment.</p>
+
+  <p class="oneline">In one line: <strong>FQS is the FCS endpoint; Manatee, CWB, BlackLab, and Pando are pluggable indexes behind a shared catalogue and a shared SRU façade.</strong></p>
+
+</main>
+<p class="hint">Tip: the page body is <code>contenteditable</code>—click and edit in the browser, then File → Save As / copy the HTML. Print stylesheet aims for a single page.</p>
+</body>
+</html>

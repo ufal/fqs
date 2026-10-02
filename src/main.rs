@@ -11,28 +11,30 @@ use std::time::{Duration, Instant};
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use axum::extract::{Query as AxumQuery, State};
-use axum::http::header;
-use axum::http::HeaderMap;
-use axum::http::StatusCode;
+use axum::extract::{Path as AxumPath, Query as AxumQuery, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::IntoResponse;
+use axum::response::{IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum::{extract::Request, response::Response};
 use clap::{Args, Parser, Subcommand};
 use rusqlite::{Connection, Error as SqliteError, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::time::sleep;
 
 mod activity;
+mod admin;
 mod fcs;
 mod hot_corpus;
 mod limits;
 mod pando_lib;
+mod scan;
+mod services;
 
 use hot_corpus::{
     pando_query_body, wrap_pando_server_as_fqs_raw, HotCorpusConfig, HotCorpusManager, HotGuard,
@@ -66,6 +68,8 @@ enum Command {
     Status(StatusArgs),
     /// Reindex queue/history scaffolding (control-plane)
     Reindex(ReindexArgs),
+    /// Mint a short-lived admin JWT (`aud=fqs-admin`) for `/admin/api/*`
+    AdminToken(AdminTokenArgs),
 }
 
 #[derive(Args, Debug)]
@@ -339,8 +343,34 @@ struct ServeArgs {
     /// "role"); when set, a request's role comes only from a valid token
     #[arg(long, env = "FQS_SECRET", hide_env_values = true)]
     jwt_secret: Option<String>,
+    /// Enable admin HTTP surface (`/admin/`, `/admin/api/*`). Requires `--jwt-secret` /
+    /// `FQS_SECRET`. Off by default.
+    #[arg(long, default_value_t = false)]
+    enable_admin_http: bool,
+    /// Directory with admin UI static files (`index.html`, …). Default: resolve
+    /// next to the binary, then `./admin`, then crate `admin/` (see admin.rs).
+    #[arg(long, env = "FQS_ADMIN_DIR")]
+    admin_dir: Option<PathBuf>,
+    /// Bind admin HTTP separately (e.g. `127.0.0.1:8790`). When set with
+    /// `--enable-admin-http`, `/admin` is served only on this address — not on
+    /// the public `--host/--port`. Recommended for LINDAT / reverse-proxy setups.
+    #[arg(long, env = "FQS_ADMIN_BIND")]
+    admin_bind: Option<String>,
     #[command(flatten)]
     db: DbPathArg,
+}
+
+#[derive(Args, Debug)]
+struct AdminTokenArgs {
+    /// Subject / operator name stored in the `user` claim
+    #[arg(long, default_value = "ops")]
+    user: String,
+    /// Token lifetime (max 4h). Accepts `30m`, `2h`, `3600`, or seconds.
+    #[arg(long, default_value = "4h")]
+    ttl: String,
+    /// Shared HS256 secret (default: `FQS_SECRET` / `--jwt-secret`)
+    #[arg(long, env = "FQS_SECRET", hide_env_values = true)]
+    jwt_secret: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -469,6 +499,12 @@ struct HttpAppState {
     limits: Arc<Limits>,
     /// `--activity-log` (None = off).
     activity: Option<Arc<ActivityLog>>,
+    /// When set, `/admin/` static UI and `/admin/api/*` are mounted.
+    admin_dir: Option<PathBuf>,
+    /// True when admin listens on `--admin-bind` (not the public port).
+    admin_bind_separate: bool,
+    /// Report-only snapshot of process settings (CLI / env / fqs.json). No secrets.
+    settings_snapshot: Arc<Value>,
 }
 
 /// Hot-path corpus lookup: all rows in memory, refreshed periodically from SQLite.
@@ -1055,7 +1091,56 @@ async fn main() -> Result<()> {
         Command::Serve(args) => run_http_server(args).await?,
         Command::Status(args) => handle_status(args)?,
         Command::Reindex(args) => handle_reindex(args)?,
+        Command::AdminToken(args) => handle_admin_token(args)?,
     }
+    Ok(())
+}
+
+fn parse_ttl_secs(s: &str) -> Result<u64> {
+    let t = s.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        anyhow::bail!("empty --ttl");
+    }
+    if let Some(num) = t.strip_suffix('h') {
+        let n: u64 = num.parse().context("invalid --ttl hours")?;
+        return Ok(n.saturating_mul(3600));
+    }
+    if let Some(num) = t.strip_suffix('m') {
+        let n: u64 = num.parse().context("invalid --ttl minutes")?;
+        return Ok(n.saturating_mul(60));
+    }
+    if let Some(num) = t.strip_suffix('s') {
+        let n: u64 = num.parse().context("invalid --ttl seconds")?;
+        return Ok(n);
+    }
+    Ok(t.parse().context("invalid --ttl (use 4h, 30m, or seconds)")?)
+}
+
+fn handle_admin_token(args: AdminTokenArgs) -> Result<()> {
+    let secret = args
+        .jwt_secret
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("FQS_SECRET").ok().filter(|s| !s.trim().is_empty()))
+        .ok_or_else(|| anyhow::anyhow!("--jwt-secret / FQS_SECRET required to mint admin tokens"))?;
+    let ttl = parse_ttl_secs(&args.ttl)?;
+    let token = admin::mint_admin_token(&secret, &args.user, ttl).map_err(anyhow::Error::msg)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let clamped = ttl.min(admin::ADMIN_TOKEN_MAX_TTL_SECS as u64);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "ok": true,
+            "token": token,
+            "user": args.user,
+            "aud": admin::FQS_ADMIN_AUD,
+            "ttl_secs": clamped,
+            "exp": now + clamped,
+            "usage": "Authorization: Bearer <token>  (or paste into /admin/ UI; stored in sessionStorage only)",
+        }))?
+    );
     Ok(())
 }
 
@@ -1945,7 +2030,10 @@ async fn http_log_middleware(
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
     let started = Instant::now();
-    let response = next.run(req).await;
+    let mut response = next.run(req).await;
+    if path.starts_with("/admin/api") {
+        admin::apply_api_security_headers(response.headers_mut());
+    }
     let status = response.status().as_u16();
     let is_polling_jobs = method == "GET" && path == "/reindex/jobs" && (200..300).contains(&status);
     if path == "/health" || path == "/query" || is_polling_jobs {
@@ -2125,6 +2213,21 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
     if args.restart {
         restart_matching_serve_processes(&args.host, args.port);
     }
+    let admin_dir = if args.enable_admin_http {
+        let secret_ok = args
+            .jwt_secret
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if !secret_ok {
+            anyhow::bail!(
+                "--enable-admin-http requires --jwt-secret / FQS_SECRET (refusing unverified catalog writes)"
+            );
+        }
+        Some(admin::resolve_admin_dir(args.admin_dir.as_deref()))
+    } else {
+        None
+    };
     let db_path = resolve_db_path(&args.db);
     let _ = open_db(&db_path)?;
     run_housekeeping_once(&db_path, args.session_ttl_minutes);
@@ -2207,6 +2310,40 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         catalog.len()
     );
 
+    let admin_bind = match args.admin_bind.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(spec) => {
+            if admin_dir.is_none() {
+                anyhow::bail!("--admin-bind requires --enable-admin-http");
+            }
+            Some(
+                admin::parse_admin_bind(spec)
+                    .map_err(|e| anyhow::anyhow!("--admin-bind: {e}"))?,
+            )
+        }
+        None => None,
+    };
+    if admin_dir.is_some() && admin_bind.is_none() {
+        eprintln!(
+            "[fqs] warning: admin HTTP shares the public bind {}:{} — for production use --admin-bind 127.0.0.1:<port>",
+            args.host, args.port
+        );
+    }
+    if admin_dir.is_some() && activity.is_none() {
+        eprintln!(
+            "[fqs] warning: --enable-admin-http without --activity-log; admin writes will not be audit-logged"
+        );
+    }
+
+    let settings_snapshot = Arc::new(build_settings_snapshot(
+        &args,
+        &db_path,
+        &request_log_path,
+        admin_dir.as_deref(),
+        admin_bind.as_ref().map(|(h, p)| (h.as_str(), *p)),
+        activity.as_deref(),
+        args.limits.as_deref(),
+        &limits,
+    ));
     let state = HttpAppState {
         db_path: db_path.clone(),
         test_mode: args.test,
@@ -2222,7 +2359,23 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         catalog: catalog.clone(),
         limits: limits.clone(),
         activity: activity.clone(),
+        admin_dir: admin_dir.clone(),
+        admin_bind_separate: admin_bind.is_some(),
+        settings_snapshot,
     };
+    if let Some(dir) = &admin_dir {
+        if let Some((ah, ap)) = &admin_bind {
+            eprintln!(
+                "[fqs] admin HTTP enabled on {ah}:{ap} (separate bind): UI {} → /admin/ ; API /admin/api/*",
+                dir.display()
+            );
+        } else {
+            eprintln!(
+                "[fqs] admin HTTP enabled: UI {} → /admin/ ; API /admin/api/* (JWT admin, aud=fqs-admin)",
+                dir.display()
+            );
+        }
+    }
     if let Some(a) = &activity {
         a.event("start", activity::fields(vec![
             ("pid", json!(std::process::id())),
@@ -2245,7 +2398,7 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
             }
         }
     });
-    let app = Router::new()
+    let mut public_app = Router::new()
         .route("/", get(http_root_with_state))
         .route("/health", get(http_health))
         .route("/corpora", get(http_list_corpora))
@@ -2264,9 +2417,59 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         .route("/run", post(http_pando_run))
         .route("/session", get(http_pando_session_info).post(http_pando_session_create))
         .route("/session/close", post(http_pando_session_close))
-        .route("/sessions", get(http_pando_sessions))
+        .route("/sessions", get(http_pando_sessions));
+
+    let admin_routes = if admin_dir.is_some() {
+        Some(
+            Router::new()
+                .route(
+                    "/admin/api/corpora",
+                    get(http_admin_list_corpora).put(http_admin_upsert_corpora),
+                )
+                .route(
+                    "/admin/api/corpora/{id}",
+                    get(http_admin_get_corpus).delete(http_admin_delete_corpus),
+                )
+                .route(
+                    "/admin/api/corpora/{id}/validate",
+                    post(http_admin_validate_corpus),
+                )
+                .route("/admin/api/health", get(http_admin_health))
+                .route("/admin/api/settings", get(http_admin_settings))
+                .route("/admin/api/activity", get(http_admin_activity))
+                .route("/admin/api/reindex/jobs", get(http_admin_reindex_jobs))
+                .route("/admin/api/scan", get(http_admin_scan).post(http_admin_scan_post))
+                .route("/admin/api/backends", get(http_admin_backends))
+                .route("/admin/api/frontends", get(http_admin_frontends))
+                .route(
+                    "/admin/api/frontends/{id}/restart",
+                    post(http_admin_frontend_restart),
+                )
+                .route("/admin/api/self", get(http_admin_self))
+                .route("/admin/api/self/restart", post(http_admin_self_restart))
+                .route("/admin", get(|| async { Redirect::temporary("/admin/") }))
+                .route("/admin/", get(http_admin_index))
+                .route("/admin/{*path}", get(http_admin_static)),
+        )
+    } else {
+        None
+    };
+
+    let admin_app = match (admin_routes, admin_bind.is_some()) {
+        (Some(ar), true) => Some(
+            ar.layer(middleware::from_fn_with_state(state.clone(), http_log_middleware))
+                .with_state(state.clone()),
+        ),
+        (Some(ar), false) => {
+            public_app = public_app.merge(ar);
+            None
+        }
+        (None, _) => None,
+    };
+
+    let public_app = public_app
         .layer(middleware::from_fn_with_state(state.clone(), http_log_middleware))
-        .with_state(state);
+        .with_state(state.clone());
 
     let worker_id = format!("fqs-serve-{}", std::process::id());
     let worker_caps = vec![
@@ -2370,12 +2573,16 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
             e
         )),
     };
+    let admin_address = admin_bind
+        .as_ref()
+        .map(|(h, p)| format!("{h}:{p}"));
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
             "ok": true,
             "operation": "serve",
             "address": addr,
+            "admin_address": admin_address,
             "db_path": db_path,
             "http_runtime_file": fqs_http_runtime_path(&db_path),
             "fcs_database": args.fcs_database,
@@ -2386,11 +2593,31 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
             "log_max_bytes": args.log_max_bytes,
             "log_keep_files": args.log_keep_files,
             "session_ttl_minutes": args.session_ttl_minutes,
+            "enable_admin_http": admin_dir.is_some(),
+            "admin_dir": admin_dir,
             "log_warning": request_log_warning,
             "http_runtime_warning": http_runtime_warning
         }))?
     );
-    axum::serve(listener, app).await.context("HTTP server failed")?;
+
+    if let (Some(admin_app), Some((ah, ap))) = (admin_app, admin_bind) {
+        let admin_addr = format!("{ah}:{ap}");
+        let admin_listener = tokio::net::TcpListener::bind(&admin_addr)
+            .await
+            .with_context(|| format!("Failed to bind admin HTTP at {admin_addr}"))?;
+        tokio::select! {
+            r = axum::serve(listener, public_app) => {
+                r.context("HTTP server failed")?;
+            }
+            r = axum::serve(admin_listener, admin_app) => {
+                r.context("admin HTTP server failed")?;
+            }
+        }
+    } else {
+        axum::serve(listener, public_app)
+            .await
+            .context("HTTP server failed")?;
+    }
     Ok(())
 }
 
@@ -3125,6 +3352,16 @@ fn execute_reindex_job_for_worker(db_path: &Path, job_id: &str, worker_id: &str)
 }
 
 async fn http_health(State(state): State<HttpAppState>) -> Json<Value> {
+    // Public: deliberately minimal (no db path, slots, engine options, admin flag).
+    Json(json!({
+        "ok": true,
+        "service": "fqs",
+        "version": env!("CARGO_PKG_VERSION"),
+        "server_name": state.server_name,
+    }))
+}
+
+fn detailed_health_body(state: &HttpAppState) -> Value {
     let mut body = json!({
         "ok": true,
         "service": "fqs",
@@ -3134,6 +3371,8 @@ async fn http_health(State(state): State<HttpAppState>) -> Json<Value> {
         "db_path": state.db_path.to_string_lossy(),
         "db_source": db_source(),
         "catalog_corpora": state.catalog.len(),
+        "admin_http": state.admin_dir.is_some(),
+        "admin_bind_separate": state.admin_bind_separate,
     });
     if let Some(a) = &state.activity {
         body["activity_log"] = a.status_json();
@@ -3144,38 +3383,957 @@ async fn http_health(State(state): State<HttpAppState>) -> Json<Value> {
         body["pando"] = json!({"available": false});
     }
     body["limits"] = state.limits.status_json();
-    Json(body)
+    body
+}
+
+fn setting_item(key: &str, value: Value, source: &str, change: &str) -> Value {
+    json!({
+        "key": key,
+        "value": value,
+        "source": source,
+        "change": change,
+    })
+}
+
+fn build_settings_snapshot(
+    args: &ServeArgs,
+    db_path: &Path,
+    request_log_path: &Path,
+    admin_dir: Option<&Path>,
+    admin_bind: Option<(&str, u16)>,
+    activity: Option<&activity::ActivityLog>,
+    limits_path: Option<&Path>,
+    limits: &Limits,
+) -> Value {
+    let cfg_path = fqs_config_path();
+    let cfg_exists = cfg_path.is_file();
+    let admin_bind_s = admin_bind.map(|(h, p)| format!("{h}:{p}"));
+
+    let mut sections = Vec::new();
+
+    sections.push(json!({
+        "id": "identity",
+        "title": "Identity",
+        "mutable": false,
+        "items": [
+            setting_item("version", json!(env!("CARGO_PKG_VERSION")), "build", "rebuild / redeploy FQS"),
+            setting_item(
+                "server_name",
+                json!(args.server_name),
+                "--server-name / FQS_SERVER_NAME",
+                "fqs serve --server-name '…'  (restart)"
+            ),
+            setting_item(
+                "test_mode",
+                json!(args.test),
+                "--test",
+                "omit --test for production (restart)"
+            ),
+        ],
+    }));
+
+    sections.push(json!({
+        "id": "bind",
+        "title": "HTTP bind",
+        "mutable": false,
+        "items": [
+            setting_item(
+                "public_address",
+                json!(format!("{}:{}", args.host, args.port)),
+                "--host / --port",
+                "fqs serve --host … --port …  (restart)"
+            ),
+            setting_item(
+                "admin_http",
+                json!(admin_dir.is_some()),
+                "--enable-admin-http",
+                "fqs serve --enable-admin-http  (requires FQS_SECRET; restart)"
+            ),
+            setting_item(
+                "admin_bind",
+                json!(admin_bind_s),
+                "--admin-bind / FQS_ADMIN_BIND",
+                "fqs serve --admin-bind 127.0.0.1:8790  (restart; recommended for production)"
+            ),
+            setting_item(
+                "admin_dir",
+                json!(admin_dir.map(|p| p.to_string_lossy().to_string())),
+                "--admin-dir / FQS_ADMIN_DIR",
+                "fqs serve --admin-dir /path/to/admin  (restart)"
+            ),
+        ],
+    }));
+
+    sections.push(json!({
+        "id": "catalog",
+        "title": "Catalog database",
+        "mutable": false,
+        "items": [
+            setting_item(
+                "db_path",
+                json!(db_path.to_string_lossy()),
+                &db_source(),
+                "fqs serve --db …  or FQS_DB_PATH  or db_path in fqs.json  (restart)"
+            ),
+            setting_item(
+                "fqs_config",
+                json!(cfg_path.to_string_lossy()),
+                "FQS_CONFIG / /etc/fqs/fqs.json",
+                "edit fqs.json (db_path, scan_roots, frontends, fqs.restart); restart after path changes"
+            ),
+            setting_item(
+                "fqs_config_present",
+                json!(cfg_exists),
+                "filesystem",
+                "create /etc/fqs/fqs.json (or set FQS_CONFIG)"
+            ),
+        ],
+    }));
+
+    sections.push(json!({
+        "id": "auth",
+        "title": "Auth / role trust",
+        "mutable": false,
+        "note": "The JWT secret itself is never shown.",
+        "items": [
+            setting_item(
+                "role_trust",
+                json!(if limits.has_jwt() { "jwt" } else { "unverified" }),
+                "--jwt-secret / FQS_SECRET",
+                "export FQS_SECRET='…'  (required for --enable-admin-http; restart)"
+            ),
+            setting_item(
+                "admin_token",
+                json!("fqs admin-token --user ops --ttl 4h"),
+                "CLI",
+                "mint a short-lived JWT with aud=fqs-admin (max 4h)"
+            ),
+        ],
+    }));
+
+    sections.push(json!({
+        "id": "limits",
+        "title": "Global limits file",
+        "mutable": false,
+        "note": "Editing the global limits file from the GUI is out of scope. Per-corpus overrides live in Corpora → settings.limits.",
+        "items": [
+            setting_item(
+                "limits_path",
+                json!(limits_path.map(|p| p.to_string_lossy().to_string())),
+                "--limits / FQS_LIMITS",
+                "fqs serve --limits /path/to/limits.json  (restart)"
+            ),
+            setting_item(
+                "tiers_loaded",
+                json!(limits.has_tiers()),
+                "limits file",
+                "add a \"tiers\" object to the limits JSON"
+            ),
+        ],
+        "config": limits.file_config().clone(),
+        "live": limits.status_json(),
+    }));
+
+    sections.push(json!({
+        "id": "pando_warm",
+        "title": "Pando warm pool",
+        "mutable": false,
+        "items": [
+            setting_item(
+                "pando_max_warm",
+                json!(args.pando_max_warm),
+                "--pando-max-warm",
+                "fqs serve --pando-max-warm N  (restart)"
+            ),
+            setting_item(
+                "pando_idle_ttl_secs",
+                json!(args.pando_idle_ttl_secs),
+                "--pando-idle-ttl-secs",
+                "fqs serve --pando-idle-ttl-secs N  (restart)"
+            ),
+            setting_item(
+                "pando_cli_only",
+                json!(args.pando_cli_only),
+                "--pando-cli-only",
+                "omit --pando-cli-only to use libflexicorp_pando when available (restart)"
+            ),
+            setting_item(
+                "session_ttl_minutes",
+                json!(args.session_ttl_minutes),
+                "--session-ttl-minutes",
+                "fqs serve --session-ttl-minutes N  (restart)"
+            ),
+        ],
+    }));
+
+    sections.push(json!({
+        "id": "fcs",
+        "title": "FCS / SRU",
+        "mutable": false,
+        "items": [
+            setting_item(
+                "fcs_database",
+                json!(args.fcs_database),
+                "--fcs-database",
+                "fqs serve --fcs-database NAME  (restart)"
+            ),
+            setting_item(
+                "fcs_base_url",
+                json!(args.fcs_base_url),
+                "--fcs-base-url / FQS_FCS_BASE_URL",
+                "fqs serve --fcs-base-url https://…/fcs  (restart)"
+            ),
+        ],
+    }));
+
+    let activity_items = match activity {
+        Some(a) => {
+            let st = a.status_json();
+            vec![
+                setting_item(
+                    "activity_log",
+                    st.get("path").cloned().unwrap_or(Value::Null),
+                    "--activity-log / FQS_ACTIVITY_LOG",
+                    "fqs serve --activity-log /var/log/fqs/activity.jsonl  (restart; required for admin write audit)"
+                ),
+                setting_item(
+                    "activity_events",
+                    json!(format!(
+                        "queries={} warm={}",
+                        st.get("queries").and_then(Value::as_bool).unwrap_or(false),
+                        st.get("warm").and_then(Value::as_bool).unwrap_or(false)
+                    )),
+                    "--activity-events / FQS_ACTIVITY_EVENTS",
+                    "fqs serve --activity-events queries,warm|all  (restart)"
+                ),
+                setting_item(
+                    "activity_users",
+                    st.get("users").cloned().unwrap_or(Value::Null),
+                    "--activity-log-users / FQS_ACTIVITY_USERS",
+                    "fqs serve --activity-log-users hash|plain|none  (restart)"
+                ),
+                setting_item(
+                    "activity_state_secs",
+                    json!(args.activity_state_secs),
+                    "--activity-state-secs",
+                    "fqs serve --activity-state-secs N  (0 = no warm_state snapshots; restart)"
+                ),
+            ]
+        }
+        None => vec![setting_item(
+            "activity_log",
+            Value::Null,
+            "--activity-log / FQS_ACTIVITY_LOG",
+            "fqs serve --activity-log /var/log/fqs/activity.jsonl  (restart; recommended with admin HTTP)",
+        )],
+    };
+    let mut logging_items = vec![
+        setting_item(
+            "request_log",
+            json!(request_log_path.to_string_lossy()),
+            "--log-file",
+            "fqs serve --log-file /path/to/fqs.log  (restart)",
+        ),
+        setting_item(
+            "log_max_bytes",
+            json!(args.log_max_bytes),
+            "--log-max-bytes",
+            "fqs serve --log-max-bytes N  (restart)",
+        ),
+        setting_item(
+            "log_keep_files",
+            json!(args.log_keep_files),
+            "--log-keep-files",
+            "fqs serve --log-keep-files N  (restart)",
+        ),
+    ];
+    logging_items.extend(activity_items);
+    sections.push(json!({
+        "id": "logging",
+        "title": "Logging",
+        "mutable": false,
+        "items": logging_items,
+    }));
+
+    sections.push(json!({
+        "id": "scan",
+        "title": "Scan allowlist",
+        "mutable": false,
+        "note": "Request scan roots are intersected with this allowlist. Set FQS_SCAN_ROOTS or fqs.json scan_roots for a tight allowlist.",
+        "change": "export FQS_SCAN_ROOTS='/srv/teitok:/data/corpora'  or add \"scan_roots\" to fqs.json (restart not required for next scan if only env/file changed — prefer restart so ops stay consistent)",
+        "items": [],
+    }));
+
+    sections.push(json!({
+        "id": "corpus_settings",
+        "title": "Per-corpus settings",
+        "mutable": "corpora_tab",
+        "note": "Catalog fields (policy, preferred_backend, settings JSON including limits/FCS) are edited on the Corpora tab via PUT /admin/api/corpora — not here.",
+        "change": "Admin UI → Corpora, or: fqs corpora upsert-json …",
+        "items": [],
+    }));
+
+    json!({
+        "ok": true,
+        "mutable": false,
+        "policy": "Process and global settings are report-only in the admin UI. Change them via CLI flags, environment variables, or fqs.json, then restart FQS. Per-corpus settings are edited on the Corpora tab.",
+        "fqs_config_path": cfg_path.to_string_lossy(),
+        "sections": sections,
+    })
+}
+
+fn enrich_settings_report(state: &HttpAppState) -> Value {
+    let mut body = state.settings_snapshot.as_ref().clone();
+    let catalog_roots: Vec<PathBuf> = state
+        .catalog
+        .list(None, true, None)
+        .into_iter()
+        .map(|c| c.project_root)
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
+    let allow = scan::configured_scan_allowlist(&catalog_roots);
+    let scan_roots: Vec<Value> = allow
+        .iter()
+        .map(|r| json!({"path": r.path, "source": r.source}))
+        .collect();
+    if let Some(sections) = body.get_mut("sections").and_then(Value::as_array_mut) {
+        for sec in sections.iter_mut() {
+            match sec.get("id").and_then(Value::as_str) {
+                Some("scan") => {
+                    sec["items"] = json!([setting_item(
+                        "allowlist",
+                        json!(scan_roots),
+                        "FQS_SCAN_ROOTS / fqs.json scan_roots / catalog parents / defaults",
+                        "export FQS_SCAN_ROOTS='…' or set scan_roots in fqs.json"
+                    )]);
+                }
+                Some("limits") => {
+                    sec["live"] = state.limits.status_json();
+                    sec["config"] = state.limits.file_config().clone();
+                }
+                _ => {}
+            }
+        }
+    }
+    body["scan_allowlist"] = json!(scan_roots);
+    body["limits_live"] = state.limits.status_json();
+    body
+}
+
+// --- Admin HTTP (v0) --------------------------------------------------------
+
+fn to_admin_err(err: anyhow::Error) -> admin::AdminError {
+    admin::AdminError::msg(StatusCode::BAD_REQUEST, err.to_string())
+}
+
+fn admin_audit(state: &HttpAppState, event: &str, caller: &Caller, mut fields: Map<String, Value>) {
+    fields.insert("by".into(), json!(caller.user));
+    fields.insert("role".into(), json!(caller.role));
+    if let Some(a) = &state.activity {
+        a.event(event, fields);
+    }
+}
+
+fn corpus_entry_hash(entry: &CorpusEntry) -> String {
+    let s = serde_json::to_string(entry).unwrap_or_default();
+    let d = Sha256::digest(s.as_bytes());
+    d.iter().map(|b| format!("{b:02x}")).collect()
+}
+#[derive(Debug, Deserialize)]
+struct AdminDeleteQuery {
+    /// Soft-delete / deactivate (`is_current=0`). Default and only HTTP action.
+    supersede: Option<String>,
+    /// Refused: hard delete is CLI-only (`fqs corpora delete`).
+    hard: Option<String>,
+    /// Refused legacy hard-delete flag.
+    force: Option<String>,
+}
+
+fn query_flag_true(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim).map(|s| s.to_ascii_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminValidateBody {
+    full: Option<bool>,
+    strict_full: Option<bool>,
+}
+
+async fn http_admin_index(State(state): State<HttpAppState>) -> Response {
+    let Some(dir) = state.admin_dir.as_ref() else {
+        return admin::AdminError::msg(StatusCode::NOT_FOUND, "admin HTTP disabled").into_response();
+    };
+    admin::static_response(dir, "index.html")
+}
+
+async fn http_admin_static(
+    State(state): State<HttpAppState>,
+    AxumPath(path): AxumPath<String>,
+) -> Response {
+    let Some(dir) = state.admin_dir.as_ref() else {
+        return admin::AdminError::msg(StatusCode::NOT_FOUND, "admin HTTP disabled").into_response();
+    };
+    if path == "api" || path.starts_with("api/") {
+        return admin::AdminError::msg(StatusCode::NOT_FOUND, "unknown admin API route").into_response();
+    }
+    let rel = if path.is_empty() { "index.html".to_string() } else { path };
+    admin::static_response(dir, &rel)
+}
+
+async fn http_admin_health(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+) -> admin::AdminResult<Json<Value>> {
+    let _ = admin::require_admin(&state.limits, &headers)?;
+    let mut body = detailed_health_body(&state);
+    let server_name = state.server_name.clone();
+    let self_report = tokio::task::spawn_blocking(move || {
+        services::probe_fqs_self(server_name.as_deref())
+    })
+    .await
+    .map_err(|e| admin::AdminError::msg(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    body["fqs"] = self_report;
+    Ok(Json(body))
+}
+
+async fn http_admin_settings(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+) -> admin::AdminResult<Json<Value>> {
+    let _ = admin::require_admin(&state.limits, &headers)?;
+    Ok(Json(enrich_settings_report(&state)))
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminActivityQuery {
+    /// Max events to return (1–500, default 100).
+    limit: Option<usize>,
+    /// `interesting` (default, skip warm_state), `all`, `query`, `warm`, `admin`, or event name.
+    event: Option<String>,
+    /// Filter by corpus / corpus_id (case-insensitive).
+    corpus: Option<String>,
+}
+
+async fn http_admin_activity(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    AxumQuery(q): AxumQuery<AdminActivityQuery>,
+) -> admin::AdminResult<Json<Value>> {
+    let _ = admin::require_admin(&state.limits, &headers)?;
+    let Some(log) = state.activity.as_ref() else {
+        return Ok(Json(json!({
+            "ok": true,
+            "enabled": false,
+            "hint": "Activity log is off. Start with --activity-log FILE (or FQS_ACTIVITY_LOG), then restart FQS.",
+            "summary": null,
+            "events": [],
+        })));
+    };
+    let limit = q.limit.unwrap_or(100);
+    let event = q.event.as_deref().unwrap_or("interesting");
+    let corpus = q.corpus.as_deref();
+    // Read on a blocking thread so a large tail does not stall the async runtime.
+    let log = Arc::clone(log);
+    let event = event.to_string();
+    let corpus = corpus.map(str::to_string);
+    let report = tokio::task::spawn_blocking(move || {
+        log.admin_overview(limit, &event, corpus.as_deref(), 2 * 1024 * 1024)
+    })
+    .await
+    .map_err(|e| admin::AdminError::msg(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(report))
+}
+
+async fn http_admin_self(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+) -> admin::AdminResult<Json<Value>> {
+    let _ = admin::require_admin(&state.limits, &headers)?;
+    let server_name = state.server_name.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        services::probe_fqs_self(server_name.as_deref())
+    })
+    .await
+    .map_err(|e| admin::AdminError::msg(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(report))
+}
+
+async fn http_admin_self_restart(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+) -> admin::AdminResult<Json<Value>> {
+    let caller = admin::require_admin(&state.limits, &headers)?;
+    let result = tokio::task::spawn_blocking(services::restart_fqs)
+        .await
+        .map_err(|e| admin::AdminError::msg(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    match result {
+        Ok(body) => {
+            let ok = body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+            admin_audit(
+                &state,
+                "admin_fqs_restart",
+                &caller,
+                activity::fields(vec![("ok", json!(ok))]),
+            );
+            Ok(Json(json!({
+                "ok": ok,
+                "operation": "admin_fqs_restart",
+                "by": caller.user,
+                "result": body,
+            })))
+        }
+        Err(msg) => Err(admin::AdminError::msg(StatusCode::BAD_REQUEST, msg)),
+    }
+}
+
+async fn http_admin_list_corpora(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+) -> admin::AdminResult<Json<Value>> {
+    let caller = admin::require_admin(&state.limits, &headers)?;
+    let corpora = state.catalog.list(None, true, None);
+    Ok(Json(json!({
+        "ok": true,
+        "role": caller.role,
+        "user": caller.user,
+        "count": corpora.len(),
+        "corpora": corpora,
+    })))
+}
+
+async fn http_admin_get_corpus(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> admin::AdminResult<Json<Value>> {
+    let _ = admin::require_admin(&state.limits, &headers)?;
+    let corpus = state.catalog.get(&id).map_err(|e| {
+        admin::AdminError::msg(StatusCode::NOT_FOUND, e.to_string())
+    })?;
+    Ok(Json(json!({"ok": true, "corpus": corpus})))
+}
+
+async fn http_admin_upsert_corpora(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    body: String,
+) -> admin::AdminResult<Json<Value>> {
+    let caller = admin::require_admin(&state.limits, &headers)?;
+    let entries = parse_entries_from_json(&body).map_err(to_admin_err)?;
+    if entries.is_empty() {
+        return Err(admin::AdminError::msg(
+            StatusCode::BAD_REQUEST,
+            "no corpus entries in body",
+        ));
+    }
+    let conn = open_db(&state.db_path).map_err(to_admin_err)?;
+    let mut inserted = Vec::new();
+    let mut updated = Vec::new();
+    let mut audits = Vec::new();
+    for entry in &entries {
+        let before = get_corpus(&conn, &entry.id).ok();
+        let before_hash = before.as_ref().map(corpus_entry_hash);
+        let existed = before.is_some();
+        upsert_corpus(&conn, entry).map_err(to_admin_err)?;
+        let after_hash = corpus_entry_hash(entry);
+        if existed {
+            updated.push(entry.id.clone());
+        } else {
+            inserted.push(entry.id.clone());
+        }
+        audits.push(json!({
+            "id": entry.id,
+            "action": if existed { "update" } else { "insert" },
+            "before_hash": before_hash,
+            "after_hash": after_hash,
+        }));
+    }
+    let n = state.catalog.reload(&state.db_path).map_err(to_admin_err)?;
+    for a in &audits {
+        admin_audit(
+            &state,
+            "admin_corpora_upsert",
+            &caller,
+            activity::fields(vec![
+                ("corpus_id", a.get("id").cloned().unwrap_or(Value::Null)),
+                ("action", a.get("action").cloned().unwrap_or(Value::Null)),
+                ("before_hash", a.get("before_hash").cloned().unwrap_or(Value::Null)),
+                ("after_hash", a.get("after_hash").cloned().unwrap_or(Value::Null)),
+            ]),
+        );
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "operation": "admin_corpora_upsert",
+        "by": caller.user,
+        "inserted": inserted,
+        "updated": updated,
+        "catalog_corpora": n,
+    })))
+}
+
+async fn http_admin_delete_corpus(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    AxumQuery(q): AxumQuery<AdminDeleteQuery>,
+) -> admin::AdminResult<Json<Value>> {
+    let caller = admin::require_admin(&state.limits, &headers)?;
+    if query_flag_true(q.hard.as_deref()) || query_flag_true(q.force.as_deref()) {
+        return Err(admin::AdminError::msg(
+            StatusCode::BAD_REQUEST,
+            "hard delete is not available via the admin API/GUI; use `fqs corpora delete --id …` (or deactivate with DELETE /admin/api/corpora/{id}?supersede=1)",
+        ));
+    }
+    let _ = q.supersede; // optional flag; DELETE always deactivates
+    let conn = open_db(&state.db_path).map_err(to_admin_err)?;
+    let before = get_corpus(&conn, &id).map_err(|e| {
+        admin::AdminError::msg(StatusCode::NOT_FOUND, e.to_string())
+    })?;
+    let before_hash = corpus_entry_hash(&before);
+    if !before.is_current {
+        return Ok(Json(json!({
+            "ok": true,
+            "operation": "admin_corpora_supersede",
+            "by": caller.user,
+            "id": id,
+            "detail": {"superseded": true, "already": true},
+            "catalog_corpora": state.catalog.len(),
+        })));
+    }
+    mark_corpus_superseded(&conn, &id).map_err(to_admin_err)?;
+    let catalog_n = state.catalog.reload(&state.db_path).map_err(to_admin_err)?;
+    admin_audit(
+        &state,
+        "admin_corpora_supersede",
+        &caller,
+        activity::fields(vec![
+            ("corpus_id", json!(id)),
+            ("before_hash", json!(before_hash)),
+        ]),
+    );
+    Ok(Json(json!({
+        "ok": true,
+        "operation": "admin_corpora_supersede",
+        "by": caller.user,
+        "id": id,
+        "detail": {"superseded": true},
+        "catalog_corpora": catalog_n,
+    })))
+}
+
+async fn http_admin_validate_corpus(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    body: Option<Json<AdminValidateBody>>,
+) -> admin::AdminResult<Json<Value>> {
+    let caller = admin::require_admin(&state.limits, &headers)?;
+    let full = body.as_ref().and_then(|b| b.full).unwrap_or(false);
+    let strict_full = body.as_ref().and_then(|b| b.strict_full).unwrap_or(false);
+    let corpus = state.catalog.get(&id).map_err(|e| {
+        admin::AdminError::msg(StatusCode::NOT_FOUND, e.to_string())
+    })?;
+    let db_path = state.db_path.clone();
+    let catalog = state.catalog.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let result = validate_corpus(&corpus, full, strict_full);
+        let conn = open_db(&db_path)?;
+        update_validation_result(&conn, &corpus.id, &result)?;
+        catalog.reload(&db_path)?;
+        Ok::<_, anyhow::Error>(result)
+    })
+    .await
+    .map_err(|e| admin::AdminError::msg(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    .map_err(to_admin_err)?;
+    admin_audit(
+        &state,
+        "admin_corpora_validate",
+        &caller,
+        activity::fields(vec![
+            ("corpus_id", json!(id)),
+            ("full", json!(full)),
+            ("strict_full", json!(strict_full)),
+            ("ok", json!(result.ok)),
+        ]),
+    );
+    Ok(Json(json!({
+        "ok": true,
+        "operation": "admin_corpora_validate",
+        "by": caller.user,
+        "full": full,
+        "strict_full": strict_full,
+        "result": result,
+    })))
+}
+
+async fn http_admin_reindex_jobs(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    AxumQuery(params): AxumQuery<HttpReindexJobsQuery>,
+) -> admin::AdminResult<Json<Value>> {
+    let _ = admin::require_admin(&state.limits, &headers)?;
+    http_reindex_jobs(State(state), AxumQuery(params))
+        .await
+        .map_err(|(status, msg)| admin::AdminError::msg(status, msg))
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminScanQuery {
+    /// Colon-separated roots; each must lie under the configured allowlist
+    roots: Option<String>,
+    max_depth: Option<u32>,
+    max_candidates: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminScanBody {
+    roots: Option<Vec<String>>,
+    max_depth: Option<u32>,
+    max_candidates: Option<usize>,
+}
+
+async fn http_admin_scan(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    AxumQuery(q): AxumQuery<AdminScanQuery>,
+) -> admin::AdminResult<Json<Value>> {
+    let roots = q.roots.as_ref().map(|s| {
+        s.split(|c| c == ':' || c == ';')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect::<Vec<_>>()
+    });
+    run_admin_scan(state, headers, roots, q.max_depth, q.max_candidates).await
+}
+
+async fn http_admin_scan_post(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    body: Option<Json<AdminScanBody>>,
+) -> admin::AdminResult<Json<Value>> {
+    let (roots, max_depth, max_candidates) = match body {
+        Some(Json(b)) => (b.roots, b.max_depth, b.max_candidates),
+        None => (None, None, None),
+    };
+    run_admin_scan(state, headers, roots, max_depth, max_candidates).await
+}
+
+async fn run_admin_scan(
+    state: HttpAppState,
+    headers: HeaderMap,
+    roots: Option<Vec<String>>,
+    max_depth: Option<u32>,
+    max_candidates: Option<usize>,
+) -> admin::AdminResult<Json<Value>> {
+    let caller = admin::require_admin(&state.limits, &headers)?;
+    let catalog_rows: Vec<(String, PathBuf, Value)> = state
+        .catalog
+        .list(None, true, None)
+        .into_iter()
+        .map(|c| (c.id, c.project_root, c.settings))
+        .collect();
+    let catalog_roots: Vec<PathBuf> = catalog_rows.iter().map(|(_, r, _)| r.clone()).collect();
+    let fingerprints = scan::catalog_fingerprints(&catalog_rows);
+    let allow = scan::configured_scan_allowlist(&catalog_roots);
+    let requested = roots.clone().unwrap_or_default();
+    let rejected: Vec<String> = requested
+        .iter()
+        .filter(|r| !scan::root_allowed_under(r, &allow))
+        .cloned()
+        .collect();
+    let explicit = roots.filter(|v| !v.is_empty());
+    if explicit.is_some() && !rejected.is_empty() && explicit.as_ref().map(|v| {
+        v.iter().all(|r| rejected.iter().any(|x| x == r))
+    }).unwrap_or(false) {
+        return Err(admin::AdminError::new(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "ok": false,
+                "error": "all requested scan roots lie outside the configured allowlist (FQS_SCAN_ROOTS / fqs.json scan_roots, else catalog/defaults)",
+                "rejected_roots": rejected,
+                "allowlist": allow,
+            }),
+        ));
+    }
+    let scan_roots = scan::resolve_scan_roots(explicit.as_deref(), &catalog_roots);
+    let max_depth = max_depth.unwrap_or(4).min(8);
+    let max_candidates = max_candidates.unwrap_or(500).clamp(1, 5000);
+    let report = tokio::task::spawn_blocking(move || {
+        scan::scan_filesystem(&scan_roots, &fingerprints, max_depth, max_candidates)
+    })
+    .await
+    .map_err(|e| admin::AdminError::msg(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let new_n = report.candidates.iter().filter(|c| c.status == "new").count();
+    let alias_n = report.candidates.iter().filter(|c| c.status == "alias").count();
+    let reg_n = report.candidates.iter().filter(|c| c.status == "registered").count();
+    let suggestions: Vec<Value> = report
+        .candidates
+        .iter()
+        .filter(|c| c.status == "new")
+        .map(scan::candidate_to_entry_json)
+        .collect();
+
+    admin_audit(
+        &state,
+        "admin_scan",
+        &caller,
+        activity::fields(vec![
+            ("roots", json!(report.roots.iter().map(|r| &r.path).collect::<Vec<_>>())),
+            ("rejected_roots", json!(rejected)),
+            ("candidates", json!(report.candidates.len())),
+            ("new", json!(new_n)),
+        ]),
+    );
+
+    Ok(Json(json!({
+        "ok": true,
+        "operation": "admin_scan",
+        "by": caller.user,
+        "summary": {
+            "roots": report.roots.len(),
+            "candidates": report.candidates.len(),
+            "new": new_n,
+            "alias": alias_n,
+            "registered": reg_n,
+            "truncated": report.truncated,
+            "skipped_outside": report.skipped_outside,
+            "rejected_roots": rejected.len(),
+        },
+        "rejected_roots": rejected,
+        "allowlist": allow,
+        "roots": report.roots,
+        "candidates": report.candidates,
+        "register_suggestions": suggestions,
+    })))
+}
+
+async fn http_admin_backends(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+) -> admin::AdminResult<Json<Value>> {
+    let _ = admin::require_admin(&state.limits, &headers)?;
+    let pando = state
+        .pando_hcm
+        .as_ref()
+        .map(|h| h.status_json())
+        .unwrap_or(json!({"available": false}));
+    let report = tokio::task::spawn_blocking(move || services::probe_backends(pando))
+        .await
+        .map_err(|e| admin::AdminError::msg(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(report))
+}
+
+async fn http_admin_frontends(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+) -> admin::AdminResult<Json<Value>> {
+    let _ = admin::require_admin(&state.limits, &headers)?;
+    let mut hints = Vec::new();
+    for c in state.catalog.list(None, true, None) {
+        hints.extend(services::hints_from_catalog_row(
+            &c.id,
+            c.project_url.as_deref(),
+            c.interface_preference.as_deref(),
+            &c.settings,
+        ));
+    }
+    let report = tokio::task::spawn_blocking(move || services::probe_frontends(&hints))
+        .await
+        .map_err(|e| admin::AdminError::msg(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(report))
+}
+
+async fn http_admin_frontend_restart(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> admin::AdminResult<Json<Value>> {
+    let caller = admin::require_admin(&state.limits, &headers)?;
+    let id_owned = id.clone();
+    let result = tokio::task::spawn_blocking(move || services::restart_frontend(&id_owned))
+        .await
+        .map_err(|e| admin::AdminError::msg(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    match result {
+        Ok(body) => {
+            let ok = body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+            admin_audit(
+                &state,
+                "admin_frontend_restart",
+                &caller,
+                activity::fields(vec![
+                    ("frontend_id", json!(id)),
+                    ("ok", json!(ok)),
+                ]),
+            );
+            Ok(Json(json!({
+                "ok": ok,
+                "operation": "admin_frontend_restart",
+                "by": caller.user,
+                "frontend_id": id,
+                "result": body,
+            })))
+        }
+        Err(msg) => Err(admin::AdminError::msg(StatusCode::BAD_REQUEST, msg)),
+    }
 }
 
 async fn http_root_with_state(State(state): State<HttpAppState>) -> Json<Value> {
+    let mut routes = vec![
+            json!({"method":"GET", "path":"/", "description":"Route index"}),
+            json!({"method":"GET", "path":"/health", "description":"Health check"}),
+            json!({"method":"GET", "path":"/corpora", "description":"List corpora (query params: request_role, environment, include_noncurrent, tag)"}),
+            json!({"method":"GET", "path":"/labels", "description":"Distinct browse labels for catalog filtering"}),
+            json!({"method":"GET", "path":"/fcs", "description":"FCS/SRU-style endpoint"}),
+            json!({"method":"GET", "path":"/reindex/jobs", "description":"List reindex queue (status/corpus/limit)"}),
+            json!({"method":"POST", "path":"/reindex/jobs", "description":"Enqueue reindex job (admin role)"}),
+            json!({"method":"GET", "path":"/reindex/history", "description":"Reindex history log (corpus/limit)"}),
+            json!({"method":"POST", "path":"/reindex/workers/heartbeat", "description":"Worker heartbeat + capacity"}),
+            json!({"method":"POST", "path":"/reindex/jobs/mark-started", "description":"Worker callback: mark started"}),
+            json!({"method":"POST", "path":"/reindex/jobs/mark-finished", "description":"Worker callback: mark finished"}),
+            json!({"method":"POST", "path":"/query", "description":"Run query (JSON body: corpus, query, language?, start?, size?, request_role?)"}),
+            json!({"method":"GET", "path":"/backends", "description":"Warm backend / HCM status"}),
+            json!({"method":"GET", "path":"/info", "description":"Pando corpus info (?corpus=)"}),
+            json!({"method":"GET", "path":"/context", "description":"Pando KWIC context (?corpus=&pos=&left=&right=)"}),
+            json!({"method":"GET", "path":"/status", "description":"Pando async total job (?corpus=&job=)"}),
+            json!({"method":"POST", "path":"/run", "description":"Pando CQL program (JSON: corpus, cql|query, session_id?, …)"}),
+            json!({"method":"POST", "path":"/session", "description":"Pando hit-set session (JSON: corpus, session_id?, ttl_s?); /query name / from and /run use it"}),
+            json!({"method":"GET", "path":"/session", "description":"Pando session's hit sets (?corpus=&session_id=)"}),
+            json!({"method":"POST", "path":"/session/close", "description":"Close a pando session (JSON: corpus, session_id)"}),
+            json!({"method":"GET", "path":"/sessions", "description":"Open pando sessions (?corpus=)"}),
+    ];
+    if state.admin_dir.is_some() && !state.admin_bind_separate {
+        routes.extend([
+            json!({"method":"GET", "path":"/admin/", "description":"Admin UI (JWT aud=fqs-admin)"}),
+            json!({"method":"GET", "path":"/admin/api/corpora", "description":"Admin: list all corpora"}),
+            json!({"method":"PUT", "path":"/admin/api/corpora", "description":"Admin: upsert corpus JSON"}),
+            json!({"method":"GET", "path":"/admin/api/corpora/{id}", "description":"Admin: get corpus"}),
+            json!({"method":"DELETE", "path":"/admin/api/corpora/{id}?supersede=1", "description":"Admin: deactivate/supersede corpus (hard delete is CLI-only)"}),
+            json!({"method":"POST", "path":"/admin/api/corpora/{id}/validate", "description":"Admin: validate corpus"}),
+            json!({"method":"GET", "path":"/admin/api/health", "description":"Admin: detailed health"}),
+            json!({"method":"GET", "path":"/admin/api/settings", "description":"Admin: report-only effective process settings (CLI/env/fqs.json)"}),
+            json!({"method":"GET", "path":"/admin/api/activity", "description":"Admin: activity-log overview (summary + recent events)"}),
+            json!({"method":"GET", "path":"/admin/api/reindex/jobs", "description":"Admin: reindex jobs"}),
+            json!({"method":"GET|POST", "path":"/admin/api/scan", "description":"Admin: scan disk (allowlisted roots)"}),
+            json!({"method":"GET", "path":"/admin/api/backends", "description":"Admin: installed query backends + versions"}),
+            json!({"method":"GET", "path":"/admin/api/frontends", "description":"Admin: known frontends + health"}),
+            json!({"method":"GET", "path":"/admin/api/frontends", "description":"Admin: known frontends + health"}),
+            json!({"method":"POST", "path":"/admin/api/frontends/{id}/restart", "description":"Admin: restart configured frontend (fqs.json only)"}),
+            json!({"method":"GET", "path":"/admin/api/self", "description":"Admin: this FQS version + update check"}),
+            json!({"method":"POST", "path":"/admin/api/self/restart", "description":"Admin: restart FQS (fqs.restart in fqs.json only)"}),
+        ]);
+    }
     Json(json!({
         "ok": true,
         "service": "fqs",
         "version": env!("CARGO_PKG_VERSION"),
         "server_name": state.server_name,
-        "routes": [
-            {"method":"GET", "path":"/", "description":"Route index"},
-            {"method":"GET", "path":"/health", "description":"Health check"},
-            {"method":"GET", "path":"/corpora", "description":"List corpora (query params: request_role, environment, include_noncurrent, tag)"},
-            {"method":"GET", "path":"/labels", "description":"Distinct browse labels for catalog filtering"},
-            {"method":"GET", "path":"/fcs", "description":"FCS/SRU-style endpoint"},
-            {"method":"GET", "path":"/reindex/jobs", "description":"List reindex queue (status/corpus/limit)"},
-            {"method":"POST", "path":"/reindex/jobs", "description":"Enqueue reindex job (admin role)"},
-            {"method":"GET", "path":"/reindex/history", "description":"Reindex history log (corpus/limit)"},
-            {"method":"POST", "path":"/reindex/workers/heartbeat", "description":"Worker heartbeat + capacity"},
-            {"method":"POST", "path":"/reindex/jobs/mark-started", "description":"Worker callback: mark started"},
-            {"method":"POST", "path":"/reindex/jobs/mark-finished", "description":"Worker callback: mark finished"},
-            {"method":"POST", "path":"/query", "description":"Run query (JSON body: corpus, query, language?, start?, size?, request_role?)"},
-            {"method":"GET", "path":"/backends", "description":"Warm backend / HCM status"},
-            {"method":"GET", "path":"/info", "description":"Pando corpus info (?corpus=)"},
-            {"method":"GET", "path":"/context", "description":"Pando KWIC context (?corpus=&pos=&left=&right=)"},
-            {"method":"GET", "path":"/status", "description":"Pando async total job (?corpus=&job=)"},
-            {"method":"POST", "path":"/run", "description":"Pando CQL program (JSON: corpus, cql|query, session_id?, …)"},
-            {"method":"POST", "path":"/session", "description":"Pando hit-set session (JSON: corpus, session_id?, ttl_s?); /query name / from and /run use it"},
-            {"method":"GET", "path":"/session", "description":"Pando session's hit sets (?corpus=&session_id=)"},
-            {"method":"POST", "path":"/session/close", "description":"Close a pando session (JSON: corpus, session_id)"},
-            {"method":"GET", "path":"/sessions", "description":"Open pando sessions (?corpus=)"}
-        ]
+        "admin_http_on_this_bind": state.admin_dir.is_some() && !state.admin_bind_separate,
+        "routes": routes,
     }))
 }
 

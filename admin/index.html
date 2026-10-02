@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FQS Admin</title>
+  <link rel="stylesheet" href="admin.css" />
+</head>
+<body>
+  <header class="top">
+    <div>
+      <h1>FQS Admin</h1>
+      <p class="muted">Catalog / health — admin JWT required</p>
+    </div>
+    <div class="top-actions">
+      <div id="auth-bar" class="auth">
+        <label class="auth-label" for="token">Admin JWT</label>
+        <input id="token" type="password" autocomplete="off" placeholder="Paste token from: fqs admin-token" />
+        <button type="button" id="btn-save-token">Use token</button>
+      </div>
+      <div id="session-bar" class="session" hidden>
+        <span id="session-label" class="session-label">Signed in</span>
+        <button type="button" id="btn-change-token" class="secondary">Change token</button>
+      </div>
+      <button type="button" id="btn-refresh" class="secondary">Refresh</button>
+    </div>
+  </header>
+
+  <p id="banner" class="banner" hidden></p>
+
+  <nav class="tabs top-tabs">
+    <button type="button" data-tab="edit" class="tab active">Corpora</button>
+    <button type="button" data-tab="scan" class="tab">Scan</button>
+    <button type="button" data-tab="backends" class="tab">Backends</button>
+    <button type="button" data-tab="frontends" class="tab">Frontends</button>
+    <button type="button" data-tab="settings" class="tab">Settings</button>
+    <button type="button" data-tab="activity" class="tab">Activity</button>
+    <button type="button" data-tab="health" class="tab">Health</button>
+    <button type="button" data-tab="reindex" class="tab">Reindex jobs</button>
+  </nav>
+
+  <section id="tab-edit" class="tab-body panels">
+    <aside class="list-panel">
+      <div class="row">
+        <h2>Corpora</h2>
+        <button type="button" id="btn-new" class="secondary">New</button>
+      </div>
+      <input id="filter" type="search" placeholder="Filter id / label…" />
+      <p id="list-empty" class="list-empty" hidden></p>
+      <ul id="corpus-list"></ul>
+    </aside>
+
+    <main class="detail-panel">
+      <div class="row actions">
+        <button type="button" id="btn-save">Save (PUT)</button>
+        <button type="button" id="btn-validate" class="secondary">Validate</button>
+        <button type="button" id="btn-validate-full" class="secondary">Validate full</button>
+        <button type="button" id="btn-delete" class="secondary">Deactivate…</button>
+      </div>
+      <div class="grid">
+        <label>id <input id="f-id" /></label>
+        <label>label <input id="f-label" /></label>
+        <label>project_root <input id="f-project_root" /></label>
+        <label>project_url <input id="f-project_url" /></label>
+        <label>preferred_backend
+          <select id="f-preferred_backend">
+            <option>auto</option>
+            <option>pando</option>
+            <option>cqp</option>
+          </select>
+        </label>
+        <label>environment <input id="f-environment" /></label>
+        <label>http_policy_mode
+          <select id="f-http_policy_mode">
+            <option>public_query</option>
+            <option>auth_required</option>
+            <option>disabled</option>
+          </select>
+        </label>
+        <label>listing_visibility <input id="f-listing_visibility" /></label>
+        <label class="check"><input id="f-is_current" type="checkbox" checked /> is_current</label>
+        <label class="check"><input id="f-supports_xml" type="checkbox" /> supports_xml</label>
+      </div>
+      <label class="block">labels (comma-separated)
+        <input id="f-labels" />
+      </label>
+      <label class="block">http_allowed_operations (comma-separated)
+        <input id="f-ops" />
+      </label>
+      <label class="block">settings (JSON)
+        <textarea id="f-settings" rows="12" spellcheck="false"></textarea>
+      </label>
+      <label class="block">capabilities (JSON)
+        <textarea id="f-capabilities" rows="6" spellcheck="false"></textarea>
+      </label>
+      <pre id="meta" class="meta muted"></pre>
+      <pre id="validate-out" class="out" hidden></pre>
+    </main>
+  </section>
+
+  <section id="tab-scan" class="tab-body page" hidden>
+    <div class="row actions">
+      <label class="inline scan-roots-field">Extra roots (optional, colon-separated)
+        <input id="scan-roots" placeholder="defaults from catalog + FQS_SCAN_ROOTS + common paths" />
+      </label>
+      <button type="button" id="btn-scan">Scan disk</button>
+    </div>
+    <p class="muted">Finds pando indexes, project trees, CQP/Manatee-like dirs under configured roots. Marks <em>new</em>, <em>registered</em>, and <em>alias</em>. Layout-based — not TEITOK-only.</p>
+    <div id="scan-view" class="view-panel">
+      <p class="muted">Click Scan disk (JWT required).</p>
+    </div>
+    <details class="raw-json">
+      <summary>Raw JSON</summary>
+      <pre id="scan-out" class="out">—</pre>
+    </details>
+  </section>
+
+  <section id="tab-backends" class="tab-body page" hidden>
+    <div class="row actions">
+      <button type="button" id="btn-backends-refresh" class="secondary">Refresh backends</button>
+    </div>
+    <p class="muted">Engines FQS can use on this host (installed binaries / libraries), with version probes where available.</p>
+    <div id="backends-view" class="view-panel">
+      <p class="muted">Open this tab (with a JWT) to probe backends.</p>
+    </div>
+    <details class="raw-json">
+      <summary>Raw JSON</summary>
+      <pre id="backends-out" class="out">—</pre>
+    </details>
+  </section>
+
+  <section id="tab-frontends" class="tab-body page" hidden>
+    <div class="row actions">
+      <button type="button" id="btn-frontends-refresh" class="secondary">Refresh frontends</button>
+    </div>
+    <p class="muted">Every frontend kind FQS can handle, with status. Centralized UIs nest the corpora they serve; TEITOK lists related per-project corpora under the kind. Restart only when configured in <code>fqs.json</code>.</p>
+    <div id="frontends-view" class="view-panel">
+      <p class="muted">Open this tab (with a JWT) to load frontends.</p>
+    </div>
+    <details class="raw-json">
+      <summary>Raw JSON</summary>
+      <pre id="frontends-out" class="out">—</pre>
+    </details>
+  </section>
+
+  <section id="tab-settings" class="tab-body page" hidden>
+    <div class="row actions">
+      <button type="button" id="btn-settings-refresh" class="secondary">Refresh settings</button>
+    </div>
+    <p class="muted">Report-only view of this FQS process. Change bind/secrets/limits/paths via CLI, env, or <code>fqs.json</code> and restart. Per-corpus policy and <code>settings</code> JSON are edited on the Corpora tab.</p>
+    <div id="settings-view" class="view-panel">
+      <p class="muted">Open this tab (with a JWT) to load effective settings.</p>
+    </div>
+    <details class="raw-json">
+      <summary>Raw JSON</summary>
+      <pre id="settings-out" class="out">—</pre>
+    </details>
+  </section>
+
+  <section id="tab-activity" class="tab-body page" hidden>
+    <div class="row actions">
+      <label class="inline">Events
+        <select id="activity-event">
+          <option value="interesting" selected>Interesting (skip warm_state)</option>
+          <option value="query">Queries</option>
+          <option value="warm">Warm open/close</option>
+          <option value="admin">Admin writes</option>
+          <option value="all">All (incl. snapshots)</option>
+        </select>
+      </label>
+      <label class="inline">Corpus
+        <input id="activity-corpus" type="search" placeholder="optional filter" />
+      </label>
+      <label class="inline">Limit
+        <select id="activity-limit">
+          <option value="50">50</option>
+          <option value="100" selected>100</option>
+          <option value="200">200</option>
+        </select>
+      </label>
+      <button type="button" id="btn-activity-refresh" class="secondary">Refresh activity</button>
+    </div>
+    <p class="muted">Overview from <code>--activity-log</code> / <code>FQS_ACTIVITY_LOG</code> (JSONL). Off unless configured. Summary covers the tailed window; the table shows the newest matching events.</p>
+    <div id="activity-view" class="view-panel">
+      <p class="muted">Open this tab (with a JWT) to load activity.</p>
+    </div>
+    <details class="raw-json">
+      <summary>Raw JSON</summary>
+      <pre id="activity-out" class="out">—</pre>
+    </details>
+  </section>
+
+  <section id="tab-health" class="tab-body page" hidden>
+    <div class="row actions">
+      <button type="button" id="btn-health-refresh" class="secondary">Refresh health</button>
+      <button type="button" id="btn-fqs-restart" class="danger" hidden>Restart FQS…</button>
+    </div>
+    <div id="health-view" class="view-panel">
+      <p class="muted">Open this tab (with a JWT) to load health.</p>
+    </div>
+    <details class="raw-json">
+      <summary>Raw JSON</summary>
+      <pre id="health-out" class="out">—</pre>
+    </details>
+  </section>
+
+  <section id="tab-reindex" class="tab-body page" hidden>
+    <div class="row actions">
+      <label class="inline">Status
+        <select id="reindex-status">
+          <option value="active">active (running + queued)</option>
+          <option value="all" selected>all</option>
+          <option value="queued">queued</option>
+          <option value="running">running</option>
+          <option value="finished">finished</option>
+          <option value="failed">failed</option>
+        </select>
+      </label>
+      <button type="button" id="btn-reindex-refresh" class="secondary">Refresh jobs</button>
+    </div>
+    <div id="reindex-view" class="view-panel">
+      <p class="muted">Open this tab (with a JWT) to load reindex jobs.</p>
+    </div>
+    <details class="raw-json">
+      <summary>Raw JSON</summary>
+      <pre id="reindex-out" class="out">—</pre>
+    </details>
+  </section>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -37,6 +37,71 @@ Local permissive test mode (policy is reported but query still runs):
 cargo run -- serve --host 127.0.0.1 --port 8787 --test
 ```
 
+### Admin UI (v0)
+
+Thin catalog / health admin surface (growable; see `dev/FQS-ADMIN-GUI.md`).
+
+```bash
+export FQS_SECRET='your-shared-hs256-secret'
+# Prefer a loopback admin bind in production (LINDAT):
+cargo run -- serve --host 0.0.0.0 --port 8787 \
+  --enable-admin-http --admin-bind 127.0.0.1:8790 \
+  --activity-log /var/log/fqs/activity.jsonl
+# Mint a short-lived admin JWT (aud=fqs-admin, max 4h):
+cargo run -- admin-token --user ops --ttl 4h
+# open http://127.0.0.1:8790/admin/  (or proxy only that bind)
+```
+
+- **Off by default.** `--enable-admin-http` refuses to start without `--jwt-secret` / `FQS_SECRET`.
+- **Separate bind:** `--admin-bind host:port` / `FQS_ADMIN_BIND` serves `/admin` only there (recommended). Without it, admin shares the public port (dev convenience; warns at startup).
+- **UI:** static files in `fqs/admin/` at `/admin/` (`--admin-dir` / `FQS_ADMIN_DIR`). CSP + `frame-ancestors 'none'`. Token kept in **sessionStorage** only.
+- **Admin JWT** (not a TEITOK query token): HS256 with `role=admin`, **`aud=fqs-admin`**, required **`iat`/`exp`**, TTL ≤ **4 hours**. Mint with `fqs admin-token`.
+- **API** (all require that admin JWT; errors are `application/json`):
+  - `GET/PUT /admin/api/corpora` — list (incl. superseded) / upsert
+  - `GET/DELETE /admin/api/corpora/{id}` — get; **DELETE only deactivates** (`?supersede=1` / `is_current=0`). Hard remove is CLI-only: `fqs corpora delete --id … --force`
+  - `POST /admin/api/corpora/{id}/validate` — body `{ "full": false, "strict_full": false }`
+  - `GET/POST /admin/api/scan` — discovery; request `roots` are **intersected** with `FQS_SCAN_ROOTS` / `fqs.json` `scan_roots` (else catalog/defaults); cannot walk arbitrary paths
+  - `GET /admin/api/self` — this FQS version + update check (default: `main` `fqs/Cargo.toml` on GitHub; override with `fqs.update_check_url` / `FQS_UPDATE_CHECK_URL`)
+  - `POST /admin/api/self/restart` — only when `fqs.restart` is set in `/etc/fqs/fqs.json` (same methods as frontend restart)
+  - `GET /admin/api/health` — full diagnostics (db path, slots, pando, limits)
+  - `GET /admin/api/settings` — **report-only** effective process settings (bind, db, auth trust, limits file, warm pool, FCS, logs, scan allowlist) with CLI/`fqs.json` how-to-change hints; no secret values; not editable via API
+  - `GET /admin/api/activity` — activity-log overview when `--activity-log` / `FQS_ACTIVITY_LOG` is set (`?event=interesting|query|warm|admin|all&limit=&corpus=`); summary + recent events from a tailed window
+- **Audit:** each write (upsert, supersede/deactivate, validate, scan, restart) appends an activity-log line when `--activity-log` is set (`by`, corpus/frontend id, before/after hash where applicable).
+- **Public `GET /health`** is minimal (`ok`, `service`, `version`, `server_name` only). Catalog `db_path` is on admin health and in the `fqs-http.json` sidecar (TEITOK should prefer the sidecar when public health has no `db_path`).
+- **UI tabs:** Corpora, Scan, Backends, Frontends, Settings (report-only), Activity, Health, Reindex jobs.
+- **Scan allowlist:** `FQS_SCAN_ROOTS` / `fqs.json` `scan_roots` (see `fqs.example.json`). Binary defaults are only generic paths (`/srv/teitok`, `/data/corpora`, `~/corpora`, …) — not developer trees.
+
+Example `frontends` entry in `/etc/fqs/fqs.json` (restart for gunicorn/KonText):
+
+```json
+{
+  "frontends": [
+    {
+      "id": "kontext",
+      "kind": "kontext",
+      "label": "KonText",
+      "url": "http://127.0.0.1:8080",
+      "restart": { "method": "systemctl", "unit": "gunicorn" }
+    }
+  ]
+}
+```
+
+Other restart methods: `hup_pidfile` with `"pidfile": "/run/gunicorn.pid"`, or `argv` with an allowlisted command array.
+
+Example FQS self-restart / update check in `/etc/fqs/fqs.json`:
+
+```json
+{
+  "fqs": {
+    "update_check_url": "https://raw.githubusercontent.com/ufal/flexicorp/main/fqs/Cargo.toml",
+    "restart": { "method": "systemctl", "unit": "fqs" }
+  }
+}
+```
+
+Set `"update_check": false` under `fqs` to skip the remote version probe.
+
 By default, `fqs serve` writes a rolling plaintext request log:
 
 ```bash
@@ -69,7 +134,7 @@ cargo run -- status --host 127.0.0.1 --port 8787
 
 Endpoints:
 
-- `GET /health` — JSON includes `version`, `db_path`, and optional `server_name` (set via `--server-name` or env `FQS_SERVER_NAME`, e.g. to label a deployment or distinguish host vs container)
+- `GET /health` — minimal public liveness (`ok`, `service`, `version`, optional `server_name`). Full details on `GET /admin/api/health` (admin JWT).
 - `GET /corpora?request_role=visitor|admin&tag=<browse-label>`
 - `GET /labels` — distinct browse labels (for Kontext-style facets)
 - `GET /reindex/jobs?status=queued&corpus=<id>&limit=100` — queue/running overview
@@ -294,8 +359,10 @@ sudo mkdir -p /etc/fqs /var/lib/fqs
 echo '{"db_path": "/var/lib/fqs/fqs.db"}' | sudo tee /etc/fqs/fqs.json
 ```
 
-`fqs status` prints `db_path` and `db_source` (which rule chose it), `/health` shows the same for
-the server, and `fqs serve` logs it at start. When the chosen file does not exist yet, every
+`fqs status` prints `db_path` and `db_source` (which rule chose it). Public `GET /health`
+is minimal (no `db_path`); use admin `GET /admin/api/health` or the `fqs-http.json` sidecar
+written beside the catalog when `fqs serve` starts. `fqs serve` also logs the catalog path at start.
+When the chosen file does not exist yet, every
 command says so on stderr (it then creates a new, empty catalog): the usual sign that it is not the
 catalog you meant.
 

@@ -1,0 +1,117 @@
+[
+  {
+    "id": "ud_pando",
+    "label": "UD 2.18 (pando)",
+    "project_root": "<PANDO_DATA>/ud_demo",
+    "preferred_backend": "pando",
+    "source_kind": "pando_raw",
+    "environment": "live",
+    "listing_visibility": "public",
+    "interfaces": ["query"],
+    "capabilities": {
+      "fcs": { "enabled": true, "supports_dataviews": ["hits", "adv"] }
+    },
+    "settings": {
+      "index_path": "<PANDO_DATA>/ud_demo",
+      "fcs": {
+        "enabled": true,
+        "title": { "en": "Universal Dependencies 2.18 (pando)" },
+        "description": {
+          "en": "UD 2.18 treebanks served by pando on test-kontext."
+        },
+        "institution": {
+          "en": "ÚFAL, Charles University (LINDAT/CLARIAH-CZ)"
+        },
+        "landing_page": "https://lindat.cz/services/test-kontext/",
+        "layers": {
+          "text": "form",
+          "lemma": "lemma",
+          "pos": { "attr": "upos" }
+        },
+        "dataviews": ["hits", "adv"],
+        "hit_link": {
+          "frontend": "kontext",
+          "base": "https://lindat.cz/services/test-kontext",
+          "corpus": "ud_pando"
+        },
+        "sentence": "s",
+        "within": { "sentence": "s", "text": "text" }
+      }
+    }
+  },
+  {
+    "id": "bnc",
+    "label": "BNC (CWB)",
+    "project_root": "<CWB_DATA>/bnc",
+    "preferred_backend": "cqp",
+    "source_kind": "cwb_raw",
+    "environment": "live",
+    "listing_visibility": "public",
+    "interfaces": ["query"],
+    "capabilities": {
+      "fcs": { "enabled": true, "supports_dataviews": ["hits", "adv"] }
+    },
+    "settings": {
+      "registry_hint": "<CWB_REGISTRY>",
+      "corpus_name": "BNC",
+      "cqp_binary": "<PATH_TO_CQP>",
+      "fcs": {
+        "enabled": true,
+        "title": { "en": "British National Corpus (CWB demo)" },
+        "description": { "en": "BNC via IMS Open Corpus Workbench." },
+        "institution": {
+          "en": "ÚFAL, Charles University (LINDAT/CLARIAH-CZ)"
+        },
+        "layers": {
+          "text": "word",
+          "lemma": "lemma",
+          "pos": { "attr": "pos" }
+        },
+        "dataviews": ["hits", "adv"],
+        "hit_link": { "frontend": "none" },
+        "sentence": "s",
+        "within": { "sentence": "s", "text": "text" }
+      }
+    }
+  },
+  {
+    "id": "susanne",
+    "label": "Susanne (Manatee)",
+    "project_root": "<MANATEE_DATA>/susanne",
+    "preferred_backend": "manatee",
+    "source_kind": "manatee_raw",
+    "environment": "live",
+    "listing_visibility": "public",
+    "interfaces": ["query"],
+    "capabilities": {
+      "fcs": { "enabled": true, "supports_dataviews": ["hits", "adv"] }
+    },
+    "settings": {
+      "kontext": { "url": "<KONTEXT_URL_AS_FQS_REACHES_IT>", "corpname": "susanne" },
+      "corpus_name": "susanne",
+      "fcs": {
+        "enabled": true,
+        "title": { "en": "Susanne (Manatee demo)" },
+        "description": {
+          "en": "Susanne corpus via Manatee / NoSketch Engine."
+        },
+        "institution": {
+          "en": "ÚFAL, Charles University (LINDAT/CLARIAH-CZ)"
+        },
+        "layers": {
+          "text": "word",
+          "lemma": "lemma",
+          "pos": { "attr": "tag" }
+        },
+        "dataviews": ["hits", "adv"],
+        "hit_link": {
+          "frontend": "kontext",
+          "base": "https://lindat.cz/services/test-kontext",
+          "corpus": "susanne"
+        },
+        "sentence": "s",
+        "within": { "sentence": "s", "text": "doc" }
+      }
+    }
+  }
+]

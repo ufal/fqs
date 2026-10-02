@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>FQS vs pando-server A/B (rerun)</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --border:#2a2f3a; --text:#e8eaed; --muted:#9aa3b2;
+    --accent:#d97706; --info:#3b82f6; --ok:#22c55e; --bad:#ef4444; --warn:#eab308;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:32px 24px 64px; font:14px/1.45 ui-sans-serif,system-ui,sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width:1100px; margin:0 auto; }
+  h1 { font-size:28px; font-weight:650; margin:0 0 6px; letter-spacing:-0.02em; }
+  h2 { font-size:18px; font-weight:600; margin:32px 0 12px; }
+  .sub { color:var(--muted); margin-bottom:16px; }
+  .grid { display:grid; gap:12px; }
+  .grid-4 { grid-template-columns:repeat(4,1fr); }
+  .grid-2 { grid-template-columns:1fr 1fr; }
+  @media (max-width:800px) { .grid-4,.grid-2 { grid-template-columns:1fr; } }
+  .stat,.card { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
+  .stat .label { color:var(--muted); font-size:12px; margin-bottom:6px; }
+  .stat .value { font-size:24px; font-weight:650; }
+  .stat.ok .value { color:var(--ok); }
+  .stat.warn .value { color:var(--accent); }
+  .stat.info .value { color:var(--info); }
+  .callout { border:1px solid var(--border); border-left:3px solid var(--ok); background:var(--panel); border-radius:8px; padding:12px 14px; margin:16px 0; }
+  .callout.warn { border-left-color:var(--warn); }
+  .callout strong { display:block; margin-bottom:4px; }
+  .callout p { margin:0; color:var(--muted); }
+  table { width:100%; border-collapse:collapse; font-size:13px; background:var(--panel); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+  th,td { padding:8px 10px; text-align:left; border-bottom:1px solid var(--border); vertical-align:top; }
+  th { color:var(--muted); font-weight:550; font-size:12px; }
+  tr:last-child td { border-bottom:0; }
+  .num { text-align:right; font-variant-numeric:tabular-nums; }
+  .mono { font-family:ui-monospace,Menlo,monospace; font-size:12px; }
+  .muted { color:var(--muted); }
+  .better { color:var(--ok); }
+  .worse { color:var(--bad); }
+  .chart { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:12px; overflow-x:auto; }
+  .chart svg { display:block; min-width:700px; }
+  .legend { display:flex; gap:14px; margin-top:8px; font-size:12px; color:var(--muted); }
+  .legend i { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:6px; }
+  .caption { color:var(--muted); font-size:12px; margin-top:8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>FQS vs pando-server A/B — rerun</h1>
+  <p class="sub">After rebuild: in-memory catalog + rewritten hot_corpus. Engine 0.1.20 (v0.1.20-27-g9892ced, perf/phase1) · catalog_corpora=4 · page=40 · reps=5 · warm=2</p>
+
+  <div class="callout warn">
+    <strong>Earlier report was against a stale FQS process</strong>
+    <p>The Sep 27 binary (started 23:12) loaded pre-rewrite hot_corpus and had no in-memory catalog. That ~1.8&nbsp;ms fixed tax included SQLite catalog lookup + the old per-request HCM busy() path. This rerun uses today’s release binary.</p>
+  </div>
+
+  <div class="grid grid-4">
+    <div class="stat ok"><div class="label">Median Δ (new)</div><div class="value">0.43 ms</div></div>
+    <div class="stat warn"><div class="label">Median Δ (old, stale)</div><div class="value">1.81 ms</div></div>
+    <div class="stat ok"><div class="label">Fast Δ pando&lt;2ms (new)</div><div class="value">0.56 ms</div></div>
+    <div class="stat info"><div class="label">Median Δ improvement</div><div class="value">−1.49 ms</div></div>
+  </div>
+
+  <div class="callout">
+    <strong>What closed</strong>
+    <p>Median Δ dropped from 1.81 → 0.43 ms (~1.5 ms). Fast-query band from ~1.8&nbsp;ms → ~0.6&nbsp;ms. Async total DIFFs: 13 → 0 (warmed). R2 (<span class="mono">.*un.*</span>) still +32&nbsp;ms — not wrapper tax.</p>
+  </div>
+
+  <h2>Δ old vs new (sorted by pando cost)</h2>
+  <div class="chart" id="chart-cmp"></div>
+  <div class="legend"><span><i style="background:var(--bad)"></i>old Δ</span><span><i style="background:var(--ok)"></i>new Δ</span></div>
+  <p class="caption">Old ≈ flat 1.5–2.5 ms tax. New collapses toward noise except R2/G4/Q2b.</p>
+
+  <h2>Remaining levers (revised)</h2>
+  <table>
+    <thead><tr><th>Lever</th><th>Status</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>In-memory corpus catalog</td><td class="better">done / measured</td><td>Part of the ~1.5 ms closed gap</td></tr>
+      <tr><td>HCM eviction rewrite (no busy() on acquire)</td><td class="better">done / measured</td><td>Was incorrectly flagged as “next” against stale binary</td></tr>
+      <tr><td>Sync request log</td><td>maybe</td><td>Still on path; now a smaller slice of &lt;1 ms residual</td></tr>
+      <tr><td>spawn_blocking hop</td><td>maybe</td><td>Residual fast-path Δ ~0.5–0.8 ms</td></tr>
+      <tr><td>R2 regex path</td><td class="worse">open</td><td>+32 ms still; engine-side or FQS envelope of large work</td></tr>
+    </tbody>
+  </table>
+
+  <h2>All queries</h2>
+  <table>
+    <thead><tr><th>ID</th><th class="num">pando</th><th class="num">FQS</th><th class="num">Δ new</th><th class="num">Δ old</th><th class="num">improved</th><th>match</th><th>query</th></tr></thead>
+    <tbody id="all-rows"></tbody>
+  </table>
+</main>
+<script>
+const DATA = [{"id": "S1", "p": 0.485, "f": 1.253, "d": 0.767, "r": 2.581, "match": "ok", "expect": 8541955, "p_tot": 8541955, "f_tot": 8541955, "query": "[upos=\"NOUN\"]", "old_d": 1.656}, {"id": "S2", "p": 0.421, "f": 1.146, "d": 0.725, "r": 2.72, "match": "ok", "expect": 751, "p_tot": 751, "f_tot": 751, "query": "[lemma=\"house\"]", "old_d": 1.793}, {"id": "S3", "p": 1.178, "f": 1.311, "d": 0.134, "r": 1.113, "match": "ok", "expect": 180035, "p_tot": 180035, "f_tot": 180035, "query": "[upos=\"NOUN\"] within text_langcode=\"en\"", "old_d": 1.445}, {"id": "Q2a", "p": 1.618, "f": 2.044, "d": 0.426, "r": 1.263, "match": "ok", "expect": 1296236, "p_tot": 1296236, "f_tot": 1296236, "query": "[upos=\"ADJ\"] [upos=\"NOUN\"]", "old_d": 1.74}, {"id": "Q2b", "p": 1.716, "f": 4.869, "d": 3.153, "r": 2.838, "match": "ok", "expect": 290096, "p_tot": 290096, "f_tot": 290096, "query": "[upos=\"VERB\"] [upos=\"DET\"]", "old_d": 1.912}, {"id": "Q2c", "p": 9.232, "f": 7.503, "d": -1.729, "r": 0.813, "match": "ok", "expect": 246, "p_tot": 246, "f_tot": 246, "query": "[upos=\"DET\"] [lemma=\"book\"]", "old_d": 1.653}, {"id": "Q2d", "p": 1.416, "f": 1.998, "d": 0.582, "r": 1.411, "match": "ok", "expect": 33, "p_tot": 33, "f_tot": 33, "query": "[lemma=\"house\"] [upos=\"NOUN\"]", "old_d": 1.479}, {"id": "Q2e", "p": 1.474, "f": 2.197, "d": 0.722, "r": 1.49, "match": "ok", "expect": 672, "p_tot": 672, "f_tot": 672, "query": "[] [lemma=\"book\"]", "old_d": 1.743}, {"id": "Q2f", "p": 1.186, "f": 1.801, "d": 0.615, "r": 1.519, "match": "ok", "expect": 33188, "p_tot": 33188, "f_tot": 33188, "query": "[upos=\"ADJ\"] [upos=\"NOUN\"] within text_langcode=\"en\"", "old_d": 1.761}, {"id": "Q2g", "p": 1.191, "f": 1.75, "d": 0.559, "r": 1.47, "match": "ok", "expect": 1293451, "p_tot": 1293451, "f_tot": 1293451, "query": "[upos=\"ADJ\"] [upos=\"NOUN\"] within s", "old_d": 1.881}, {"id": "Q2h", "p": 1.802, "f": 1.943, "d": 0.141, "r": 1.078, "match": "ok", "expect": 1053, "p_tot": 1053, "f_tot": 1053, "query": "[upos=\"ADJ\" & lemma=\"good\"] [upos=\"NOUN\"]", "old_d": 1.569}, {"id": "Q2i", "p": 9.387, "f": 6.898, "d": -2.489, "r": 0.735, "match": "ok", "expect": 33188, "p_tot": 33188, "f_tot": 33188, "query": "[upos=\"ADJ\"] [upos=\"NOUN\" & text_langcode=\"en\"]", "old_d": 1.462}, {"id": "Q2j", "p": 3.9, "f": 2.901, "d": -1.0, "r": 0.744, "match": "ok", "expect": 29930, "p_tot": 29930, "f_tot": 29930, "query": "[form=\"the\" %c] [upos=\"NOUN\"]", "old_d": 1.797}, {"id": "Q3a", "p": 1.461, "f": 2.032, "d": 0.571, "r": 1.39, "match": "ok", "expect": 245609, "p_tot": 245609, "f_tot": 245609, "query": "[upos=\"DET\"] [upos=\"ADJ\"] [upos=\"NOUN\"]", "old_d": 2.845}, {"id": "Q3b", "p": 0.546, "f": 0.814, "d": 0.267, "r": 1.489, "match": "ok", "expect": 9, "p_tot": 9, "f_tot": 9, "query": "[upos=\"DET\"] [lemma=\"book\"] [upos=\"NOUN\"]", "old_d": 1.107}, {"id": "Q3c", "p": 1.93, "f": 2.124, "d": 0.194, "r": 1.1, "match": "ok", "expect": 445051, "p_tot": 445051, "f_tot": 445051, "query": "[upos=\"DET\"] [] [upos=\"NOUN\"]", "old_d": 2.237}, {"id": "Q4a", "p": 1.626, "f": 2.551, "d": 0.925, "r": 1.569, "match": "ok", "expect": 93341, "p_tot": 93341, "f_tot": 93341, "query": "[upos=\"ADP\"] [upos=\"DET\"] [upos=\"ADJ\"] [upos=\"NOUN\"]", "old_d": 2.66}, {"id": "G1", "p": 2.013, "f": 2.032, "d": 0.019, "r": 1.009, "match": "ok", "expect": 2427669, "p_tot": 2427669, "f_tot": 2427669, "query": "[upos=\"DET\"] []{0,2} [upos=\"NOUN\"]", "old_d": 2.017}, {"id": "G2", "p": 1.398, "f": 1.892, "d": 0.493, "r": 1.353, "match": "ok", "expect": 1823542, "p_tot": 1823542, "f_tot": 1823542, "query": "[upos=\"DET\"] [upos=\"ADJ\"]? [upos=\"NOUN\"]", "old_d": 1.939}, {"id": "G3", "p": 1.902, "f": 1.933, "d": 0.031, "r": 1.016, "match": "ok", "expect": 1409290, "p_tot": 1409290, "f_tot": 1409290, "query": "[upos=\"ADJ\"]+ [upos=\"NOUN\"]", "old_d": 1.939}, {"id": "D1", "p": 2.602, "f": 2.284, "d": -0.317, "r": 0.878, "match": "ok", "expect": 4272647, "p_tot": 4272647, "f_tot": 4272647, "query": "[upos=\"VERB\"] > [upos=\"NOUN\"]", "old_d": 1.932}, {"id": "D2", "p": 3.126, "f": 2.317, "d": -0.809, "r": 0.741, "match": "ok", "expect": 310994, "p_tot": 310994, "f_tot": 310994, "query": "[upos=\"VERB\"] > [upos=\"ADJ\"]", "old_d": 1.757}, {"id": "D3", "p": 2.19, "f": 2.192, "d": 0.002, "r": 1.001, "match": "ok", "expect": 25009, "p_tot": 25009, "f_tot": 25009, "query": "[upos=\"NOUN\"] < [upos=\"DET\"]", "old_d": 2.47}, {"id": "D4", "p": 1.49, "f": 1.93, "d": 0.441, "r": 1.296, "match": "ok", "expect": 1923304, "p_tot": 1923304, "f_tot": 1923304, "query": "[upos=\"VERB\"] > [deprel=\"nsubj\"]", "old_d": 1.784}, {"id": "D5", "p": 1.705, "f": 1.742, "d": 0.036, "r": 1.021, "match": "ok", "expect": 90, "p_tot": 90, "f_tot": 90, "query": "[lemma=\"book\"] > [upos=\"ADJ\"]", "old_d": 1.643}, {"id": "D6", "p": 2.334, "f": 2.231, "d": -0.104, "r": 0.956, "match": "ok", "expect": 87979, "p_tot": 87979, "f_tot": 87979, "query": "[upos=\"VERB\"] > [upos=\"NOUN\"] within text_langcode=\"en\"", "old_d": 1.829}, {"id": "D7", "p": 1.989, "f": 2.165, "d": 0.176, "r": 1.088, "match": "ok", "expect": 4272647, "p_tot": 4272647, "f_tot": 4272647, "query": "[upos=\"VERB\"] > [upos=\"NOUN\"] within s", "old_d": 1.68}, {"id": "D8", "p": 17.21, "f": 12.203, "d": -5.007, "r": 0.709, "match": "ok", "expect": 87979, "p_tot": 87979, "f_tot": 87979, "query": "[upos=\"VERB\" & text_langcode=\"en\"] > [upos=\"NOUN\"]", "old_d": 2.289}, {"id": "T1", "p": 0.773, "f": 1.9, "d": 1.128, "r": 2.46, "match": "ok", "expect": 11569310, "p_tot": 11569310, "f_tot": 11569310, "query": "[upos=\"VERB\"] >> [upos=\"NOUN\"]", "old_d": 1.819}, {"id": "T2", "p": 1.481, "f": 1.737, "d": 0.256, "r": 1.173, "match": "ok", "expect": 207, "p_tot": 207, "f_tot": 207, "query": "[lemma=\"book\"] >> [upos=\"ADJ\"]", "old_d": 1.742}, {"id": "T3", "p": 1.109, "f": 1.861, "d": 0.751, "r": 1.677, "match": "ok", "expect": 11569310, "p_tot": 11569310, "f_tot": 11569310, "query": "[upos=\"NOUN\"] << [upos=\"VERB\"]", "old_d": 1.886}, {"id": "T4", "p": 5.208, "f": 2.619, "d": -2.59, "r": 0.503, "match": "ok", "expect": 219944, "p_tot": 219944, "f_tot": 219944, "query": "[upos=\"VERB\"] >> [upos=\"NOUN\"] within text_langcode=\"en\"", "old_d": 1.795}, {"id": "N1", "p": 1.939, "f": 1.5, "d": -0.439, "r": 0.774, "match": "ok", "expect": 2384135, "p_tot": 2384135, "f_tot": 2384135, "query": "[upos=\"VERB\"] !> [deprel=\"nsubj\"]", "old_d": 1.42}, {"id": "N2", "p": 2.946, "f": 1.37, "d": -1.576, "r": 0.465, "match": "ok", "expect": 363, "p_tot": 363, "f_tot": 363, "query": "[upos=\"DET\"] !< [lemma=\"book\"]", "old_d": 1.492}, {"id": "N3", "p": 1.7, "f": 1.551, "d": -0.148, "r": 0.913, "match": "ok", "expect": 1451039, "p_tot": 1451039, "f_tot": 1451039, "query": "[upos=\"NOUN\"] !< [upos=\"VERB\"]", "old_d": 1.542}, {"id": "Q2k", "p": 43.885, "f": 44.152, "d": 0.267, "r": 1.006, "match": "ok", "expect": 2874169, "p_tot": 2874169, "f_tot": 2874169, "query": "[upos=\"ADJ\" | upos=\"DET\"] [upos=\"NOUN\"]", "old_d": 0.113}, {"id": "Q2l", "p": 25.407, "f": 27.447, "d": 2.039, "r": 1.08, "match": "ok", "expect": 95687, "p_tot": 95687, "f_tot": 95687, "query": "[lemma=/^un.*/] [upos=\"NOUN\"]", "old_d": 3.071}, {"id": "Q2m", "p": 1.838, "f": 2.759, "d": 0.921, "r": 1.501, "match": "ok", "expect": 29930, "p_tot": 29930, "f_tot": 29930, "query": "[form=\"The\" %c] [upos=\"NOUN\"]", "old_d": 1.92}, {"id": "D9", "p": 0.8, "f": 1.839, "d": 1.038, "r": 2.297, "match": "ok", "expect": 757, "p_tot": 757, "f_tot": 757, "query": "[lemma=\"good\" %c] >> [upos=\"NOUN\"]", "old_d": 2.187}, {"id": "N4", "p": 32.948, "f": 34.05, "d": 1.102, "r": 1.033, "match": "ok", "expect": 1511388, "p_tot": 1511388, "f_tot": 1511388, "query": "[upos=\"VERB\"] !> [deprel=\"nsubj\" | deprel=\"obj\"]", "old_d": 5.904}, {"id": "R1", "p": 18.314, "f": 19.954, "d": 1.64, "r": 1.09, "match": "ok", "expect": 1667, "p_tot": 1667, "f_tot": 1667, "query": "[lemma=\".*ness\"]", "old_d": 1.366}, {"id": "R2", "p": 67.794, "f": 99.895, "d": 32.101, "r": 1.474, "match": "ok", "expect": 551666, "p_tot": 551666, "f_tot": 551666, "query": "[lemma=\".*un.*\"]", "old_d": 33.918}, {"id": "R3", "p": 2.735, "f": 4.839, "d": 2.105, "r": 1.77, "match": "ok", "expect": 230262, "p_tot": 230262, "f_tot": 230262, "query": "[lemma=\"un.*\"]", "old_d": 2.834}, {"id": "R4", "p": 0.568, "f": 1.45, "d": 0.882, "r": 2.554, "match": "ok", "expect": 48852, "p_tot": 48852, "f_tot": 48852, "query": "[form=\"the\" %c]", "old_d": 1.247}, {"id": "D10", "p": 1.012, "f": 2.205, "d": 1.193, "r": 2.178, "match": "ok", "expect": 4272647, "p_tot": 4272647, "f_tot": 4272647, "query": "[upos=\"VERB\"] > [upos=\"NOUN\"] within text", "old_d": 2.114}, {"id": "D11", "p": 1.021, "f": 2.178, "d": 1.157, "r": 2.133, "match": "ok", "expect": 422285, "p_tot": 422285, "f_tot": 422285, "query": "[upos=\"VERB\"] > [upos=\"NOUN\"] :: match.text_langcode=\"cs\"", "old_d": 2.657}, {"id": "G4", "p": 13.627, "f": 19.449, "d": 5.822, "r": 1.427, "match": "ok", "expect": 50371132, "p_tot": 50371132, "f_tot": 50371132, "query": "[upos=\"DET\"] []+ [upos=\"NOUN\"]", "old_d": 17.116}, {"id": "G5", "p": 2.02, "f": 3.568, "d": 1.548, "r": 1.766, "match": "ok", "expect": 3653166, "p_tot": 3653166, "f_tot": 3653166, "query": "[upos=\"DET\"] []{1,10} [upos=\"NOUN\"] within s", "old_d": 3.53}, {"id": "G6", "p": 1.115, "f": 1.438, "d": 0.323, "r": 1.29, "match": "ok", "expect": 10119888, "p_tot": 10119888, "f_tot": 10119888, "query": "[upos=\"DET\"]? [upos=\"NOUN\"]", "old_d": 1.707}, {"id": "G7", "p": 3.019, "f": 2.468, "d": -0.551, "r": 0.817, "match": "ok", "expect": 48345, "p_tot": 48345, "f_tot": 48345, "query": "[lemma=\"be\"] []* [upos=\"VERB\"] within s", "old_d": 2.221}];
+const byCost = [...DATA].sort((a,b)=>a.p-b.p);
+
+function barChart(el, series) {
+  const W = Math.max(700, series[0].data.length * 14);
+  const H = 280, padL=40, padR=8, padT=10, padB=40;
+  const max = Math.max(...series.flatMap(s=>s.data.map(Math.abs)), 0.001);
+  const n = series[0].data.length;
+  const groupW = (W-padL-padR)/n;
+  const barW = Math.max(2, (groupW-2)/series.length);
+  let svg = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`;
+  for (let i=0;i<=4;i++) {
+    const y = padT + (H-padT-padB)*(1-i/4);
+    const v = (max*i/4).toFixed(1);
+    svg += `<line x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}" stroke="#2a2f3a"/><text x="${padL-6}" y="${y+3}" fill="#9aa3b2" font-size="10" text-anchor="end">${v}</text>`;
+  }
+  byCost.forEach((row,i) => {
+    series.forEach((s,si) => {
+      const val = Math.max(0, s.data[i]);
+      const h = (val/max)*(H-padT-padB);
+      const x = padL + i*groupW + si*barW + 1;
+      const y = H-padB-h;
+      svg += `<rect x="${x}" y="${y}" width="${barW}" height="${h}" fill="${s.color}"><title>${row.id}: ${val.toFixed(2)} ms</title></rect>`;
+    });
+    const tx = padL + i*groupW + groupW/2;
+    svg += `<text x="${tx}" y="${H-6}" fill="#9aa3b2" font-size="8" text-anchor="middle" transform="rotate(-60 ${tx} ${H-6})">${row.id}</text>`;
+  });
+  svg += '</svg>';
+  el.innerHTML = svg;
+}
+
+barChart(document.getElementById('chart-cmp'), [
+  { color:'#ef4444', data: byCost.map(x => x.old_d ?? 0) },
+  { color:'#22c55e', data: byCost.map(x => x.d) },
+]);
+
+document.getElementById('all-rows').innerHTML = DATA.map(r => {
+  const imp = (r.old_d!=null) ? (r.old_d - r.d) : null;
+  const cls = imp!=null && imp>0 ? 'better' : (imp!=null && imp< -0.5 ? 'worse' : '');
+  return `<tr>
+    <td>${r.id}</td>
+    <td class="num">${r.p.toFixed(2)}</td>
+    <td class="num">${r.f.toFixed(2)}</td>
+    <td class="num">${r.d.toFixed(2)}</td>
+    <td class="num muted">${r.old_d!=null?r.old_d.toFixed(2):'—'}</td>
+    <td class="num ${cls}">${imp!=null?((imp>=0?'+':'')+imp.toFixed(2)):'—'}</td>
+    <td>${r.match}</td>
+    <td class="mono muted">${r.query.replaceAll('<','&lt;')}</td>
+  </tr>`;
+}).join('');
+</script>
+</body>
+</html>
