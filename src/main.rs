@@ -5640,9 +5640,48 @@ fn open_db(path: &PathBuf) -> Result<Connection> {
             path.as_path().display()
         )
     })?;
+    share_db_files_with_group(path);
     init_schema(&conn)?;
     Ok(conn)
 }
+
+/// The service (user `fqs`) and TEITOK's PHP (`www-data`, in group `fqs`) both
+/// write the catalog; the directory is setgid `fqs` (install: mode 2775). A
+/// catalog file created with umask 022 (0644) is then writable for its creator
+/// only, and the other side fails with "attempt to write a readonly database".
+/// When the parent directory is group-writable, give the files we own
+/// (`fqs.db`, `-wal`, `-shm`, `-journal`) group write too. SQLite creates the
+/// journal / WAL files with the database file's mode, so fixing `fqs.db` keeps
+/// them right as well.
+#[cfg(unix)]
+fn share_db_files_with_group(path: &Path) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Some(parent) = path.parent() else { return };
+    let Ok(pm) = fs::metadata(if parent.as_os_str().is_empty() { Path::new(".") } else { parent }) else {
+        return;
+    };
+    if pm.mode() & 0o020 == 0 {
+        return; // directory not group-writable: a single-user setup, leave modes alone
+    }
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut p = path.as_os_str().to_owned();
+        p.push(suffix);
+        let p = PathBuf::from(p);
+        let Ok(m) = fs::metadata(&p) else { continue };
+        if m.mode() & 0o060 == 0o060 {
+            continue;
+        }
+        let mut perm = m.permissions();
+        perm.set_mode((m.mode() | 0o060) & 0o7777);
+        // only the owner may chmod: a file the other user created is fixed when
+        // that user next opens the catalog (or by the installer's chmod)
+        let _ = fs::set_permissions(&p, perm);
+    }
+}
+
+#[cfg(not(unix))]
+fn share_db_files_with_group(_path: &Path) {}
+
 
 /// Maps SQLite write failures so common permission issues surface a clear hint.
 fn sqlite_write_err(op: &'static str, e: SqliteError) -> anyhow::Error {

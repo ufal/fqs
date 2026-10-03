@@ -9,6 +9,26 @@
   const filterEl = $("filter");
   const tokenEl = $("token");
 
+  // Inside TEITOK (index.php?action=fqsadmin): TEITOK's login is the sign-in, and
+  // TEITOK signs each API call server-side — no token in the browser. The page
+  // carries the proxy URL, a CSRF value to send back, and the TEITOK user.
+  const meta = (n) => {
+    const m = document.querySelector('meta[name="' + n + '"]');
+    return m ? m.getAttribute("content") || "" : "";
+  };
+  const PROXY = meta("fqs-admin-proxy");
+  const PROXY_CSRF = meta("fqs-admin-csrf");
+  const PROXY_USER = meta("fqs-admin-user");
+
+  /** URL of an admin API call: `path` like "/corpora/x?full=1". */
+  function apiUrl(path) {
+    if (!PROXY) return apiBase() + path;
+    const q = path.indexOf("?");
+    const p = q < 0 ? path : path.slice(0, q);
+    const qs = q < 0 ? "" : path.slice(q + 1);
+    return PROXY + "&p=" + encodeURIComponent("api" + p) + (qs ? "&" + qs : "");
+  }
+
   /** Admin API base ending in /api — derived from <base href> or the page URL. */
   function apiBase() {
     const base = document.baseURI || window.location.href;
@@ -32,10 +52,12 @@
   }
 
   function token() {
+    if (PROXY) return "teitok-session";   // signed in through TEITOK; no token here
     return (tokenEl.value || sessionStorage.getItem(TOKEN_KEY) || "").trim();
   }
 
   function looksLikeJwt(t) {
+    if (PROXY) return true;
     const parts = (t || "").split(".");
     return parts.length === 3 && parts.every((p) => p.length > 0);
   }
@@ -48,8 +70,12 @@
     sessionBar.hidden = !signedIn;
     const label = $("session-label");
     if (label) {
-      label.textContent = userHint ? "Signed in as " + userHint : "Signed in";
+      label.textContent = PROXY
+        ? "Signed in via TEITOK" + (PROXY_USER ? " as " + PROXY_USER : "")
+        : userHint ? "Signed in as " + userHint : "Signed in";
     }
+    const change = $("btn-change-token");
+    if (change && PROXY) change.hidden = true;
   }
 
   function saveToken() {
@@ -93,12 +119,16 @@
 
   async function api(path, opts = {}) {
     const headers = Object.assign({ Accept: "application/json" }, opts.headers || {});
-    const t = token();
-    if (t) headers.Authorization = "Bearer " + t;
+    if (PROXY) {
+      headers["X-FQS-Admin-CSRF"] = PROXY_CSRF;
+    } else {
+      const t = token();
+      if (t) headers.Authorization = "Bearer " + t;
+    }
     if (opts.body != null && !headers["Content-Type"]) {
       headers["Content-Type"] = "application/json";
     }
-    const res = await fetch(apiBase() + path, Object.assign({}, opts, { headers }));
+    const res = await fetch(apiUrl(path), Object.assign({ credentials: "same-origin" }, opts, { headers }));
     const text = await res.text();
     let data;
     try {
@@ -108,7 +138,7 @@
     }
     if (!res.ok) {
       const err = (data && (data.error || data.message)) || res.statusText || String(res.status);
-      if (res.status === 401 || res.status === 403) {
+      if ((res.status === 401 || res.status === 403) && !PROXY) {
         setAuthUi(false);
       }
       throw new Error(err);

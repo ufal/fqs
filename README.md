@@ -103,6 +103,16 @@ cargo run -- admin-token --user ops --ttl 4h
 # open http://127.0.0.1:8790/admin/  (or proxy only that bind)
 ```
 
+**Through TEITOK (no token to paste):** `index.php?action=fqsadmin` (TEITOK module
+`teitok_teitok_ui/fqsadmin.php`) serves this UI from the admin listener and forwards
+its API calls, signing each one server-side with a 2-minute admin token
+(`aud=fqs-admin`, `user` = the TEITOK user, so the audit log shows who). Only TEITOK
+admins listed in `flexicorp/fqs_admin_users` (comma-separated; `*` = every admin of
+that project; unset = off) get in; API calls must carry the page's CSRF value
+(`X-FQS-Admin-CSRF`) and come from the same origin. Settings: `flexicorp/fqs_admin_url`
+(default `http://127.0.0.1:8790`, the `--admin-bind`) and `flexicorp/fqs_secret`.
+The admin listener can stay on localhost; no proxy rule or token handling needed.
+
 - **Off by default.** `--enable-admin-http` refuses to start without `--jwt-secret` / `FQS_SECRET`.
 - **Separate bind:** `--admin-bind host:port` / `FQS_ADMIN_BIND` serves `/admin` only there (recommended). Without it, admin shares the public port (dev convenience; warns at startup).
 - **UI:** static files in `fqs/admin/` at `/admin/` (`--admin-dir` / `FQS_ADMIN_DIR`). CSP + `frame-ancestors 'none'`. Token kept in **sessionStorage** only.

@@ -8,6 +8,9 @@ Wants=network-online.target
 Type=simple
 User=fqs
 Group=fqs
+# Files the service creates in /var/lib/fqs (setgid group fqs) stay writable for
+# group fqs — TEITOK's PHP (www-data, in group fqs) writes the same catalog.
+UMask=0002
 # Secrets and overrides (FQS_SECRET, PYTHON_BIN, FQS_SERVER_NAME, …)
 EnvironmentFile=-/etc/fqs/fqs.env
 WorkingDirectory=/var/lib/fqs
