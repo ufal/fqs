@@ -7,7 +7,7 @@ use std::process::Command as ProcessCommand;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
@@ -356,6 +356,12 @@ struct ServeArgs {
     /// the public `--host/--port`. Recommended for LINDAT / reverse-proxy setups.
     #[arg(long, env = "FQS_ADMIN_BIND")]
     admin_bind: Option<String>,
+    /// Optional public URL prefix for the admin UI when behind a reverse proxy
+    /// that strips a path (e.g. hub `/services/test-kontext/fqsadmin/`). Injected
+    /// as `<base href="…">` into `index.html` so `./admin.css` / `./app.js` resolve.
+    /// Env: `FQS_ADMIN_BASE_HREF`. Should end with `/`.
+    #[arg(long, env = "FQS_ADMIN_BASE_HREF")]
+    admin_base_href: Option<String>,
     #[command(flatten)]
     db: DbPathArg,
 }
@@ -399,6 +405,13 @@ struct HttpQueryRequest {
     context_scope: Option<String>,
     context_format: Option<String>,
     flexicorp_fragment_kwic_cpos_span: Option<bool>,
+    /// Pando: each hit also gets `fragment` (its context as TEITOK-style XML,
+    /// `<s id><tok id=… attrs head=…>form</tok>…</s>`), token ids and a
+    /// `highlight_map` by query token — for corpora without XML files (TEITOK
+    /// sends it when the project has no xmlfiles/). Catalog default:
+    /// `settings.pando.synthetic_fragments`.
+    #[serde(default)]
+    fragment: Option<bool>,
     /// Override FQS backend for this request (pando | cqp) — TEITOK/flexicorp should set from project config
     backend: Option<String>,
     request_role: Option<String>,
@@ -503,17 +516,50 @@ struct HttpAppState {
     admin_dir: Option<PathBuf>,
     /// True when admin listens on `--admin-bind` (not the public port).
     admin_bind_separate: bool,
+    /// Public `<base href>` for admin static assets behind a path-stripping proxy.
+    admin_base_href: Option<String>,
     /// Report-only snapshot of process settings (CLI / env / fqs.json). No secrets.
     settings_snapshot: Arc<Value>,
 }
 
-/// Hot-path corpus lookup: all rows in memory, refreshed periodically from SQLite.
+/// Hot-path corpus lookup: all rows in memory, from SQLite.
+///
+/// Kept fresh without a restart when another process (the CLI, TEITOK's
+/// `fqs corpora upsert-json`) writes the catalog: `get` / `list` look at the
+/// database files' size and mtime (`fqs.db`, `fqs.db-wal`) at most once per
+/// second and reload when they changed; a `get` for an unknown id reloads
+/// once (throttled) before answering "not found". The 60 s housekeeping reload
+/// stays as a safety net.
 struct CorpusCatalog {
     inner: RwLock<HashMap<String, CorpusEntry>>,
+    db_path: PathBuf,
+    /// (last check, database file stamps at the last load, last forced reload)
+    fresh: Mutex<CatalogFreshness>,
+}
+
+struct CatalogFreshness {
+    checked: Instant,
+    stamp: Option<DbFileStamp>,
+    forced: Option<Instant>,
+}
+
+type DbFileStamp = (Option<SystemTime>, u64, Option<SystemTime>, u64);
+
+fn db_file_stamp(db_path: &Path) -> DbFileStamp {
+    let st = |p: &Path| match std::fs::metadata(p) {
+        Ok(m) => (m.modified().ok(), m.len()),
+        Err(_) => (None, 0),
+    };
+    let (mt, len) = st(db_path);
+    let mut wal = db_path.as_os_str().to_owned();
+    wal.push("-wal");
+    let (wmt, wlen) = st(Path::new(&wal));
+    (mt, len, wmt, wlen)
 }
 
 impl CorpusCatalog {
     fn load_from_db(db_path: &Path) -> Result<Self> {
+        let stamp = db_file_stamp(db_path);
         let conn = open_db(&db_path.to_path_buf())?;
         let rows = list_corpora(&conn, None, true, None)?;
         let mut by_id = HashMap::with_capacity(rows.len());
@@ -522,10 +568,13 @@ impl CorpusCatalog {
         }
         Ok(Self {
             inner: RwLock::new(by_id),
+            db_path: db_path.to_path_buf(),
+            fresh: Mutex::new(CatalogFreshness { checked: Instant::now(), stamp: Some(stamp), forced: None }),
         })
     }
 
     fn reload(&self, db_path: &Path) -> Result<usize> {
+        let stamp = db_file_stamp(db_path);
         let conn = open_db(&db_path.to_path_buf())?;
         let rows = list_corpora(&conn, None, true, None)?;
         let n = rows.len();
@@ -534,10 +583,46 @@ impl CorpusCatalog {
             by_id.insert(entry.id.clone(), entry);
         }
         *self.inner.write().expect("catalog write lock") = by_id;
+        if let Ok(mut f) = self.fresh.lock() {
+            f.stamp = Some(stamp);
+            f.checked = Instant::now();
+        }
         Ok(n)
     }
 
+    /// Reload when the database files changed (checked at most once per second),
+    /// or — `force` — unconditionally, at most once per second.
+    fn refresh(&self, force: bool) {
+        let need = {
+            let Ok(mut f) = self.fresh.lock() else { return };
+            if force {
+                if f.forced.map(|t| t.elapsed() < Duration::from_secs(1)).unwrap_or(false) {
+                    false
+                } else {
+                    f.forced = Some(Instant::now());
+                    true
+                }
+            } else if f.checked.elapsed() < Duration::from_secs(1) {
+                false
+            } else {
+                f.checked = Instant::now();
+                f.stamp.as_ref() != Some(&db_file_stamp(&self.db_path))
+            }
+        };
+        if need {
+            if let Err(err) = self.reload(&self.db_path) {
+                eprintln!("[fqs] catalog reload failed: {err}");
+            }
+        }
+    }
+
     fn get(&self, id: &str) -> Result<CorpusEntry> {
+        self.refresh(false);
+        if let Some(e) = self.inner.read().expect("catalog read lock").get(id).cloned() {
+            return Ok(e);
+        }
+        // just registered by another process (e.g. TEITOK: upsert, then enqueue)?
+        self.refresh(true);
         self.inner
             .read()
             .expect("catalog read lock")
@@ -552,6 +637,7 @@ impl CorpusCatalog {
         include_noncurrent: bool,
         tag: Option<&str>,
     ) -> Vec<CorpusEntry> {
+        self.refresh(false);
         let g = self.inner.read().expect("catalog read lock");
         let mut rows: Vec<CorpusEntry> = g
             .values()
@@ -2361,6 +2447,10 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         activity: activity.clone(),
         admin_dir: admin_dir.clone(),
         admin_bind_separate: admin_bind.is_some(),
+        admin_base_href: args
+            .admin_base_href
+            .as_deref()
+            .and_then(|s| admin::normalize_admin_base_href(Some(s))),
         settings_snapshot,
     };
     if let Some(dir) = &admin_dir {
@@ -3181,7 +3271,11 @@ fn execute_reindex_job_for_worker(db_path: &Path, job_id: &str, worker_id: &str)
         .arg("--verbose")
         .arg("--staging")
         .arg("--reindex-backends")
-        .arg(&requested_csv);
+        .arg(&requested_csv)
+        // So flexicorp foreground --staging can stage+swap under a stable id
+        // (FQS job id) instead of a random fg-* id, and so job logs correlate.
+        .arg("--options")
+        .arg(format!("reindex_job_id={job_id}"));
     if let Some(ql) = query_language {
         cmd.arg("--query-language").arg(ql);
     }
@@ -3204,7 +3298,7 @@ fn execute_reindex_job_for_worker(db_path: &Path, job_id: &str, worker_id: &str)
             .collect::<String>()
     };
     let command_preview = format!(
-        "{python_bin} -m {flexicorp_module} reindex --api --backend {backend} --folder {project_root} --teitok yes --verbose --staging --reindex-backends {requested_csv}{options_preview}"
+        "{python_bin} -m {flexicorp_module} reindex --api --backend {backend} --folder {project_root} --teitok yes --verbose --staging --reindex-backends {requested_csv} --options reindex_job_id={job_id}{options_preview}"
     );
     let mut child = cmd
         .spawn()
@@ -3317,12 +3411,33 @@ fn execute_reindex_job_for_worker(db_path: &Path, job_id: &str, worker_id: &str)
             "message": if status.success() { "completed" } else { "failed" }
         }
     });
+    let mut api_ok: Option<bool> = None;
+    let mut api_errors: Vec<String> = Vec::new();
     if let Ok(parsed) = serde_json::from_str::<Value>(&stdout) {
+        if let Some(s) = parsed.get("success").and_then(|v| v.as_bool()) {
+            api_ok = Some(s);
+        }
+        if let Some(arr) = parsed
+            .pointer("/done/errors")
+            .and_then(|v| v.as_array())
+            .or_else(|| parsed.get("errors").and_then(|v| v.as_array()))
+        {
+            for e in arr {
+                if let Some(s) = e.as_str() {
+                    let t = s.trim();
+                    if !t.is_empty() {
+                        api_errors.push(t.to_string());
+                    }
+                }
+            }
+        }
         result["raw"] = parsed;
     }
 
+    // flexicorp --api historically exited 0 even when success:false; prefer JSON.
+    let job_ok = status.success() && api_ok.unwrap_or(true);
     let conn2 = open_db(&db_path.to_path_buf())?;
-    if status.success() {
+    if job_ok {
         let _ = mark_reindex_job_finished(
             &conn2,
             job_id,
@@ -3332,13 +3447,31 @@ fn execute_reindex_job_for_worker(db_path: &Path, job_id: &str, worker_id: &str)
             Some(&result),
         )?;
     } else {
-        let err_text = if !stderr.trim().is_empty() {
+        let err_text = if !api_errors.is_empty() {
+            truncate_for_job_log(&api_errors.join("; "), 12000)
+        } else if api_ok == Some(false) {
+            truncate_for_job_log(
+                if !stdout.trim().is_empty() {
+                    stdout.trim()
+                } else {
+                    "flexicorp reindex reported success=false"
+                },
+                12000,
+            )
+        } else if !stderr.trim().is_empty() {
             truncate_for_job_log(stderr.trim(), 12000)
         } else if !stdout.trim().is_empty() {
             truncate_for_job_log(stdout.trim(), 12000)
         } else {
             format!("reindex process exited with status {}", exit_code)
         };
+        if let Some(progress) = result.get_mut("progress") {
+            *progress = json!({
+                "phase": "failed",
+                "percent": last_progress_percent.unwrap_or(0),
+                "message": "failed"
+            });
+        }
         let _ = mark_reindex_job_finished(
             &conn2,
             job_id,
@@ -3766,7 +3899,7 @@ async fn http_admin_index(State(state): State<HttpAppState>) -> Response {
     let Some(dir) = state.admin_dir.as_ref() else {
         return admin::AdminError::msg(StatusCode::NOT_FOUND, "admin HTTP disabled").into_response();
     };
-    admin::static_response(dir, "index.html")
+    admin::static_response_with_base(dir, "index.html", state.admin_base_href.as_deref())
 }
 
 async fn http_admin_static(
@@ -3780,7 +3913,7 @@ async fn http_admin_static(
         return admin::AdminError::msg(StatusCode::NOT_FOUND, "unknown admin API route").into_response();
     }
     let rel = if path.is_empty() { "index.html".to_string() } else { path };
-    admin::static_response(dir, &rel)
+    admin::static_response_with_base(dir, &rel, state.admin_base_href.as_deref())
 }
 
 async fn http_admin_health(
@@ -6715,6 +6848,14 @@ fn run_pando_query(
             }
             if let Some(n) = q.sample.filter(|n| *n > 0) {
                 extra.insert("sample".into(), json!(n));
+            }
+            let synthetic_default = corpus
+                .settings
+                .pointer("/pando/synthetic_fragments")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if q.fragment.unwrap_or(synthetic_default) {
+                extra.insert("fragment".into(), json!(true));
             }
             if q.shuffle == Some(true) {
                 extra.insert("shuffle".into(), json!(true));

@@ -1,0 +1,36 @@
+[Unit]
+Description=FQS corpus query / reindex service (Flexicorp)
+Documentation=file:///usr/local/share/doc/fqs/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fqs
+Group=fqs
+# Secrets and overrides (FQS_SECRET, PYTHON_BIN, FQS_SERVER_NAME, …)
+EnvironmentFile=-/etc/fqs/fqs.env
+WorkingDirectory=/var/lib/fqs
+# Do not use --restart under systemd; systemd owns the process lifecycle.
+ExecStart=/usr/local/bin/fqs serve \
+	--host 127.0.0.1 \
+	--port 8787 \
+	--enable-admin-http \
+	--admin-bind 127.0.0.1:8790 \
+	--admin-dir /usr/local/share/fqs/admin \
+	--activity-log /var/log/fqs/activity.jsonl
+Restart=on-failure
+RestartSec=3
+# Soft limits; tune as needed for warm Pando corpora
+LimitNOFILE=65536
+# Hardening (keep write access to catalog + logs)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/fqs /var/log/fqs /etc/fqs
+# TEITOK corpus trees (reindex writes pando/, tmp/). Override in a drop-in if paths differ.
+ReadWritePaths=/var/www/html/teitok /srv/teitok
+
+[Install]
+WantedBy=multi-user.target

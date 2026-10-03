@@ -242,14 +242,23 @@ fn admin_security_headers() -> [(header::HeaderName, HeaderValue); 3] {
     ]
 }
 
-pub fn static_response(admin_dir: &Path, rel: &str) -> Response {
+pub fn static_response_with_base(
+    admin_dir: &Path,
+    rel: &str,
+    base_href: Option<&str>,
+) -> Response {
     let safe = rel.trim_start_matches('/').replace('\\', "/");
     if safe.is_empty() || safe.contains("..") || safe.starts_with('/') {
         return AdminError::msg(StatusCode::BAD_REQUEST, "bad path").into_response();
     }
     let path = admin_dir.join(&safe);
     match std::fs::read(&path) {
-        Ok(bytes) => {
+        Ok(mut bytes) => {
+            if safe == "index.html" {
+                if let Some(base) = normalize_admin_base_href(base_href) {
+                    bytes = inject_base_href(&bytes, &base);
+                }
+            }
             let ctype = content_type(&safe);
             let mut res = (
                 StatusCode::OK,
@@ -278,6 +287,54 @@ pub fn static_response(admin_dir: &Path, rel: &str) -> Response {
         )
         .into_response(),
     }
+}
+
+/// Ensure a public admin base path ends with `/` and is a safe same-origin path.
+pub fn normalize_admin_base_href(raw: Option<&str>) -> Option<String> {
+    let s = raw.map(str::trim).filter(|s| !s.is_empty())?;
+    if s.contains("://") || s.contains('\n') || s.contains('<') || s.contains('"') {
+        return None;
+    }
+    let mut out = s.to_string();
+    if !out.starts_with('/') {
+        out.insert(0, '/');
+    }
+    if !out.ends_with('/') {
+        out.push('/');
+    }
+    Some(out)
+}
+
+fn inject_base_href(html: &[u8], base: &str) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(html) else {
+        return html.to_vec();
+    };
+    if text.contains("<base ") {
+        return html.to_vec();
+    }
+    let tag = format!(r#"<base href="{base}" />"#);
+    if let Some(i) = text.find("<head>") {
+        let mut out = String::with_capacity(text.len() + tag.len() + 1);
+        out.push_str(&text[..=i + 5]); // include `<head>`
+        out.push('\n');
+        out.push_str("  ");
+        out.push_str(&tag);
+        out.push_str(&text[i + 6..]);
+        return out.into_bytes();
+    }
+    if let Some(i) = text.find("<head ") {
+        if let Some(end) = text[i..].find('>') {
+            let at = i + end + 1;
+            let mut out = String::with_capacity(text.len() + tag.len() + 1);
+            out.push_str(&text[..at]);
+            out.push('\n');
+            out.push_str("  ");
+            out.push_str(&tag);
+            out.push_str(&text[at..]);
+            return out.into_bytes();
+        }
+    }
+    html.to_vec()
 }
 
 fn content_type(name: &str) -> &'static str {
@@ -390,5 +447,15 @@ mod tests {
             parse_admin_bind("127.0.0.1:8790").unwrap(),
             ("127.0.0.1".into(), 8790)
         );
+    }
+
+    #[test]
+    fn inject_base_href_after_head() {
+        let html = b"<html><head>\n<title>x</title></head></html>";
+        let out = inject_base_href(html, "/services/test-kontext/fqsadmin/");
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains(r#"<base href="/services/test-kontext/fqsadmin/" />"#));
+        assert!(normalize_admin_base_href(Some("services/foo")).unwrap().ends_with('/'));
+        assert!(normalize_admin_base_href(Some("http://evil")).is_none());
     }
 }

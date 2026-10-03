@@ -1,4 +1,4 @@
-/* FQS Admin UI v0 — no build step; talks to /admin/api/* on the same origin. */
+/* FQS Admin UI v0 — no build step; talks to api/* relative to this page (works under /admin/ or /fqsadmin/). */
 (function () {
   const TOKEN_KEY = "fqs_admin_jwt";
 
@@ -9,6 +9,13 @@
   const filterEl = $("filter");
   const tokenEl = $("token");
 
+  /** Admin API base ending in /api — derived from <base href> or the page URL. */
+  function apiBase() {
+    const base = document.baseURI || window.location.href;
+    // …/fqsadmin/ or …/admin/ → …/api
+    const page = base.endsWith("/") ? base : base.replace(/\/[^/]*$/, "/");
+    return new URL("api", page).href.replace(/\/?$/, "");
+  }
   let corpora = [];
   let selectedId = null;
   let draftNew = false;
@@ -91,7 +98,7 @@
     if (opts.body != null && !headers["Content-Type"]) {
       headers["Content-Type"] = "application/json";
     }
-    const res = await fetch("/admin/api" + path, Object.assign({}, opts, { headers }));
+    const res = await fetch(apiBase() + path, Object.assign({}, opts, { headers }));
     const text = await res.text();
     let data;
     try {

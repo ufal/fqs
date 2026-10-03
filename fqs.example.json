@@ -6,6 +6,7 @@
     "/data/pando"
   ],
   "fqs": {
-    "update_check": false
+    "update_check": true,
+    "restart": { "method": "systemctl", "unit": "fqs" }
   }
 }

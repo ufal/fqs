@@ -2,6 +2,57 @@
 
 This folder contains the Rust implementation of FQS used by Flexicorp/TEITOK workflows.
 
+## Installation (systemd)
+
+On a Linux server (TEITOK + nginx/Apache), install the binary, catalog dirs, admin UI, and a `fqs.service` unit:
+
+```bash
+cd fqs
+# optional: cargo build --release && pass --skip-build
+sudo ./install.sh \
+  --teitok-venv /var/www/html/teitok/shared/Resources/venv \
+  --web-user www-data \
+  --scan-root /var/www/html/teitok
+```
+
+What it does:
+
+| Piece | Path |
+|---|---|
+| Binary | `/usr/local/bin/fqs` |
+| System config | `/etc/fqs/fqs.json` (`db_path`, `scan_roots`, admin restart via systemctl) |
+| Secrets / env | `/etc/fqs/fqs.env` (`FQS_SECRET`, **`PYTHON_BIN`**, `FQS_SERVER_NAME`, …) |
+| Catalog + WAL | `/var/lib/fqs/` (mode `2775`, user `fqs`, group `fqs`) |
+| Logs | `/var/log/fqs/` |
+| Admin static UI | `/usr/local/share/fqs/admin` → `http://127.0.0.1:8790/admin/` |
+| Unit | `/etc/systemd/system/fqs.service` (`systemctl enable --now fqs`) |
+
+The installer creates system user/group `fqs` and adds `--web-user` (default `www-data`) to group `fqs` so TEITOK PHP and `fqs serve` can both write the SQLite catalog. **Restart php-fpm** after install so the new group membership applies.
+
+`PYTHON_BIN` must point at a Python that can `import flexicorp` (normally the TEITOK shared venv). Without it, reindex fails with `No module named flexicorp`. Flexicorp itself is installed separately into that venv:
+
+```bash
+/var/www/html/teitok/shared/Resources/venv/bin/python -m pip install -e /path/to/flexicorp
+```
+
+Templates live under `deploy/` (`fqs.service`, `fqs.env.example`). After changing env:
+
+```bash
+sudo systemctl restart fqs
+sudo systemctl status fqs
+curl -sS http://127.0.0.1:8787/health
+```
+
+Corpus trees that reindex writes into (e.g. `…/migrantstories/pando`) must be writable by user `fqs` or group `fqs`. The unit’s `ReadWritePaths=` lists `/var/www/html/teitok` and `/srv/teitok`; add a drop-in if your corpora live elsewhere:
+
+```bash
+sudo systemctl edit fqs
+# [Service]
+# ReadWritePaths=/data/corpora
+```
+
+Useful flags: `--skip-build`, `--no-systemd`, `--no-start`, `--user` / `--group` to override the service account.
+
 Current capabilities:
 
 - native CLI executable (`fqs`)
@@ -66,6 +117,7 @@ cargo run -- admin-token --user ops --ttl 4h
   - `GET /admin/api/health` — full diagnostics (db path, slots, pando, limits)
   - `GET /admin/api/settings` — **report-only** effective process settings (bind, db, auth trust, limits file, warm pool, FCS, logs, scan allowlist) with CLI/`fqs.json` how-to-change hints; no secret values; not editable via API
   - `GET /admin/api/activity` — activity-log overview when `--activity-log` / `FQS_ACTIVITY_LOG` is set (`?event=interesting|query|warm|admin|all&limit=&corpus=`); summary + recent events from a tailed window
+- **Behind a path-stripping proxy** (e.g. hub `/services/test-kontext/fqsadmin/` → `/fqsadmin/`): set `FQS_ADMIN_BASE_HREF=/services/test-kontext/fqsadmin/` so `index.html` gets a `<base href>` and CSS/JS/API resolve under that prefix. Prefer a trailing-slash public URL.
 - **Audit:** each write (upsert, supersede/deactivate, validate, scan, restart) appends an activity-log line when `--activity-log` is set (`by`, corpus/frontend id, before/after hash where applicable).
 - **Public `GET /health`** is minimal (`ok`, `service`, `version`, `server_name` only). Catalog `db_path` is on admin health and in the `fqs-http.json` sidecar (TEITOK should prefer the sidecar when public health has no `db_path`).
 - **UI tabs:** Corpora, Scan, Backends, Frontends, Settings (report-only), Activity, Health, Reindex jobs.
