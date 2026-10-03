@@ -26,7 +26,7 @@
     const q = path.indexOf("?");
     const p = q < 0 ? path : path.slice(0, q);
     const qs = q < 0 ? "" : path.slice(q + 1);
-    return PROXY + "&p=" + encodeURIComponent("api" + p) + (qs ? "&" + qs : "");
+    return PROXY + "&fqsa=" + encodeURIComponent("api" + p) + (qs ? "&" + qs : "");
   }
 
   /** Admin API base ending in /api — derived from <base href> or the page URL. */
@@ -131,10 +131,21 @@
     const res = await fetch(apiUrl(path), Object.assign({ credentials: "same-origin" }, opts, { headers }));
     const text = await res.text();
     let data;
+    if (res.ok && !text.trim()) {
+      throw new Error("The admin API answered " + res.status + " with an empty body (" + apiUrl(path) + ")" +
+        (PROXY ? " — open " + PROXY + "&fqsa=selftest to see what TEITOK and FQS report" : ""));
+    }
     try {
       data = text ? JSON.parse(text) : null;
     } catch (_) {
       data = { ok: false, error: text || res.statusText };
+      if (res.ok) {
+        // a 200 that is not JSON (an HTML page, a proxy's answer): say so instead
+        // of showing an empty catalog
+        const snippet = String(text || "").replace(/\s+/g, " ").trim().slice(0, 160);
+        throw new Error("The admin API answered with something that is not JSON (" +
+          (res.headers.get("content-type") || "no content type") + "): " + snippet);
+      }
     }
     if (!res.ok) {
       const err = (data && (data.error || data.message)) || res.statusText || String(res.status);
