@@ -652,19 +652,45 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
 
 /// Build a catalog-ready upsert object from a scan candidate.
 pub fn candidate_to_entry_json(c: &ScanCandidate) -> Value {
+    let root = Path::new(&c.project_root);
+    let teitok_tree = root.join("index.php").is_file()
+        && (root.join("pando").is_dir()
+            || root.join("cqp").is_dir()
+            || root.join("Scripts").exists()
+            || root.join("xmlfiles").is_dir()
+            || root.join("Pages").is_dir()
+            || root.join("Resources/settings.xml").is_file());
+    let source_kind = if teitok_tree {
+        if c.preferred_backend == "pando" {
+            "teitok_pando"
+        } else if c.preferred_backend == "cqp" {
+            "teitok_cqp"
+        } else {
+            "teitok"
+        }
+    } else {
+        c.source_kind.as_str()
+    };
+    // project_url cannot be inferred from disk — set in admin / TEITOK registration.
     json!({
         "id": c.suggested_id,
         "label": c.label,
         "project_root": c.project_root,
         "preferred_backend": c.preferred_backend,
-        "source_kind": c.source_kind,
+        "source_kind": source_kind,
+        "interface_preference": if teitok_tree { json!("teitok") } else { Value::Null },
         "environment": "live",
         "http_policy_mode": "public_query",
         "http_allowed_operations": ["query", "catalog"],
         "interfaces": ["query"],
         "settings": c.settings,
+        "capabilities": if teitok_tree {
+            json!({"teitok_integration": true})
+        } else {
+            json!({})
+        },
         "is_current": true,
-        "supports_xml": c.kind.starts_with("project"),
+        "supports_xml": teitok_tree || c.kind.starts_with("project"),
     })
 }
 
