@@ -294,12 +294,33 @@ fn detect_from_disk(root: &Path, entry: &CorpusEntry) -> Detected {
         features.push("video".into());
         notes.push("video: Video folder or media extensions".into());
     }
-    if settings_xml_mentions(root, &["<geomap", "geolocation", "latitude", "longitude"])
-        || dir_nonempty(&root.join("Geo"))
+    if settings_xml_mentions(
+        root,
+        &[
+            "<geomap",
+            "geolocation",
+            "latitude",
+            "longitude",
+            "key=\"lat\"",
+            "key='lat'",
+            "key=\"lon\"",
+            "key='lon'",
+            "key=\"long\"",
+            "key='long'",
+            "key=\"country\"",
+            "key='country'",
+            "key=\"country_or\"",
+            "key='country_or'",
+            "key=\"country_de\"",
+            "key='country_de'",
+            "xpath=\"@country",
+            "xpath='@country",
+        ],
+    ) || dir_nonempty(&root.join("Geo"))
         || root.join("Resources/geo.json").is_file()
     {
         features.push("geolocation".into());
-        notes.push("geolocation: geomap / geo.json / coords".into());
+        notes.push("geolocation: geomap / geo.json / coords / country".into());
     }
     if has_dependencies(root) {
         features.push("dependencies".into());
@@ -389,7 +410,7 @@ fn push_lang(langs: &mut Vec<String>, raw: &str) {
         .next()
         .unwrap_or("")
         .trim();
-    if code.is_empty() || code == "und" {
+    if code.is_empty() || matches!(code, "und" | "unk" | "unknown" | "zxx") {
         return;
     }
     let code = match code {
@@ -417,20 +438,105 @@ fn push_langs(langs: &mut Vec<String>, more: Vec<String>) {
 
 fn read_settings_xml_langs(root: &Path) -> Vec<String> {
     let mut out = Vec::new();
-    let path = root.join("Resources/settings.xml");
-    let Ok(txt) = fs::read_to_string(&path) else {
+    for path in [
+        root.join("Resources/settings.xml"),
+        root.join("cqpsettings.xml"),
+        root.join("tmp/cqpsettings.xml"),
+    ] {
+        let Ok(txt) = fs::read_to_string(&path) else {
+            continue;
+        };
+        // Prefer TEITOK <defaults lang="…"> / language="…" (content language).
+        scrape_attr_langs(&txt, &["defaults"], &mut out);
+        // Also general lang=/language=/xml:lang= (skip UI i18n noise later via push_lang).
+        for key in [
+            "xml:lang=\"",
+            "xml:lang='",
+            "lang=\"",
+            "language=\"",
+            "lang='",
+            "language='",
+        ] {
+            for (i, _) in txt.match_indices(key) {
+                let rest = &txt[i + key.len()..];
+                let end = rest.find(|c| c == '"' || c == '\'').unwrap_or(0);
+                if end > 0 {
+                    push_lang(&mut out, &rest[..end]);
+                }
+            }
+        }
+    }
+    // Sample TEI/XML docs for xml:lang when settings are silent.
+    if out.is_empty() {
+        push_langs(&mut out, sample_xmlfiles_langs(root));
+    }
+    out
+}
+
+/// Look for lang attrs inside (or near) named start tags, e.g. `<defaults … lang="en">`.
+fn scrape_attr_langs(txt: &str, tags: &[&str], out: &mut Vec<String>) {
+    let lower = txt.to_ascii_lowercase();
+    for tag in tags {
+        let needle = format!("<{tag}");
+        let mut from = 0;
+        while let Some(rel) = lower[from..].find(&needle) {
+            let start = from + rel;
+            let chunk_end = lower[start..]
+                .find('>')
+                .map(|i| start + i)
+                .unwrap_or(lower.len().min(start + 400));
+            let chunk = &txt[start..chunk_end];
+            for key in ["lang=\"", "language=\"", "lang='", "language='"] {
+                if let Some(i) = chunk.to_ascii_lowercase().find(key) {
+                    // key is ascii; same index in chunk
+                    let rest = &chunk[i + key.len()..];
+                    let end = rest.find(|c| c == '"' || c == '\'').unwrap_or(0);
+                    if end > 0 {
+                        push_lang(out, &rest[..end]);
+                    }
+                }
+            }
+            from = chunk_end + 1;
+            if from >= lower.len() {
+                break;
+            }
+        }
+    }
+}
+
+fn sample_xmlfiles_langs(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let dir = root.join("xmlfiles");
+    let Ok(rd) = fs::read_dir(&dir) else {
         return out;
     };
-    // Cheap attribute scrape (avoid pulling an XML crate for this).
-    for key in ["lang=\"", "language=\"", "lang='", "language='"] {
-        for (i, _) in txt.match_indices(key) {
-            let rest = &txt[i + key.len()..];
-            let end = rest
-                .find(|c| c == '"' || c == '\'')
-                .unwrap_or(0);
-            if end > 0 {
-                push_lang(&mut out, &rest[..end]);
+    let mut n = 0;
+    for ent in rd.flatten() {
+        let p = ent.path();
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext != "xml" && ext != "tei" {
+            continue;
+        }
+        let Ok(txt) = fs::read_to_string(&p) else {
+            continue;
+        };
+        // First few docs only — enough for a dominant corpus language.
+        for key in ["xml:lang=\"", "xml:lang='", " lang=\"", " lang='"] {
+            for (i, _) in txt.match_indices(key) {
+                let rest = &txt[i + key.len()..];
+                let end = rest.find(|c| c == '"' || c == '\'').unwrap_or(0);
+                if end > 0 && end <= 8 {
+                    push_lang(&mut out, &rest[..end]);
+                }
             }
+        }
+        n += 1;
+        if n >= 8 || out.len() >= 3 {
+            break;
         }
     }
     out
@@ -602,6 +708,28 @@ mod tests {
         .unwrap();
         assert!(has_ner(&root));
         assert!(has_ud_morph(&root));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn defaults_lang_and_country_geo() {
+        let root = tmp_root("defaults");
+        fs::write(
+            root.join("Resources/settings.xml"),
+            r#"<ttsettings>
+              <defaults lang="en" shared="/teitok/shared"/>
+              <cqp><sattributes>
+                <item key="country_or" xpath="@country"/>
+              </sattributes></cqp>
+            </ttsettings>"#,
+        )
+        .unwrap();
+        let langs = read_settings_xml_langs(&root);
+        assert!(langs.iter().any(|l| l == "en"), "langs={langs:?}");
+        assert!(settings_xml_mentions(
+            &root,
+            &["key=\"country_or\"", "xpath=\"@country"]
+        ));
         let _ = fs::remove_dir_all(&root);
     }
 }
