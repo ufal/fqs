@@ -6,7 +6,9 @@
   const banner = $("banner");
   const listEl = $("corpus-list");
   const listEmpty = $("list-empty");
-  const filterEl = $("filter");
+  // Was id="filter" — that collides with TEITOK pages / browser autofill and can
+  // leave a phantom query that empties the list ("No match") after a click.
+  const filterEl = $("corpus-filter") || $("filter");
   const tokenEl = $("token");
 
   // Inside TEITOK (index.php?action=fqsadmin): TEITOK's login is the sign-in, and
@@ -39,6 +41,24 @@
   let corpora = [];
   let selectedId = null;
   let draftNew = false;
+  /** Browse labels currently on the open corpus form (order preserved). */
+  let formLabels = [];
+  /** Extra labels created via "Add new…" in this browser session (before/after save). */
+  let sessionNewLabels = [];
+  /** Corpus settings/capabilities kept in memory (shown read-only; not edited in the form). */
+  let formSettings = {};
+  let formCapabilities = {};
+
+  const SUGGESTED_LABELS = [
+    "feature:spoken",
+    "feature:facsimile",
+    "feature:video",
+    "feature:parallel",
+    "feature:geolocation",
+    "feature:dependencies",
+    "feature:ner",
+    "feature:ud",
+  ];
 
   function showBanner(msg, isErr) {
     banner.hidden = !msg;
@@ -196,7 +216,19 @@
       return;
     }
     if (!filtered.length) {
-      setListEmpty("<strong>No match</strong>Nothing matches the current filter.", true);
+      setListEmpty(
+        "<strong>No match</strong>Nothing matches the current filter" +
+          (q ? " (<code>" + esc(filterEl.value.trim()) + "</code>)." : ".") +
+          ' <button type="button" class="secondary" id="btn-clear-corpus-filter">Clear filter</button>',
+        true
+      );
+      const clearBtn = $("btn-clear-corpus-filter");
+      if (clearBtn) {
+        clearBtn.addEventListener("click", () => {
+          filterEl.value = "";
+          renderList();
+        });
+      }
       return;
     }
     setListEmpty("", false);
@@ -235,6 +267,128 @@
     };
   }
 
+  function labelKey(s) {
+    return String(s || "").trim().toLowerCase();
+  }
+
+  function normalizeLabelList(list) {
+    const out = [];
+    const seen = new Set();
+    (list || []).forEach((raw) => {
+      const t = String(raw || "").trim();
+      if (!t) return;
+      const k = labelKey(t);
+      if (seen.has(k)) return;
+      seen.add(k);
+      out.push(t);
+    });
+    return out;
+  }
+
+  function catalogLabelVocabulary() {
+    const seen = new Set();
+    const out = [];
+    const push = (raw) => {
+      const t = String(raw || "").trim();
+      if (!t) return;
+      const k = labelKey(t);
+      if (seen.has(k)) return;
+      seen.add(k);
+      out.push(t);
+    };
+    corpora.forEach((c) => (c.labels || []).forEach(push));
+    sessionNewLabels.forEach(push);
+    SUGGESTED_LABELS.forEach(push);
+    formLabels.forEach(push);
+    out.sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+    return out;
+  }
+
+  function setFormLabels(list) {
+    formLabels = normalizeLabelList(list);
+    renderLabelsEditor();
+  }
+
+  function renderLabelsEditor() {
+    const box = $("labels-selected");
+    const pick = $("labels-pick");
+    const newRow = $("labels-new-row");
+    if (!box || !pick) return;
+
+    box.innerHTML = "";
+    if (!formLabels.length) {
+      const empty = document.createElement("span");
+      empty.className = "empty";
+      empty.textContent = "No labels yet";
+      box.appendChild(empty);
+    } else {
+      formLabels.forEach((lab) => {
+        const chip = document.createElement("span");
+        chip.className = "labels-chip";
+        const text = document.createElement("span");
+        text.textContent = lab;
+        const rm = document.createElement("button");
+        rm.type = "button";
+        rm.setAttribute("aria-label", "Remove " + lab);
+        rm.textContent = "×";
+        rm.addEventListener("click", () => {
+          formLabels = formLabels.filter((x) => labelKey(x) !== labelKey(lab));
+          renderLabelsEditor();
+        });
+        chip.appendChild(text);
+        chip.appendChild(rm);
+        box.appendChild(chip);
+      });
+    }
+
+    const selected = new Set(formLabels.map(labelKey));
+    const available = catalogLabelVocabulary().filter((l) => !selected.has(labelKey(l)));
+    pick.innerHTML = "";
+    const ph = document.createElement("option");
+    ph.value = "";
+    ph.textContent = available.length ? "Choose…" : "No unused labels";
+    pick.appendChild(ph);
+    available.forEach((lab) => {
+      const opt = document.createElement("option");
+      opt.value = lab;
+      opt.textContent = lab;
+      pick.appendChild(opt);
+    });
+    pick.disabled = !available.length;
+    pick.value = "";
+
+    if (newRow) newRow.hidden = true;
+    const inp = $("labels-new-input");
+    if (inp) inp.value = "";
+  }
+
+  function addExistingLabel(raw) {
+    const t = String(raw || "").trim();
+    if (!t) return;
+    if (formLabels.some((x) => labelKey(x) === labelKey(t))) return;
+    formLabels.push(t);
+    renderLabelsEditor();
+  }
+
+  function addNewLabel(raw) {
+    const t = String(raw || "").trim();
+    if (!t) throw new Error("Enter a non-empty label");
+    if (/[,\n\r]/.test(t)) throw new Error("One label at a time (no commas)");
+    if (t.length > 80) throw new Error("Label is too long");
+    const k = labelKey(t);
+    if (formLabels.some((x) => labelKey(x) === k)) {
+      throw new Error("Already on this corpus");
+    }
+    // Prefer canonical spelling already in the catalogue if case differs.
+    const known = catalogLabelVocabulary().find((x) => labelKey(x) === k);
+    const final = known || t;
+    if (!known && !sessionNewLabels.some((x) => labelKey(x) === k)) {
+      sessionNewLabels.push(final);
+    }
+    formLabels.push(final);
+    renderLabelsEditor();
+  }
+
   function fillForm(c) {
     $("f-id").value = c.id || "";
     $("f-id").readOnly = !draftNew && !!c.id;
@@ -247,10 +401,20 @@
     $("f-listing_visibility").value = c.listing_visibility || "public";
     $("f-is_current").checked = c.is_current !== false;
     $("f-supports_xml").checked = !!c.supports_xml;
-    $("f-labels").value = (c.labels || []).join(", ");
+    setFormLabels(c.labels || []);
     $("f-ops").value = (c.http_allowed_operations || []).join(", ");
-    $("f-settings").value = JSON.stringify(c.settings || {}, null, 2);
-    $("f-capabilities").value = JSON.stringify(c.capabilities || {}, null, 2);
+    formSettings =
+      c.settings && typeof c.settings === "object" && !Array.isArray(c.settings)
+        ? c.settings
+        : {};
+    formCapabilities =
+      c.capabilities && typeof c.capabilities === "object" && !Array.isArray(c.capabilities)
+        ? c.capabilities
+        : {};
+    const settingsOut = $("f-settings-out");
+    const capsOut = $("f-capabilities-out");
+    if (settingsOut) settingsOut.textContent = JSON.stringify(formSettings, null, 2);
+    if (capsOut) capsOut.textContent = JSON.stringify(formCapabilities, null, 2);
     $("meta").textContent = [
       c.corpus_size != null ? "corpus_size: " + c.corpus_size : null,
       c.last_validated_at ? "last_validated_at: " + c.last_validated_at : null,
@@ -265,17 +429,6 @@
   }
 
   function readForm() {
-    let settings, capabilities;
-    try {
-      settings = JSON.parse($("f-settings").value || "{}");
-    } catch (e) {
-      throw new Error("settings JSON: " + e.message);
-    }
-    try {
-      capabilities = JSON.parse($("f-capabilities").value || "{}");
-    } catch (e) {
-      throw new Error("capabilities JSON: " + e.message);
-    }
     const split = (s) =>
       (s || "")
         .split(",")
@@ -296,10 +449,12 @@
       listing_visibility: $("f-listing_visibility").value.trim() || "public",
       is_current: $("f-is_current").checked,
       supports_xml: $("f-supports_xml").checked,
-      labels: split($("f-labels").value),
+      labels: normalizeLabelList(formLabels),
       http_allowed_operations: split($("f-ops").value),
-      settings,
-      capabilities,
+      // Preserve blobs loaded with the form; do not accept free-form JSON edits here.
+      settings: formSettings && typeof formSettings === "object" ? formSettings : {},
+      capabilities:
+        formCapabilities && typeof formCapabilities === "object" ? formCapabilities : {},
     };
   }
 
@@ -307,6 +462,20 @@
     draftNew = false;
     selectedId = id;
     const c = corpora.find((x) => x.id === id);
+    // If a leftover/autofilled filter would hide the selection, clear it so the
+    // click does not collapse the list to "No match".
+    const q = (filterEl && filterEl.value ? filterEl.value : "").trim().toLowerCase();
+    if (
+      q &&
+      c &&
+      !(
+        (c.id || "").toLowerCase().includes(q) ||
+        (c.label || "").toLowerCase().includes(q) ||
+        (c.environment || "").toLowerCase().includes(q)
+      )
+    ) {
+      filterEl.value = "";
+    }
     if (c) fillForm(c);
     renderList();
   }
@@ -953,14 +1122,30 @@
     } else {
       kinds.forEach((k) => {
         const st = k.status || "not_configured";
-        let pill = "missing";
-        if (st === "healthy") pill = "ok";
-        else if (st === "configured" || st === "in_use" || st === "present") pill = "queued";
-        else if (st === "catalog_only") pill = "warn";
+        let pillLabel = "unused";
+        let pillCls = "warn";
+        if (st === "healthy") {
+          pillLabel = "ok";
+          pillCls = "ok";
+        } else if (st === "configured" || st === "in_use" || st === "present") {
+          pillLabel = st === "in_use" ? "in use" : "configured";
+          pillCls = "warn";
+        } else if (st === "catalog_only") {
+          pillLabel = "catalog";
+          pillCls = "warn";
+        } else if (st === "not_configured") {
+          // Per-corpus UIs (TEITOK) are not a single install — "unused" ≠ missing software.
+          pillLabel = k.centralized === false ? "unused" : "not set";
+          pillCls = "";
+        }
         html += '<div class="frontend-kind">';
         html +=
           '<div class="frontend-kind-head">' +
-          statusPill(pill === "queued" ? "configured" : pill === "warn" ? "catalog" : pill) +
+          '<span class="pill ' +
+          pillCls +
+          '">' +
+          esc(pillLabel) +
+          "</span>" +
           " <strong>" +
           esc(k.label || k.id) +
           '</strong> <span class="muted">' +
@@ -975,7 +1160,9 @@
         const instances = k.instances || [];
         if (!instances.length) {
           html +=
-            '<p class="muted muted-sm85">Not configured in catalog or <code>fqs.json</code>.</p>';
+            k.centralized === false
+              ? '<p class="muted muted-sm85">No catalog corpora linked yet (set <code>project_url</code>, <code>interface_preference=teitok</code>, <code>supports_xml</code>, or a TEITOK <code>project_root</code>). This does not mean TEITOK is missing from the server.</p>'
+              : '<p class="muted muted-sm85">Not configured in catalog or <code>fqs.json</code>.</p>';
         } else {
           instances.forEach((f) => {
             const h = f.health || {};
@@ -1307,7 +1494,43 @@
       .then(() => setTab(document.querySelector(".tab.active").dataset.tab))
       .catch((e) => showBanner(e.message, true));
   });
-  filterEl.addEventListener("input", renderList);
+  if (filterEl) filterEl.addEventListener("input", renderList);
+  $("labels-pick").addEventListener("change", () => {
+    const v = $("labels-pick").value;
+    if (!v) return;
+    addExistingLabel(v);
+  });
+  $("labels-add-new-btn").addEventListener("click", () => {
+    const row = $("labels-new-row");
+    if (!row) return;
+    row.hidden = false;
+    const inp = $("labels-new-input");
+    if (inp) {
+      inp.focus();
+      inp.select();
+    }
+  });
+  $("labels-new-cancel").addEventListener("click", () => {
+    $("labels-new-row").hidden = true;
+    $("labels-new-input").value = "";
+  });
+  $("labels-new-confirm").addEventListener("click", () => {
+    try {
+      addNewLabel($("labels-new-input").value);
+      showBanner("", false);
+    } catch (e) {
+      showBanner(e.message, true);
+    }
+  });
+  $("labels-new-input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      $("labels-new-confirm").click();
+    } else if (e.key === "Escape") {
+      $("labels-new-cancel").click();
+    }
+  });
+
   $("btn-new").addEventListener("click", () => {
     if (!token()) {
       showBanner("Enter an admin JWT before creating a corpus.", true);

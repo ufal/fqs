@@ -59,7 +59,8 @@ Current capabilities:
 - SQLite-backed corpus catalog (`fqs.db` by default)
 - `corpora add` / `corpora list` / `corpora show` commands
 - `query` command with live execution for `pando` corpora (via `flexicorp-pando` CLI)
-- `corpora validate` command (basic + full probe mode)
+- `corpora validate` command (basic + full probe mode; optional `--enrich`)
+- `corpora enrich` — one-shot languages/features/interfaces from on-disk TEITOK/pando/cqp layout
 - reindex control-plane and execution lifecycle:
   - `fqs reindex enqueue|queue|history|mark-started|mark-finished`
   - `fqs reindex dispatch-once` and `fqs reindex worker-heartbeat`
@@ -197,8 +198,8 @@ cargo run -- status --host 127.0.0.1 --port 8787
 Endpoints:
 
 - `GET /health` — minimal public liveness (`ok`, `service`, `version`, optional `server_name`). Full details on `GET /admin/api/health` (admin JWT).
-- `GET /corpora?request_role=visitor|admin&tag=<browse-label>`
-- `GET /labels` — distinct browse labels (for Kontext-style facets)
+- `GET /corpora?request_role=visitor|admin&tag=<browse-label>&frontend=teitok&facet=lang:cs&facet=feature:spoken&q=…&view=browse` — catalog list; `frontend=teitok` keeps TEITOK-listable rows; repeated `facet=` is AND across groups / OR within; `view=browse` returns a public DTO (no `project_root` / settings dump)
+- `GET /labels?frontend=teitok&facet=…` — distinct browse labels plus `facets` groups with counts (KonText-style)
 - `GET /reindex/jobs?status=queued&corpus=<id>&limit=100` — queue/running overview
 - `POST /reindex/jobs` — enqueue (`request_role=admin`)
 - `GET /reindex/history?corpus=<id>&limit=200` — history/audit log (includes indexed timestamps)
@@ -399,6 +400,14 @@ Strict full mode (mark missing query probe as failure):
 
 ```bash
 cargo run -- corpora validate --full --strict-full
+```
+
+One-shot catalogue enrich (languages; spoken/facsimile/video/geo/deps/parallel/ner/ud features; interfaces — additive; see [FQS-TEITOK-CORPORA-LISTING.md](../dev/FQS-TEITOK-CORPORA-LISTING.md) §1.1b):
+
+```bash
+cargo run -- corpora enrich --dry-run
+cargo run -- corpora enrich --id my_corpus
+cargo run -- corpora validate --full --strict-full --enrich --id my_corpus
 ```
 
 In `--full` mode, `cqp` corpora run a small CQP probe; `pando` corpora run `flexicorp-pando` and persist the JSON `total` as `corpus_size` (override the probe CQL with `settings.pando_probe_query`, default `[word=".*"]`). Pando entries get this probe even when `interfaces` is empty.

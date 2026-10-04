@@ -46,7 +46,7 @@
         <h2>Corpora</h2>
         <button type="button" id="btn-new" class="secondary">New</button>
       </div>
-      <input id="filter" type="search" placeholder="Filter id / label…" />
+      <input id="corpus-filter" type="search" placeholder="Filter id / label…" autocomplete="off" />
       <p id="list-empty" class="list-empty" hidden></p>
       <ul id="corpus-list"></ul>
     </aside>
@@ -82,20 +82,41 @@
         <label class="check"><input id="f-is_current" type="checkbox" checked /> is_current</label>
         <label class="check"><input id="f-supports_xml" type="checkbox" /> supports_xml</label>
       </div>
-      <label class="block">labels (comma-separated)
-        <input id="f-labels" />
-      </label>
+      <div class="block labels-editor" id="labels-editor">
+        <div class="labels-heading">Browse labels</div>
+        <p class="muted labels-hint">Pick tags already used in the catalogue. Use <em>Add new…</em> only for a tag that does not exist yet (prefer <code>lang:cs</code>, <code>feature:spoken</code>).</p>
+        <div id="labels-selected" class="labels-selected" aria-live="polite"></div>
+        <div class="labels-add-row">
+          <label class="labels-pick-label">Add existing
+            <select id="labels-pick">
+              <option value="">Choose…</option>
+            </select>
+          </label>
+          <button type="button" id="labels-add-new-btn" class="secondary">Add new…</button>
+        </div>
+        <div id="labels-new-row" class="labels-new-row" hidden>
+          <label class="labels-new-label">New label
+            <input id="labels-new-input" type="text" autocomplete="off" placeholder="lang:cs · feature:spoken · genre:news · UD" />
+          </label>
+          <div class="labels-new-actions">
+            <button type="button" id="labels-new-confirm">Add</button>
+            <button type="button" id="labels-new-cancel" class="secondary">Cancel</button>
+          </div>
+        </div>
+      </div>
       <label class="block">http_allowed_operations (comma-separated)
         <input id="f-ops" />
       </label>
-      <label class="block">settings (JSON)
-        <textarea id="f-settings" rows="12" spellcheck="false"></textarea>
-      </label>
-      <label class="block">capabilities (JSON)
-        <textarea id="f-capabilities" rows="6" spellcheck="false"></textarea>
-      </label>
       <pre id="meta" class="meta muted"></pre>
       <pre id="validate-out" class="out" hidden></pre>
+      <details class="raw-json">
+        <summary>Raw settings JSON <span class="muted">(read-only)</span></summary>
+        <pre id="f-settings-out" class="out">—</pre>
+      </details>
+      <details class="raw-json">
+        <summary>Raw capabilities JSON <span class="muted">(read-only)</span></summary>
+        <pre id="f-capabilities-out" class="out">—</pre>
+      </details>
     </main>
   </section>
 
@@ -134,7 +155,7 @@
     <div class="row actions">
       <button type="button" id="btn-frontends-refresh" class="secondary">Refresh frontends</button>
     </div>
-    <p class="muted">Every frontend kind FQS can handle, with status. Centralized UIs nest the corpora they serve; TEITOK lists related per-project corpora under the kind. Restart only when configured in <code>fqs.json</code>.</p>
+    <p class="muted">Every frontend kind FQS can handle, with status. Centralized UIs nest the corpora they serve; TEITOK is per-project PHP (status = catalog corpora linked to it, not whether TEITOK is installed). Restart only when configured in <code>fqs.json</code>.</p>
     <div id="frontends-view" class="view-panel">
       <p class="muted">Open this tab (with a JWT) to load frontends.</p>
     </div>
@@ -148,7 +169,7 @@
     <div class="row actions">
       <button type="button" id="btn-settings-refresh" class="secondary">Refresh settings</button>
     </div>
-    <p class="muted">Report-only view of this FQS process. Change bind/secrets/limits/paths via CLI, env, or <code>fqs.json</code> and restart. Per-corpus policy and <code>settings</code> JSON are edited on the Corpora tab.</p>
+    <p class="muted">Report-only view of this FQS process. Change bind/secrets/limits/paths via CLI, env, or <code>fqs.json</code> and restart. Per-corpus fields are edited on the Corpora tab; corpus <code>settings</code>/<code>capabilities</code> JSON is shown read-only there (change via enrich, registration, or CLI upsert).</p>
     <div id="settings-view" class="view-panel">
       <p class="muted">Open this tab (with a JWT) to load effective settings.</p>
     </div>

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime};
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use axum::extract::{Path as AxumPath, Query as AxumQuery, State};
+use axum::extract::{Path as AxumPath, Query as AxumQuery, RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect};
@@ -29,6 +29,7 @@ use tokio::time::sleep;
 
 mod activity;
 mod admin;
+mod enrich;
 mod fcs;
 mod hot_corpus;
 mod limits;
@@ -219,6 +220,8 @@ enum CorporaAction {
     ExportJson(ExportJsonArgs),
     /// Validate corpus registry entries and optionally run query probes
     Validate(ValidateArgs),
+    /// One-shot: detect languages / features / interfaces from TEITOK+index layout
+    Enrich(EnrichArgs),
     /// Mark one corpus as superseded (hidden by default list)
     Supersede(ShowByIdArgs),
     /// Remove one corpus row from the catalogue (requires --force)
@@ -447,6 +450,14 @@ struct HttpCorporaQuery {
     request_role: Option<String>,
     /// Filter by browse tag (case-insensitive)
     tag: Option<String>,
+    /// Frontend bag filter, e.g. `teitok` (TEITOK-listable corpora).
+    frontend: Option<String>,
+    /// Comma-separated facets (`lang:cs,feature:spoken`). Prefer repeated `facet=` in the raw query.
+    facets: Option<String>,
+    /// Substring match on id / label / family_label.
+    q: Option<String>,
+    /// `browse` returns a public DTO (no project_root / settings dump).
+    view: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -808,6 +819,27 @@ struct ValidateArgs {
     /// In full mode, fail corpus validation when query probe is unavailable
     #[arg(long, default_value_t = false)]
     strict_full: bool,
+    /// After validation, run one-shot metadata enrich and write the catalogue
+    #[arg(long, default_value_t = false)]
+    enrich: bool,
+    #[command(flatten)]
+    db: DbPathArg,
+}
+
+#[derive(Args, Debug)]
+struct EnrichArgs {
+    /// Enrich only one corpus id
+    #[arg(long)]
+    id: Option<String>,
+    /// Filter by environment label (exact match)
+    #[arg(long)]
+    environment: Option<String>,
+    /// Include superseded corpora
+    #[arg(long, default_value_t = false)]
+    include_noncurrent: bool,
+    /// Dry-run: print detections without writing the catalogue
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
     #[command(flatten)]
     db: DbPathArg,
 }
@@ -1408,9 +1440,17 @@ fn handle_corpora(args: CorporaArgs) -> Result<()> {
             };
 
             let mut results = Vec::new();
-            for corpus in corpora {
+            let mut enrich_reports = Vec::new();
+            for mut corpus in corpora {
                 let result = validate_corpus(&corpus, args.full, args.strict_full);
                 update_validation_result(&conn, &corpus.id, &result)?;
+                if args.enrich {
+                    let report = enrich::enrich_corpus_entry(&mut corpus);
+                    if report.changed {
+                        upsert_corpus(&conn, &corpus)?;
+                    }
+                    enrich_reports.push(enrich::report_json(&report));
+                }
                 results.push(result);
             }
 
@@ -1420,11 +1460,41 @@ fn handle_corpora(args: CorporaArgs) -> Result<()> {
                 "operation": "corpora_validate",
                 "full": args.full,
                 "strict_full": args.strict_full,
+                "enrich": args.enrich,
                 "validated": results.len(),
                 "failures": failures,
-                "results": results
+                "results": results,
+                "enrichment": enrich_reports,
             });
             println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        CorporaAction::Enrich(args) => {
+            let conn = open_db(&resolve_db_path(&args.db))?;
+            let corpora = if let Some(id) = args.id.as_deref() {
+                vec![get_corpus(&conn, id)?]
+            } else {
+                list_corpora(&conn, args.environment.as_deref(), args.include_noncurrent, None)?
+            };
+            let mut reports = Vec::new();
+            let mut written = 0usize;
+            for mut corpus in corpora {
+                let report = enrich::enrich_corpus_entry(&mut corpus);
+                if report.changed && !args.dry_run {
+                    upsert_corpus(&conn, &corpus)?;
+                    written += 1;
+                }
+                reports.push(enrich::report_json(&report));
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "ok": true,
+                    "operation": "corpora_enrich",
+                    "dry_run": args.dry_run,
+                    "written": written,
+                    "reports": reports,
+                }))?
+            );
         }
     }
     Ok(())
@@ -3801,7 +3871,7 @@ fn build_settings_snapshot(
         "id": "corpus_settings",
         "title": "Per-corpus settings",
         "mutable": "corpora_tab",
-        "note": "Catalog fields (policy, preferred_backend, settings JSON including limits/FCS) are edited on the Corpora tab via PUT /admin/api/corpora — not here.",
+        "note": "Catalog fields (policy, preferred_backend, labels, …) are edited on the Corpora tab via PUT /admin/api/corpora — not here. Corpus settings/capabilities JSON is shown read-only in the admin UI.",
         "change": "Admin UI → Corpora, or: fqs corpora upsert-json …",
         "items": [],
     }));
@@ -3809,7 +3879,7 @@ fn build_settings_snapshot(
     json!({
         "ok": true,
         "mutable": false,
-        "policy": "Process and global settings are report-only in the admin UI. Change them via CLI flags, environment variables, or fqs.json, then restart FQS. Per-corpus settings are edited on the Corpora tab.",
+        "policy": "Process and global settings are report-only in the admin UI. Change them via CLI flags, environment variables, or fqs.json, then restart FQS. Per-corpus form fields are edited on the Corpora tab; settings/capabilities JSON there is read-only (enrich, registration, or CLI upsert).",
         "fqs_config_path": cfg_path.to_string_lossy(),
         "sections": sections,
     })
@@ -4027,6 +4097,8 @@ async fn http_admin_list_corpora(
     headers: HeaderMap,
 ) -> admin::AdminResult<Json<Value>> {
     let caller = admin::require_admin(&state.limits, &headers)?;
+    // Admin UI should see CLI/TEITOK upserts immediately (not wait for mtime poll).
+    state.catalog.refresh(true);
     let corpora = state.catalog.list(None, true, None);
     Ok(Json(json!({
         "ok": true,
@@ -4368,11 +4440,16 @@ async fn http_admin_frontends(
     let _ = admin::require_admin(&state.limits, &headers)?;
     let mut hints = Vec::new();
     for c in state.catalog.list(None, true, None) {
+        let project_root = c.project_root.to_string_lossy();
         hints.extend(services::hints_from_catalog_row(
             &c.id,
             c.project_url.as_deref(),
             c.interface_preference.as_deref(),
             &c.settings,
+            &c.source_kind,
+            c.supports_xml,
+            Some(project_root.as_ref()),
+            &c.capabilities,
         ));
     }
     let report = tokio::task::spawn_blocking(move || services::probe_frontends(&hints))
@@ -4419,8 +4496,8 @@ async fn http_root_with_state(State(state): State<HttpAppState>) -> Json<Value> 
     let mut routes = vec![
             json!({"method":"GET", "path":"/", "description":"Route index"}),
             json!({"method":"GET", "path":"/health", "description":"Health check"}),
-            json!({"method":"GET", "path":"/corpora", "description":"List corpora (query params: request_role, environment, include_noncurrent, tag)"}),
-            json!({"method":"GET", "path":"/labels", "description":"Distinct browse labels for catalog filtering"}),
+            json!({"method":"GET", "path":"/corpora", "description":"List corpora (request_role, environment, tag, frontend=teitok, facet=/facets=, q=, view=browse)"}),
+            json!({"method":"GET", "path":"/labels", "description":"Browse labels + facet groups/counts (frontend=teitok, facet=…)"}),
             json!({"method":"GET", "path":"/fcs", "description":"FCS/SRU-style endpoint"}),
             json!({"method":"GET", "path":"/reindex/jobs", "description":"List reindex queue (status/corpus/limit)"}),
             json!({"method":"POST", "path":"/reindex/jobs", "description":"Enqueue reindex job (admin role)"}),
@@ -4473,43 +4550,211 @@ async fn http_root_with_state(State(state): State<HttpAppState>) -> Json<Value> 
 async fn http_list_corpora(
     State(state): State<HttpAppState>,
     AxumQuery(params): AxumQuery<HttpCorporaQuery>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let role = normalize_role(params.request_role.as_deref());
     let include_noncurrent = params.include_noncurrent.unwrap_or(false);
+    let requested_facets =
+        services::parse_facet_params(raw.as_deref(), params.facets.as_deref());
     let corpora = state.catalog.list(
         params.environment.as_deref(),
         include_noncurrent,
         params.tag.as_deref(),
     );
-    let filtered = corpora
+    let frontend = params
+        .frontend
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase());
+    let q = params
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase());
+    let browse = params
+        .view
+        .as_deref()
+        .map(|s| s.eq_ignore_ascii_case("browse"))
+        .unwrap_or(false);
+
+    let filtered: Vec<CorpusEntry> = corpora
         .into_iter()
         .filter(|c| is_http_access_allowed(c, &role) && is_http_operation_allowed(c, "catalog"))
-        .collect::<Vec<_>>();
-    Ok(Json(json!({"ok": true, "role": role, "corpora": filtered})))
+        .filter(|c| {
+            if frontend.as_deref() != Some("teitok") {
+                return true;
+            }
+            let root = c.project_root.to_string_lossy();
+            services::corpus_is_teitok_listable(
+                c.interface_preference.as_deref(),
+                &c.source_kind,
+                c.supports_xml,
+                Some(root.as_ref()),
+                c.project_url.as_deref(),
+                &c.settings,
+                &c.capabilities,
+            )
+        })
+        .filter(|c| {
+            if requested_facets.is_empty() {
+                return true;
+            }
+            let facets =
+                services::browse_facets_for_corpus(&c.labels, &c.settings, &c.capabilities);
+            services::corpus_matches_requested_facets(&facets, &requested_facets)
+        })
+        .filter(|c| {
+            let Some(q) = q.as_deref() else {
+                return true;
+            };
+            let id = c.id.to_ascii_lowercase();
+            let label = c.label.to_ascii_lowercase();
+            let fam = c
+                .family_label
+                .as_deref()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            id.contains(q) || label.contains(q) || fam.contains(q)
+        })
+        .collect();
+
+    let rows: Value = if browse {
+        Value::Array(
+            filtered
+                .iter()
+                .map(browse_corpus_dto)
+                .collect(),
+        )
+    } else {
+        serde_json::to_value(&filtered).unwrap_or(Value::Array(vec![]))
+    };
+
+    Ok(Json(json!({
+        "ok": true,
+        "role": role,
+        "frontend": frontend,
+        "view": if browse { "browse" } else { "full" },
+        "facets_applied": requested_facets.iter().map(|(g,v)| format!("{g}:{v}")).collect::<Vec<_>>(),
+        "corpora": rows,
+    })))
 }
 
 async fn http_browse_labels(
     State(state): State<HttpAppState>,
     AxumQuery(params): AxumQuery<HttpCorporaQuery>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let role = normalize_role(params.request_role.as_deref());
     let include_noncurrent = params.include_noncurrent.unwrap_or(false);
+    let requested_facets =
+        services::parse_facet_params(raw.as_deref(), params.facets.as_deref());
     let corpora = state.catalog.list(
         params.environment.as_deref(),
         include_noncurrent,
         None,
     );
-    let filtered = corpora
+    let frontend = params
+        .frontend
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase());
+
+    let filtered: Vec<CorpusEntry> = corpora
         .into_iter()
         .filter(|c| is_http_access_allowed(c, &role) && is_http_operation_allowed(c, "catalog"))
-        .collect::<Vec<_>>();
-    let mut labels: Vec<String> = filtered
+        .filter(|c| {
+            if frontend.as_deref() != Some("teitok") {
+                return true;
+            }
+            let root = c.project_root.to_string_lossy();
+            services::corpus_is_teitok_listable(
+                c.interface_preference.as_deref(),
+                &c.source_kind,
+                c.supports_xml,
+                Some(root.as_ref()),
+                c.project_url.as_deref(),
+                &c.settings,
+                &c.capabilities,
+            )
+        })
+        .collect();
+
+    // Facet dictionary for the frontend set; optionally narrowed by already-selected facets.
+    let facet_maps: Vec<_> = filtered
+        .iter()
+        .filter(|c| {
+            if requested_facets.is_empty() {
+                return true;
+            }
+            let facets =
+                services::browse_facets_for_corpus(&c.labels, &c.settings, &c.capabilities);
+            services::corpus_matches_requested_facets(&facets, &requested_facets)
+        })
+        .map(|c| services::browse_facets_for_corpus(&c.labels, &c.settings, &c.capabilities))
+        .collect();
+
+    let dict = services::facet_dictionary(&facet_maps);
+    let mut legacy_labels: Vec<String> = filtered
         .iter()
         .flat_map(|c| c.labels.iter().cloned())
         .collect();
+    legacy_labels.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+    legacy_labels.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+
+    let mut labels = dict
+        .get("labels")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    for l in legacy_labels {
+        if !labels.iter().any(|x| x.eq_ignore_ascii_case(&l)) {
+            labels.push(l);
+        }
+    }
     labels.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
-    labels.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
-    Ok(Json(json!({"ok": true, "role": role, "labels": labels})))
+
+    Ok(Json(json!({
+        "ok": true,
+        "role": role,
+        "frontend": frontend,
+        "labels": labels,
+        "facets": dict.get("facets").cloned().unwrap_or(json!({})),
+    })))
+}
+
+fn browse_corpus_dto(c: &CorpusEntry) -> Value {
+    let facets = services::browse_facets_for_corpus(&c.labels, &c.settings, &c.capabilities);
+    let description = c
+        .settings
+        .get("description")
+        .or_else(|| c.capabilities.get("description"))
+        .or_else(|| {
+            c.capabilities
+                .get("browse")
+                .and_then(|b| b.get("description"))
+        })
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    json!({
+        "id": c.id,
+        "label": c.label,
+        "family_key": c.family_key,
+        "family_label": c.family_label,
+        "project_url": c.project_url,
+        "preferred_backend": c.preferred_backend,
+        "source_kind": c.source_kind,
+        "supports_xml": c.supports_xml,
+        "labels": c.labels,
+        "facets": facets,
+        "corpus_size": c.corpus_size,
+        "description": description,
+    })
 }
 
 async fn http_reindex_jobs(
@@ -6273,18 +6518,33 @@ fn list_reindex_jobs(
     let mut sql = String::from(
         "SELECT job_id, corpus_id, status, priority, requested_backends_json, requested_by_role, origin, message, last_error, worker_id, request_json, result_json, requested_at, started_at, finished_at, updated_at FROM reindex_jobs WHERE 1=1",
     );
+    // Display / API lists: newest first (same idea as reindex_history / activity log).
+    // Queued dispatch still uses pick_next_queued_job_for_worker (priority DESC, requested_at ASC).
+    let order = match st.as_deref() {
+        Some("queued") => {
+            // Active queue view: fair FIFO within priority.
+            " ORDER BY priority DESC, requested_at ASC, job_id ASC"
+        }
+        Some("running") => " ORDER BY COALESCE(started_at, requested_at) DESC, job_id DESC",
+        _ => {
+            // all / completed / failed / … — reverse+head, not chronological tail.
+            " ORDER BY COALESCE(finished_at, started_at, updated_at, requested_at) DESC, job_id DESC"
+        }
+    };
     if st.is_some() {
         sql.push_str(" AND status = ?1");
         if corpus.is_some() {
             sql.push_str(" AND corpus_id = ?2");
-            sql.push_str(" ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, priority DESC, requested_at ASC LIMIT ?3");
+            sql.push_str(order);
+            sql.push_str(" LIMIT ?3");
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt
                 .query_map(params![st, corpus, limit as i64], row_to_reindex_job)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             return Ok(rows);
         }
-        sql.push_str(" ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, priority DESC, requested_at ASC LIMIT ?2");
+        sql.push_str(order);
+        sql.push_str(" LIMIT ?2");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params![st, limit as i64], row_to_reindex_job)?
@@ -6293,16 +6553,16 @@ fn list_reindex_jobs(
     }
     if corpus.is_some() {
         sql.push_str(" AND corpus_id = ?1");
-        sql.push_str(" ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, priority DESC, requested_at ASC LIMIT ?2");
+        sql.push_str(order);
+        sql.push_str(" LIMIT ?2");
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(params![corpus, limit as i64], row_to_reindex_job)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         return Ok(rows);
     }
-    sql.push_str(
-        " ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, priority DESC, requested_at ASC LIMIT ?1",
-    );
+    sql.push_str(order);
+    sql.push_str(" LIMIT ?1");
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt
         .query_map(params![limit as i64], row_to_reindex_job)?

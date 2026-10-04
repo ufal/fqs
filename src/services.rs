@@ -427,7 +427,7 @@ fn handled_frontend_kinds() -> &'static [FrontendKindSpec] {
             id: "teitok",
             label: "TEITOK",
             centralized: false,
-            notes: "Per-project PHP UI — each corpus has its own site, not one shared frontend.",
+            notes: "Per-project PHP UI — each corpus has its own site, not one shared frontend. Status reflects catalog corpora (project_url / supports_xml / TEITOK project tree), not whether TEITOK is installed on the server.",
         },
         FrontendKindSpec {
             id: "fcs",
@@ -455,6 +455,10 @@ pub fn hints_from_catalog_row(
     project_url: Option<&str>,
     interface_preference: Option<&str>,
     settings: &Value,
+    source_kind: &str,
+    supports_xml: bool,
+    project_root: Option<&str>,
+    capabilities: &Value,
 ) -> Vec<FrontendHint> {
     let mut out = Vec::new();
 
@@ -621,7 +625,425 @@ pub fn hints_from_catalog_row(
         }
     }
 
+    // TEITOK is per-corpus PHP — not a single shared frontend in fqs.json.
+    // Catalog rows often omit project_url; still count TEITOK-style corpora.
+    if !out.iter().any(|h| normalize_frontend_kind(&h.kind) == "teitok")
+        && corpus_is_teitok_listable(
+            interface_preference,
+            source_kind,
+            supports_xml,
+            project_root,
+            project_url,
+            settings,
+            capabilities,
+        )
+    {
+        let url = project_url
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|u| u.trim_end_matches('/').to_string());
+        out.push(FrontendHint {
+            id: format!("teitok:{corpus_id}"),
+            kind: "teitok".into(),
+            label: "TEITOK".into(),
+            url,
+            corpus_id: corpus_id.to_string(),
+            corpus_alias: None,
+            centralized: false,
+        });
+    }
+
     out
+}
+
+/// Whether a catalog row should appear in TEITOK browse / Frontends TEITOK bag.
+///
+/// FCS-searchable alone is not enough: Susanne/Dickens-style KonText/CWB demos can
+/// be queried via FQS/FCS but have no TEITOK project UI. Require an openable TEITOK
+/// entry point (project URL and/or a real TEITOK project tree), not bare `supports_xml`.
+pub fn corpus_is_teitok_listable(
+    interface_preference: Option<&str>,
+    source_kind: &str,
+    supports_xml: bool,
+    project_root: Option<&str>,
+    project_url: Option<&str>,
+    settings: &Value,
+    capabilities: &Value,
+) -> bool {
+    let _ = supports_xml; // not sufficient for TEITOK display listing
+    match capabilities.get("teitok_listing").and_then(Value::as_bool) {
+        Some(false) => return false,
+        Some(true) => {
+            return has_teitok_open_target(project_url, project_root);
+        }
+        None => {}
+    }
+
+    let url_ok = project_url_openable_for_teitok(
+        project_url,
+        interface_preference,
+        source_kind,
+        capabilities,
+    ) || project_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some_and(looks_like_teitok_url);
+    let root_ok = project_root
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some_and(looks_like_teitok_project_root);
+
+    if url_ok {
+        return true;
+    }
+    // On-disk TEITOK tree (including dummy index.php+pando) is enough even
+    // without catalogue teitok_* flags — those are filled by one-shot enrich.
+    let _ = settings; // reserved for future settings.teitok-only signals without a tree
+    root_ok
+}
+
+fn has_teitok_open_target(project_url: Option<&str>, project_root: Option<&str>) -> bool {
+    project_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some_and(|u| looks_like_teitok_url(u) || !u.is_empty())
+        || project_root
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .is_some_and(looks_like_teitok_project_root)
+}
+
+fn catalog_row_looks_like_teitok(
+    interface_preference: Option<&str>,
+    source_kind: &str,
+    settings: &Value,
+    capabilities: &Value,
+) -> bool {
+    if interface_preference
+        .map(str::trim)
+        .is_some_and(|p| p.eq_ignore_ascii_case("teitok"))
+    {
+        return true;
+    }
+    if source_kind.to_ascii_lowercase().contains("teitok") {
+        return true;
+    }
+    if capabilities
+        .get("teitok_integration")
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return true;
+    }
+    settings.get("teitok").is_some()
+        || settings
+            .get("use_flexicorp_cqp")
+            .and_then(Value::as_bool)
+            == Some(true)
+}
+
+/// Parse `group:value` / bare labels (+ settings/capabilities languages & browse) into facet map.
+pub fn browse_facets_for_corpus(
+    labels: &[String],
+    settings: &Value,
+    capabilities: &Value,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    use std::collections::BTreeMap;
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let push = |map: &mut BTreeMap<String, Vec<String>>, group: &str, value: &str| {
+        let g = group.trim().to_ascii_lowercase();
+        let v = value.trim().to_ascii_lowercase();
+        if g.is_empty() || v.is_empty() {
+            return;
+        }
+        let slot = map.entry(g).or_default();
+        if !slot.iter().any(|x| x == &v) {
+            slot.push(v);
+        }
+    };
+
+    for lab in labels {
+        if let Some((g, v)) = split_facet_label(lab) {
+            push(&mut out, &g, &v);
+        }
+    }
+
+    // Structured browse blob (optional).
+    if let Some(browse) = capabilities
+        .get("browse")
+        .or_else(|| settings.get("browse"))
+    {
+        if let Some(arr) = browse.get("languages").and_then(Value::as_array) {
+            for x in arr {
+                if let Some(s) = x.as_str() {
+                    push(&mut out, "lang", s);
+                }
+            }
+        }
+        if let Some(arr) = browse.get("features").and_then(Value::as_array) {
+            for x in arr {
+                if let Some(s) = x.as_str() {
+                    push(&mut out, "feature", s);
+                }
+            }
+        }
+    }
+
+    // Common language sources used by TEITOK registration / FCS.
+    for key in ["languages", "language"] {
+        if let Some(arr) = settings.get(key).and_then(Value::as_array) {
+            for x in arr {
+                if let Some(s) = x.as_str() {
+                    push(&mut out, "lang", s);
+                }
+            }
+        } else if let Some(s) = settings.get(key).and_then(Value::as_str) {
+            for part in s.split(|c: char| c == ',' || c == ';' || c.is_whitespace()) {
+                push(&mut out, "lang", part);
+            }
+        }
+    }
+    if let Some(fcs) = capabilities.get("fcs") {
+        if let Some(arr) = fcs.get("languages").and_then(Value::as_array) {
+            for x in arr {
+                if let Some(s) = x.as_str() {
+                    push(&mut out, "lang", s);
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn split_facet_label(raw: &str) -> Option<(String, String)> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if let Some((g, v)) = t.split_once(':') {
+        let g = g.trim().to_ascii_lowercase();
+        let g = match g.as_str() {
+            "language" | "languages" => "lang".into(),
+            "features" => "feature".into(),
+            other => other.to_string(),
+        };
+        let v = v.trim().to_ascii_lowercase();
+        if !g.is_empty() && !v.is_empty() {
+            return Some((g, v));
+        }
+    }
+    let lower = t.to_ascii_lowercase();
+    match lower.as_str() {
+        "spoken" | "facsimile" | "video" | "parallel" | "written" | "oral"
+        | "geolocation" | "dependencies" | "ner" | "ud" => {
+            Some(("feature".into(), lower))
+        }
+        "english" | "en" => Some(("lang".into(), "en".into())),
+        "czech" | "cs" | "cz" => Some(("lang".into(), "cs".into())),
+        "german" | "de" => Some(("lang".into(), "de".into())),
+        "dutch" | "nl" => Some(("lang".into(), "nl".into())),
+        "french" | "fr" => Some(("lang".into(), "fr".into())),
+        "spanish" | "es" => Some(("lang".into(), "es".into())),
+        "italian" | "it" => Some(("lang".into(), "it".into())),
+        "portuguese" | "pt" => Some(("lang".into(), "pt".into())),
+        "polish" | "pl" => Some(("lang".into(), "pl".into())),
+        "russian" | "ru" => Some(("lang".into(), "ru".into())),
+        "slovak" | "sk" => Some(("lang".into(), "sk".into())),
+        _ => {
+            // ISO-like 2–3 letter code
+            if lower.len() <= 3 && lower.chars().all(|c| c.is_ascii_alphabetic()) {
+                Some(("lang".into(), lower))
+            } else {
+                Some(("other".into(), lower))
+            }
+        }
+    }
+}
+
+/// Requested facets: AND across groups, OR within the same group.
+pub fn corpus_matches_requested_facets(
+    corpus_facets: &std::collections::BTreeMap<String, Vec<String>>,
+    requested: &[(String, String)],
+) -> bool {
+    if requested.is_empty() {
+        return true;
+    }
+    use std::collections::BTreeMap;
+    let mut by_group: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (g, v) in requested {
+        by_group.entry(g.clone()).or_default().push(v.clone());
+    }
+    for (group, want) in by_group {
+        let have = corpus_facets.get(&group).map(Vec::as_slice).unwrap_or(&[]);
+        if !want.iter().any(|w| have.iter().any(|h| h == w)) {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn parse_facet_params(raw_query: Option<&str>, facets_csv: Option<&str>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut push_token = |s: &str| {
+        let t = s.trim();
+        if t.is_empty() {
+            return;
+        }
+        if let Some((g, v)) = split_facet_label(t) {
+            out.push((g, v));
+        }
+    };
+    if let Some(csv) = facets_csv {
+        for part in csv.split(',') {
+            push_token(part);
+        }
+    }
+    if let Some(raw) = raw_query {
+        for pair in raw.split('&') {
+            let mut it = pair.splitn(2, '=');
+            let key = it.next().unwrap_or("");
+            let val = it.next().unwrap_or("");
+            let key = percent_decode(key);
+            if key != "facet" && key != "facets" {
+                continue;
+            }
+            let val = percent_decode(val);
+            if key == "facets" {
+                for part in val.split(',') {
+                    push_token(part);
+                }
+            } else {
+                push_token(&val);
+            }
+        }
+    }
+    out
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let h = |c: u8| -> Option<u8> {
+                    match c {
+                        b'0'..=b'9' => Some(c - b'0'),
+                        b'a'..=b'f' => Some(c - b'a' + 10),
+                        b'A'..=b'F' => Some(c - b'A' + 10),
+                        _ => None,
+                    }
+                };
+                if let (Some(a), Some(b)) = (h(bytes[i + 1]), h(bytes[i + 2])) {
+                    out.push((a << 4) | b);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+pub fn facet_dictionary(
+    corpora_facets: &[std::collections::BTreeMap<String, Vec<String>>],
+) -> Value {
+    use std::collections::BTreeMap;
+    let mut counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    for facets in corpora_facets {
+        for (g, vals) in facets {
+            let slot = counts.entry(g.clone()).or_default();
+            for v in vals {
+                *slot.entry(v.clone()).or_default() += 1;
+            }
+        }
+    }
+    let mut facets_obj = serde_json::Map::new();
+    let mut flat_labels = Vec::new();
+    for (g, vals) in counts {
+        let mut arr = Vec::new();
+        for (v, n) in vals {
+            flat_labels.push(format!("{g}:{v}"));
+            arr.push(json!({"value": v, "count": n}));
+        }
+        arr.sort_by(|a, b| {
+            a.get("value")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .cmp(b.get("value").and_then(Value::as_str).unwrap_or(""))
+        });
+        facets_obj.insert(g, Value::Array(arr));
+    }
+    flat_labels.sort();
+    flat_labels.dedup();
+    json!({
+        "labels": flat_labels,
+        "facets": facets_obj,
+    })
+}
+
+fn looks_like_teitok_project_root(path: &str) -> bool {
+    let dir = Path::new(path);
+    // project_root may point at …/pando; TEITOK entry is often the parent.
+    let parent = dir.parent().unwrap_or(dir);
+    for cand in [dir, parent] {
+        if teitok_project_dir(cand) {
+            return true;
+        }
+    }
+    false
+}
+
+fn teitok_project_dir(dir: &Path) -> bool {
+    if !dir.is_dir() || !dir.join("index.php").is_file() {
+        return false;
+    }
+    // Full TEITOK layout markers…
+    let markers = [
+        "Scripts",
+        "Pages",
+        "xmlfiles",
+        "cqpsettings.xml",
+        "Resources/settings.xml",
+    ];
+    if markers.iter().any(|m| dir.join(m).exists()) {
+        return true;
+    }
+    // …or a “dummy” TEITOK wrapper: index.php + a query backend folder (e.g. ud_pando
+    // without xmlfiles). Bare CWB/Manatee data dirs lack index.php, so they stay out.
+    ["pando", "cqp", "manatee", "xidx"]
+        .iter()
+        .any(|m| dir.join(m).is_dir())
+}
+
+/// Non-empty project_url + TEITOK catalogue signal counts even when the URL
+/// path does not contain the substring "teitok" (some vhosts omit it).
+pub fn project_url_openable_for_teitok(
+    project_url: Option<&str>,
+    interface_preference: Option<&str>,
+    source_kind: &str,
+    capabilities: &Value,
+) -> bool {
+    let url = project_url.map(str::trim).filter(|s| !s.is_empty());
+    let Some(u) = url else {
+        return false;
+    };
+    if looks_like_teitok_url(u) {
+        return true;
+    }
+    catalog_row_looks_like_teitok(interface_preference, source_kind, &json!({}), capabilities)
 }
 
 fn is_centralized_kind(kind: &str) -> bool {
@@ -651,7 +1073,9 @@ fn centralized_label(kind: &str) -> String {
 
 fn looks_like_teitok_url(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
-    lower.contains("/teitok/") || lower.contains("teitok.")
+    lower.contains("/teitok/")
+        || lower.contains("/teitok-")
+        || lower.contains("teitok.")
 }
 
 fn resolve_frontend_merge_id(by_id: &Map<String, Value>, hint: &FrontendHint) -> String {
@@ -1151,10 +1575,106 @@ mod tests {
             Some("http://127.0.0.1/teitok/easycorp/infoveillance/index.php"),
             None,
             &json!({}),
+            "generic",
+            false,
+            None,
+            &json!({}),
         );
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].kind, "teitok");
         assert!(!hints[0].centralized);
+    }
+
+    #[test]
+    fn teitok_supports_xml_alone_is_not_listable() {
+        assert!(!corpus_is_teitok_listable(
+            None,
+            "cwb_registry",
+            true,
+            None,
+            None,
+            &json!({}),
+            &json!({}),
+        ));
+        let hints = hints_from_catalog_row(
+            "dickens",
+            None,
+            None,
+            &json!({}),
+            "cwb_registry",
+            true,
+            None,
+            &json!({}),
+        );
+        assert!(hints.iter().all(|h| h.kind != "teitok"));
+    }
+
+    #[test]
+    fn teitok_source_kind_needs_open_target() {
+        assert!(!corpus_is_teitok_listable(
+            Some("teitok"),
+            "teitok",
+            false,
+            None,
+            None,
+            &json!({}),
+            &json!({"teitok_integration": true}),
+        ));
+        assert!(corpus_is_teitok_listable(
+            Some("teitok"),
+            "teitok",
+            false,
+            None,
+            Some("https://example.org/teitok/ud_pando/"),
+            &json!({}),
+            &json!({"teitok_integration": true}),
+        ));
+    }
+
+    #[test]
+    fn dummy_teitok_index_plus_pando_is_listable_without_catalog_flags() {
+        let tmp = std::env::temp_dir().join(format!(
+            "fqs_dummy_teitok_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("pando")).expect("mkdir pando");
+        std::fs::write(tmp.join("index.php"), "<?php\n").expect("index.php");
+        let root = tmp.to_string_lossy().to_string();
+        assert!(corpus_is_teitok_listable(
+            None,
+            "pando_index",
+            false,
+            Some(&root),
+            None,
+            &json!({}),
+            &json!({}),
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn browse_facets_and_match() {
+        let facets = browse_facets_for_corpus(
+            &["spoken".into(), "lang:cs".into(), "UD".into()],
+            &json!({"languages": ["en"]}),
+            &json!({}),
+        );
+        assert!(facets.get("feature").unwrap().contains(&"spoken".to_string()));
+        assert!(facets.get("feature").unwrap().contains(&"ud".to_string()));
+        assert!(facets.get("lang").unwrap().contains(&"cs".to_string()));
+        assert!(facets.get("lang").unwrap().contains(&"en".to_string()));
+
+        let req = parse_facet_params(
+            Some("facet=lang%3Acs&facet=feature:spoken"),
+            None,
+        );
+        assert!(corpus_matches_requested_facets(&facets, &req));
+        let req2 = vec![("lang".into(), "de".into())];
+        assert!(!corpus_matches_requested_facets(&facets, &req2));
     }
 
     #[test]
@@ -1164,6 +1684,10 @@ mod tests {
             None,
             None,
             &json!({"kontext": {"url": "http://127.0.0.1:8080/kontext", "corpname": "ud"}}),
+            "generic",
+            false,
+            None,
+            &json!({}),
         );
         assert_eq!(hints.len(), 1);
         assert!(hints[0].centralized);
@@ -1178,6 +1702,10 @@ mod tests {
             None,
             None,
             &json!({"cqpweb": {"url": "https://cqpweb.example/cqpweb", "corpus": "DICKENS"}}),
+            "generic",
+            false,
+            None,
+            &json!({}),
         );
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].kind, "cqpweb");
