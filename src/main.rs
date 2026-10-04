@@ -4751,8 +4751,31 @@ fn browse_corpus_dto(c: &CorpusEntry) -> Value {
         &c.settings,
         &c.capabilities,
     );
+    // Where the corpus can be opened (TEITOK project, KonText, CQPweb, Korp, FCS ...),
+    // so a corpus list can show corpora from every interface on the server.
+    let frontends: Vec<Value> = services::hints_from_catalog_row(
+        &c.id,
+        c.project_url.as_deref(),
+        c.interface_preference.as_deref(),
+        &c.settings,
+        &c.source_kind,
+        c.supports_xml,
+        Some(root.as_ref()),
+        &c.capabilities,
+    )
+    .into_iter()
+    .map(|h| {
+        json!({
+            "kind": h.kind,
+            "label": h.label,
+            "url": h.url,
+            "corpus": h.corpus_alias.unwrap_or(h.corpus_id),
+        })
+    })
+    .collect();
     // Public browse DTO: no project_root (local path). Clients use project_url + teitok_listable.
     json!({
+        "frontends": frontends,
         "id": c.id,
         "label": c.label,
         "family_key": c.family_key,
