@@ -4741,6 +4741,17 @@ fn browse_corpus_dto(c: &CorpusEntry) -> Value {
         })
         .and_then(Value::as_str)
         .map(str::to_string);
+    let root = c.project_root.to_string_lossy();
+    let teitok_listable = services::corpus_is_teitok_listable(
+        c.interface_preference.as_deref(),
+        &c.source_kind,
+        c.supports_xml,
+        Some(root.as_ref()),
+        c.project_url.as_deref(),
+        &c.settings,
+        &c.capabilities,
+    );
+    // Public browse DTO: no project_root (local path). Clients use project_url + teitok_listable.
     json!({
         "id": c.id,
         "label": c.label,
@@ -4749,7 +4760,9 @@ fn browse_corpus_dto(c: &CorpusEntry) -> Value {
         "project_url": c.project_url,
         "preferred_backend": c.preferred_backend,
         "source_kind": c.source_kind,
+        "interface_preference": c.interface_preference,
         "supports_xml": c.supports_xml,
+        "teitok_listable": teitok_listable,
         "labels": c.labels,
         "facets": facets,
         "corpus_size": c.corpus_size,
