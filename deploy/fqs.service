@@ -32,8 +32,10 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/fqs /var/log/fqs /etc/fqs
-# TEITOK corpus trees (reindex writes pando/, tmp/). Override in a drop-in if paths differ.
-ReadWritePaths=/var/www/html/teitok /srv/teitok
+# TEITOK corpus trees (reindex writes pando/, tmp/). Only list paths that exist —
+# ProtectSystem=strict fails NAMESPACE startup if a ReadWritePaths entry is missing.
+# Extra roots: drop-in via install.sh / `systemctl edit fqs` (e.g. /srv/teitok).
+ReadWritePaths=/var/www/html/teitok
 
 [Install]
 WantedBy=multi-user.target

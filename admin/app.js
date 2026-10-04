@@ -49,16 +49,46 @@
   let formSettings = {};
   let formCapabilities = {};
 
-  const SUGGESTED_LABELS = [
-    "feature:spoken",
-    "feature:facsimile",
-    "feature:video",
-    "feature:parallel",
-    "feature:geolocation",
-    "feature:dependencies",
-    "feature:ner",
-    "feature:ud",
+  /** Stored token → human label for the admin UI (catalogue still uses lang:/feature:). */
+  const FEATURE_OPTIONS = [
+    { token: "feature:spoken", title: "Spoken / audio" },
+    { token: "feature:facsimile", title: "Facsimile images" },
+    { token: "feature:video", title: "Video" },
+    { token: "feature:parallel", title: "Parallel / aligned" },
+    { token: "feature:geolocation", title: "Geolocation" },
+    { token: "feature:dependencies", title: "Dependency trees" },
+    { token: "feature:ner", title: "Named entities (NER)" },
+    { token: "feature:ud", title: "Universal Dependencies" },
   ];
+  const LANGUAGE_OPTIONS = [
+    { token: "lang:cs", title: "Czech" },
+    { token: "lang:en", title: "English" },
+    { token: "lang:de", title: "German" },
+    { token: "lang:nl", title: "Dutch" },
+    { token: "lang:fr", title: "French" },
+    { token: "lang:es", title: "Spanish" },
+    { token: "lang:it", title: "Italian" },
+    { token: "lang:pt", title: "Portuguese" },
+    { token: "lang:pl", title: "Polish" },
+    { token: "lang:sk", title: "Slovak" },
+    { token: "lang:ru", title: "Russian" },
+    { token: "lang:uk", title: "Ukrainian" },
+    { token: "lang:hu", title: "Hungarian" },
+    { token: "lang:fi", title: "Finnish" },
+    { token: "lang:sv", title: "Swedish" },
+    { token: "lang:da", title: "Danish" },
+    { token: "lang:nb", title: "Norwegian" },
+    { token: "lang:el", title: "Greek" },
+    { token: "lang:tr", title: "Turkish" },
+    { token: "lang:ar", title: "Arabic" },
+    { token: "lang:zh", title: "Chinese" },
+    { token: "lang:ja", title: "Japanese" },
+    { token: "lang:ko", title: "Korean" },
+    { token: "lang:la", title: "Latin" },
+  ];
+  const SUGGESTED_LABELS = FEATURE_OPTIONS.map((x) => x.token).concat(
+    LANGUAGE_OPTIONS.map((x) => x.token)
+  );
 
   function showBanner(msg, isErr) {
     banner.hidden = !msg;
@@ -177,8 +207,29 @@
     return data;
   }
 
-  function renderList() {
+  function corpusMatchesFilter(c, q) {
+    if (!q) return true;
+    return (
+      (c.id || "").toLowerCase().includes(q) ||
+      (c.label || "").toLowerCase().includes(q) ||
+      (c.environment || "").toLowerCase().includes(q)
+    );
+  }
+
+  /** Keep the open corpus visible; password managers sometimes autofill #corpus-filter. */
+  function ensureSelectionVisible() {
+    if (!filterEl || !selectedId) return;
+    const c = corpora.find((x) => x.id === selectedId);
+    if (!c) return;
     const q = (filterEl.value || "").trim().toLowerCase();
+    if (q && !corpusMatchesFilter(c, q)) {
+      filterEl.value = "";
+    }
+  }
+
+  function renderList() {
+    ensureSelectionVisible();
+    const q = (filterEl && filterEl.value ? filterEl.value : "").trim().toLowerCase();
     listEl.innerHTML = "";
     const t = token();
     if (!t) {
@@ -199,14 +250,17 @@
       );
       return;
     }
-    const filtered = corpora.filter((c) => {
-      if (!q) return true;
-      return (
-        (c.id || "").toLowerCase().includes(q) ||
-        (c.label || "").toLowerCase().includes(q) ||
-        (c.environment || "").toLowerCase().includes(q)
-      );
-    });
+    let filtered = corpora.filter((c) => corpusMatchesFilter(c, q));
+    // If a phantom filter hid everything but we have a selection, drop the filter once.
+    if (
+      !filtered.length &&
+      q &&
+      selectedId &&
+      corpora.some((c) => c.id === selectedId)
+    ) {
+      filterEl.value = "";
+      filtered = corpora.slice();
+    }
     if (!corpora.length) {
       setListEmpty(
         "<strong>Authenticated, but catalog is empty</strong>" +
@@ -285,6 +339,36 @@
     return out;
   }
 
+  function parseLabelToken(raw) {
+    const t = String(raw || "").trim();
+    const m = t.match(/^(lang|language|feature|features)\s*:\s*(.+)$/i);
+    if (m) {
+      const g = m[1].toLowerCase().startsWith("lang") ? "lang" : "feature";
+      return { group: g, value: m[2].trim().toLowerCase(), token: g + ":" + m[2].trim().toLowerCase() };
+    }
+    return { group: "other", value: t, token: t };
+  }
+
+  function friendlyLabel(raw) {
+    const k = labelKey(raw);
+    const feat = FEATURE_OPTIONS.find((x) => labelKey(x.token) === k);
+    if (feat) return feat.title;
+    const lang = LANGUAGE_OPTIONS.find((x) => labelKey(x.token) === k);
+    if (lang) return lang.title;
+    const p = parseLabelToken(raw);
+    if (p.group === "lang") return "Language: " + p.value;
+    if (p.group === "feature") return "Feature: " + p.value;
+    return p.token;
+  }
+
+  function toggleTokenSet() {
+    const set = new Set();
+    FEATURE_OPTIONS.forEach((x) => set.add(labelKey(x.token)));
+    LANGUAGE_OPTIONS.forEach((x) => set.add(labelKey(x.token)));
+    extraLanguageOptions().forEach((x) => set.add(labelKey(x.token)));
+    return set;
+  }
+
   function catalogLabelVocabulary() {
     const seen = new Set();
     const out = [];
@@ -304,9 +388,54 @@
     return out;
   }
 
+  /** Extra languages already on this corpus / catalogue but not in the fixed list. */
+  function extraLanguageOptions() {
+    const known = new Set(LANGUAGE_OPTIONS.map((x) => labelKey(x.token)));
+    const out = [];
+    const seen = new Set();
+    const consider = (raw) => {
+      const p = parseLabelToken(raw);
+      if (p.group !== "lang") return;
+      if (known.has(labelKey(p.token)) || seen.has(labelKey(p.token))) return;
+      seen.add(labelKey(p.token));
+      out.push({ token: p.token, title: "Language: " + p.value });
+    };
+    formLabels.forEach(consider);
+    corpora.forEach((c) => (c.labels || []).forEach(consider));
+    out.sort((a, b) => a.title.localeCompare(b.title));
+    return out;
+  }
+
   function setFormLabels(list) {
     formLabels = normalizeLabelList(list);
     renderLabelsEditor();
+  }
+
+  function toggleManagedLabel(token, on) {
+    const k = labelKey(token);
+    if (on) {
+      if (!formLabels.some((x) => labelKey(x) === k)) formLabels.push(token);
+    } else {
+      formLabels = formLabels.filter((x) => labelKey(x) !== k);
+    }
+    renderLabelsEditor();
+  }
+
+  function renderToggleGroup(hostId, options) {
+    const host = $(hostId);
+    if (!host) return;
+    const selected = new Set(formLabels.map(labelKey));
+    host.innerHTML = "";
+    options.forEach((opt) => {
+      const lab = document.createElement("label");
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = selected.has(labelKey(opt.token));
+      cb.addEventListener("change", () => toggleManagedLabel(opt.token, cb.checked));
+      lab.appendChild(cb);
+      lab.appendChild(document.createTextNode(opt.title));
+      host.appendChild(lab);
+    });
   }
 
   function renderLabelsEditor() {
@@ -315,18 +444,24 @@
     const newRow = $("labels-new-row");
     if (!box || !pick) return;
 
+    renderToggleGroup("labels-langs", LANGUAGE_OPTIONS.concat(extraLanguageOptions()));
+    renderToggleGroup("labels-features", FEATURE_OPTIONS);
+
+    const toggled = toggleTokenSet();
+    const other = formLabels.filter((l) => !toggled.has(labelKey(l)));
     box.innerHTML = "";
-    if (!formLabels.length) {
+    if (!other.length) {
       const empty = document.createElement("span");
       empty.className = "empty";
-      empty.textContent = "No labels yet";
+      empty.textContent = "None";
       box.appendChild(empty);
     } else {
-      formLabels.forEach((lab) => {
+      other.forEach((lab) => {
         const chip = document.createElement("span");
         chip.className = "labels-chip";
         const text = document.createElement("span");
-        text.textContent = lab;
+        text.textContent = friendlyLabel(lab);
+        text.title = lab;
         const rm = document.createElement("button");
         rm.type = "button";
         rm.setAttribute("aria-label", "Remove " + lab);
@@ -342,16 +477,19 @@
     }
 
     const selected = new Set(formLabels.map(labelKey));
-    const available = catalogLabelVocabulary().filter((l) => !selected.has(labelKey(l)));
+    const available = catalogLabelVocabulary().filter(
+      (l) => !selected.has(labelKey(l)) && !toggled.has(labelKey(l))
+    );
     pick.innerHTML = "";
     const ph = document.createElement("option");
     ph.value = "";
-    ph.textContent = available.length ? "Choose…" : "No unused labels";
+    ph.textContent = available.length ? "Select a tag…" : "No other tags in catalogue";
     pick.appendChild(ph);
     available.forEach((lab) => {
       const opt = document.createElement("option");
       opt.value = lab;
-      opt.textContent = lab;
+      opt.textContent = friendlyLabel(lab);
+      opt.title = lab;
       pick.appendChild(opt);
     });
     pick.disabled = !available.length;
@@ -371,15 +509,18 @@
   }
 
   function addNewLabel(raw) {
-    const t = String(raw || "").trim();
-    if (!t) throw new Error("Enter a non-empty label");
-    if (/[,\n\r]/.test(t)) throw new Error("One label at a time (no commas)");
-    if (t.length > 80) throw new Error("Label is too long");
+    let t = String(raw || "").trim();
+    if (!t) throw new Error("Enter a non-empty tag");
+    if (/[,\n\r]/.test(t)) throw new Error("One tag at a time (no commas)");
+    if (t.length > 80) throw new Error("Tag is too long");
+    // Bare 2–3 letter codes → lang:xx
+    if (/^[A-Za-z]{2,3}$/.test(t) && !t.includes(":")) {
+      t = "lang:" + t.toLowerCase();
+    }
     const k = labelKey(t);
     if (formLabels.some((x) => labelKey(x) === k)) {
       throw new Error("Already on this corpus");
     }
-    // Prefer canonical spelling already in the catalogue if case differs.
     const known = catalogLabelVocabulary().find((x) => labelKey(x) === k);
     const final = known || t;
     if (!known && !sessionNewLabels.some((x) => labelKey(x) === k)) {
@@ -462,21 +603,9 @@
     draftNew = false;
     selectedId = id;
     const c = corpora.find((x) => x.id === id);
-    // If a leftover/autofilled filter would hide the selection, clear it so the
-    // click does not collapse the list to "No match".
-    const q = (filterEl && filterEl.value ? filterEl.value : "").trim().toLowerCase();
-    if (
-      q &&
-      c &&
-      !(
-        (c.id || "").toLowerCase().includes(q) ||
-        (c.label || "").toLowerCase().includes(q) ||
-        (c.environment || "").toLowerCase().includes(q)
-      )
-    ) {
-      filterEl.value = "";
-    }
+    // Fill first: browser/password-manager autofill can then rewrite #corpus-filter.
     if (c) fillForm(c);
+    ensureSelectionVisible();
     renderList();
   }
 

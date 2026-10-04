@@ -243,13 +243,17 @@ else
 		-e "s|/usr/local/bin/fqs|$BIN_DIR/fqs|g" \
 		-e "s|/usr/local/share/fqs/admin|$SHARE_DIR/admin|g" \
 		"$UNIT_SRC" >"$UNIT_DST"
-	# Drop-in for extra corpus roots (ProtectSystem=strict needs ReadWritePaths)
+	# Drop-in for corpus roots (ProtectSystem=strict: every ReadWritePaths must exist)
 	DROP_IN_DIR=$UNIT_DIR/fqs.service.d
 	install -d -m 0755 "$DROP_IN_DIR"
 	{
 		echo '[Service]'
 		for _root in "${SCAN_ROOTS[@]}"; do
-			echo "ReadWritePaths=$_root"
+			if [[ -d "$_root" ]]; then
+				echo "ReadWritePaths=$_root"
+			else
+				log "skip ReadWritePaths=$_root (directory missing — NAMESPACE would fail)"
+			fi
 		done
 	} >"$DROP_IN_DIR/scan-roots.conf"
 	systemctl daemon-reload

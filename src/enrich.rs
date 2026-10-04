@@ -54,13 +54,23 @@ pub fn enrich_corpus_entry(entry: &mut CorpusEntry) -> EnrichReport {
         }
     }
 
-    // settings.languages (only if missing/empty)
+    // settings.languages (only if missing/empty/placeholder-only)
     let mut settings = entry.settings.clone();
     if let Some(obj) = settings.as_object_mut() {
         let has_langs = obj
             .get("languages")
             .and_then(Value::as_array)
-            .map(|a| !a.is_empty())
+            .map(|a| {
+                a.iter().any(|v| {
+                    v.as_str()
+                        .map(|s| {
+                            let s = s.trim().to_ascii_lowercase();
+                            !s.is_empty()
+                                && !matches!(s.as_str(), "und" | "unk" | "unknown" | "zxx")
+                        })
+                        .unwrap_or(false)
+                })
+            })
             .unwrap_or(false);
         if !has_langs && !detected.languages.is_empty() {
             obj.insert(
@@ -137,7 +147,19 @@ pub fn enrich_corpus_entry(entry: &mut CorpusEntry) -> EnrichReport {
             let empty = fcs
                 .get("languages")
                 .and_then(Value::as_array)
-                .map(|a| a.is_empty())
+                .map(|a| {
+                    a.is_empty()
+                        || a.iter().all(|v| {
+                            v.as_str()
+                                .map(|s| {
+                                    matches!(
+                                        s.trim().to_ascii_lowercase().as_str(),
+                                        "" | "und" | "unk" | "unknown" | "zxx"
+                                    )
+                                })
+                                .unwrap_or(true)
+                        })
+                })
                 .unwrap_or(true);
             if empty && !detected.languages.is_empty() {
                 fcs.insert(

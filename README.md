@@ -43,7 +43,7 @@ sudo systemctl status fqs
 curl -sS http://127.0.0.1:8787/health
 ```
 
-Corpus trees that reindex writes into (e.g. `…/migrantstories/pando`) must be writable by user `fqs` or group `fqs`. The unit’s `ReadWritePaths=` lists `/var/www/html/teitok` and `/srv/teitok`; add a drop-in if your corpora live elsewhere:
+Corpus trees that reindex writes into (e.g. `…/migrantstories/pando`) must be writable by user `fqs` or group `fqs`. The unit’s `ReadWritePaths=` includes `/var/www/html/teitok` when present; **every** path listed must exist or systemd fails with `status=226/NAMESPACE`. Add further roots with a drop-in (install.sh does this for configured scan roots):
 
 ```bash
 sudo systemctl edit fqs

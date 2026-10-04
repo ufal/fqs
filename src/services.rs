@@ -756,6 +756,10 @@ pub fn browse_facets_for_corpus(
         if g.is_empty() || v.is_empty() {
             return;
         }
+        // ISO 639-3 "und" / unknowns are placeholders — not useful browse facets.
+        if g == "lang" && matches!(v.as_str(), "und" | "unk" | "unknown" | "zxx" | "mul") {
+            return;
+        }
         let slot = map.entry(g).or_default();
         if !slot.iter().any(|x| x == &v) {
             slot.push(v);
