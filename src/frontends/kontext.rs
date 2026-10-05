@@ -842,10 +842,9 @@ fn kontext_coverage_for_frontend(frontend_id: &str, cfg: &Value, corpora: &[Cata
     };
     // the real files (corplist.xml may be a symlink)
     let real = |p: &Option<PathBuf>| p.as_ref().map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
-    let corplist_problem = real(&corplist_path).and_then(|p| write_problem(&p, false));
-    let pando_problem = real(&pando_path).and_then(|p| write_problem(&p, false));
-    let corplist_writable = corplist_path.is_some() && corplist_problem.is_none();
-    let pando_writable = pando_path.is_some() && pando_problem.is_none();
+    let mut checks = WriteChecks::default();
+    let corplist_writable = real(&corplist_path).is_some_and(|p| checks.check(&p, false));
+    let pando_writable = real(&pando_path).is_some_and(|p| checks.check(&p, false));
     let have_corplist = corplist_path.is_some() && setup_hint.is_none();
     let ident_set: std::collections::HashSet<String> = idents.iter().map(|s| s.to_ascii_lowercase()).collect();
     let pando_set = pando_path.as_deref().and_then(pando_corpora_idents);
@@ -897,14 +896,7 @@ fn kontext_coverage_for_frontend(frontend_id: &str, cfg: &Value, corpora: &[Cata
     if have_corplist && pando_path.is_none() {
         hints.push("No pando_corpora.json found: KonText can only serve Pando corpora with kontext-pando; set frontends[].pando_corpora in fqs.json if it is installed.".into());
     }
-    if have_corplist {
-        if let Some(h) = &corplist_problem {
-            hints.push(h.clone());
-        }
-    }
-    if let Some(h) = &pando_problem {
-        hints.push(h.clone());
-    }
+
     if registry.is_none() && have_corplist {
         hints.push("Manatee registry folder not found (set frontends[].registry): FQS cannot check or build the registry files KonText needs.".into());
     }
@@ -915,10 +907,13 @@ fn kontext_coverage_for_frontend(frontend_id: &str, cfg: &Value, corpora: &[Cata
         for d in dirs.into_iter().flatten() {
             if !d.is_dir() {
                 hints.push(format!("{} does not exist: create it (writable for FQS) for the Manatee registry files.", d.display()));
-            } else if let Some(h) = write_problem(&d, true) {
-                hints.push(h);
+            } else {
+                checks.check(&d, true);
             }
         }
+    }
+    if have_corplist || pando_path.is_some() {
+        hints.extend(checks.hints());
     }
     if registry.is_some() && have_corplist && find_encodevert(Some(cfg)).is_none() {
         hints.push("Manatee's encodevert not found (set frontends[].encodevert): registry files are written without Manatee data, which is enough for searching through Pando; KonText's word list, keywords and collocations then fail for those corpora.".into());

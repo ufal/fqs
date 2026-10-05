@@ -470,34 +470,67 @@ pub(crate) fn process_user() -> String {
     }
 }
 
-/// Can FQS write `path` (a file; with `in_dir`, create files in that folder)? Else why
-/// not, in words that say what to change: the file's permissions, or the systemd
-/// sandbox of the FQS service (ProtectSystem=strict makes everything outside its
-/// ReadWritePaths read-only, whoever owns it).
-pub(crate) fn write_problem(path: &Path, in_dir: bool) -> Option<String> {
-    let res = if in_dir {
-        let probe = path.join(format!(".fqs-write-test-{}", std::process::id()));
-        let r = fs::write(&probe, "");
-        let _ = fs::remove_file(&probe);
-        r
-    } else {
-        fs::OpenOptions::new().write(true).open(path).map(|_| ())
-    };
-    let e = res.err()?;
-    // EROFS (30 on Linux and macOS): mounted read-only for this process
-    if e.raw_os_error() == Some(30) {
-        return Some(format!(
-            "{} is read-only for FQS: its systemd service has ProtectSystem=strict. Allow it with `sudo systemctl edit fqs`: [Service] ReadWritePaths={} — then `sudo systemctl restart fqs`.",
-            path.display(),
-            path.display()
-        ));
+/// Which of a frontend's files and folders FQS can write, and one set of hints for those
+/// it cannot: the systemd sandbox of the FQS service (ProtectSystem=strict makes all
+/// outside its ReadWritePaths read-only, whoever owns it) in one message for all of
+/// them, and missing permissions per path.
+#[derive(Default)]
+pub(crate) struct WriteChecks {
+    read_only: Vec<PathBuf>,
+    denied: Vec<PathBuf>,
+    other: Vec<String>,
+}
+
+impl WriteChecks {
+    /// Can FQS write `path` (a file; with `in_dir`, create files in that folder)?
+    pub(crate) fn check(&mut self, path: &Path, in_dir: bool) -> bool {
+        let res = if in_dir {
+            let probe = path.join(format!(".fqs-write-test-{}", std::process::id()));
+            let r = fs::write(&probe, "");
+            let _ = fs::remove_file(&probe);
+            r
+        } else {
+            fs::OpenOptions::new().write(true).open(path).map(|_| ())
+        };
+        let Err(e) = res else { return true };
+        // EROFS (30 on Linux and macOS): mounted read-only for this process. The folder,
+        // not the file, goes in ReadWritePaths: a bind-mounted file would keep pointing at
+        // the old file when a deployment replaces it.
+        if e.raw_os_error() == Some(30) {
+            let d = if in_dir { path.to_path_buf() } else { path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.to_path_buf()) };
+            if !self.read_only.contains(&d) {
+                self.read_only.push(d);
+            }
+        } else if e.kind() == std::io::ErrorKind::PermissionDenied {
+            self.denied.push(path.to_path_buf());
+        } else {
+            self.other.push(format!("FQS cannot write {}: {e}", path.display()));
+        }
+        false
     }
-    if e.kind() == std::io::ErrorKind::PermissionDenied {
-        return Some(format!(
-            "FQS runs as {} and may not write {}: make it writable for that user or one of its groups.",
-            process_user(),
-            path.display()
-        ));
+
+    pub(crate) fn hints(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.read_only.is_empty() {
+            let list: Vec<String> = self.read_only.iter().map(|p| p.display().to_string()).collect();
+            out.push(format!(
+                "FQS's systemd service may not write in {} (the unit has ProtectSystem=strict). \
+                 `sudo perl install/install-stack.pl --only fqs` (in the flexicorp checkout) sets this up, \
+                 with write access for the FQS user; by hand: `sudo systemctl edit fqs`, add \
+                 \"[Service]\" and \"ReadWritePaths={}\", then `sudo systemctl restart fqs`.",
+                list.join(", "),
+                list.iter().map(|p| format!("-{p}")).collect::<Vec<_>>().join(" ")
+            ));
+        }
+        if !self.denied.is_empty() {
+            let list: Vec<String> = self.denied.iter().map(|p| p.display().to_string()).collect();
+            out.push(format!(
+                "FQS runs as {} and may not write {}: give that user write access (e.g. `sudo setfacl -m u:USER:rw FILE`, `-m u:USER:rwx -m d:u:USER:rwx` for folders), or run `sudo perl install/install-stack.pl --only fqs`.",
+                process_user(),
+                list.join(", ")
+            ));
+        }
+        out.extend(self.other.iter().cloned());
+        out
     }
-    Some(format!("FQS cannot write {}: {e}", path.display()))
 }

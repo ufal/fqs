@@ -650,12 +650,22 @@ impl CorpusCatalog {
         }
         // just registered by another process (e.g. TEITOK: upsert, then enqueue)?
         self.refresh(true);
-        self.inner
-            .read()
-            .expect("catalog read lock")
-            .get(id)
-            .cloned()
-            .with_context(|| format!("Corpus '{id}' not found in catalog"))
+        if let Some(e) = self.inner.read().expect("catalog read lock").get(id).cloned() {
+            return Ok(e);
+        }
+        // The reloads above are throttled (once a second), so a row written a moment ago
+        // can still be missing — TEITOK registers a corpus and enqueues its reindex right
+        // after: read that one row from the database itself.
+        let conn = open_db(&self.db_path.to_path_buf())?;
+        if corpus_exists(&conn, id)? {
+            let e = get_corpus(&conn, id)?;
+            self.inner
+                .write()
+                .expect("catalog write lock")
+                .insert(id.to_string(), e.clone());
+            return Ok(e);
+        }
+        anyhow::bail!("Corpus '{id}' not found in catalog")
     }
 
     fn list(
@@ -8184,5 +8194,29 @@ mod upsert_merge_tests {
         let raw2 = json!({"id": "c", "label": "x", "project_root": "/p", "preferred_backend": "auto", "settings": {"fcs": {"enabled": true}}});
         let m2 = merge_upsert_entry(&old, &entry(raw2.clone()), &raw2).unwrap();
         assert_eq!(m2.settings["fcs"]["enabled"], true);
+    }
+}
+
+#[cfg(test)]
+mod catalog_fresh_tests {
+    use super::*;
+
+    #[test]
+    fn a_row_written_a_moment_ago_is_found() {
+        let d = std::env::temp_dir().join(format!("fqs-cat-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let db = d.join("fqs.db");
+        let conn = open_db(&db).unwrap();
+        let cat = CorpusCatalog::load_from_db(&db).unwrap();
+        // a lookup now: the catalog has just reloaded (throttled for a second)
+        assert!(cat.get("ntrex").is_err());
+        let e: CorpusEntry = serde_json::from_value(json!({
+            "id": "ntrex", "label": "NTREX", "project_root": "/p", "preferred_backend": "auto"
+        })).unwrap();
+        upsert_corpus(&conn, &e).unwrap();
+        // TEITOK: upsert, then enqueue right away
+        assert_eq!(cat.get("ntrex").unwrap().label, "NTREX");
+        let _ = fs::remove_dir_all(&d);
     }
 }
