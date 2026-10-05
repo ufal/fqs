@@ -22,6 +22,10 @@
   // the session's CSRF value; replaced when the TEITOK session is renewed (see below)
   let proxyCsrf = meta("fqs-admin-csrf");
   const PROXY_USER = meta("fqs-admin-user");
+  // Opened from a TEITOK project (not the shared one) by its admins: only the entry of
+  // that project's corpus ("project"); server-wide admins get everything ("server").
+  const SCOPE = PROXY ? meta("fqs-admin-scope") || "server" : "server";
+  const REGISTER_URL = meta("fqs-admin-register");
 
   /** URL of an admin API call: `path` like "/corpora/x?full=1". */
   function apiUrl(path) {
@@ -410,8 +414,12 @@
     }
     if (!corpora.length) {
       setListEmpty(
-        "<strong>Authenticated, but catalog is empty</strong>" +
-          "This FQS database has no corpora yet. Use <em>New</em> or upsert via the API.",
+        SCOPE === "project"
+          ? "<strong>This corpus is not in FQS yet</strong>" +
+              "It is listed once it is registered: indexing it with Pando does that, or " +
+              '<a href="' + esc(REGISTER_URL || "index.php?action=fqs&act=addcorpus") + '" target="_top">register it now</a>.'
+          : "<strong>Authenticated, but catalog is empty</strong>" +
+              "This FQS database has no corpora yet. Use <em>New</em> or upsert via the API.",
         true
       );
       return;
@@ -699,6 +707,16 @@
       c.capabilities && typeof c.capabilities === "object" && !Array.isArray(c.capabilities)
         ? c.capabilities
         : {};
+    $("f-description").value = typeof formSettings.description === "string" ? formSettings.description : "";
+    const teitok = !!formSettings.teitok_project_root || /teitok/i.test(c.source_kind || "");
+    $("f-description-note").textContent = teitok
+      ? "For a TEITOK project, its own page \"description\" (Pages/description.html) comes first; this text is used when it has none."
+      : "";
+    if (SCOPE === "project") {
+      // the entry of this project: it stays where it is
+      $("f-id").readOnly = true;
+      $("f-project_root").readOnly = true;
+    }
     const settingsOut = $("f-settings-out");
     const capsOut = $("f-capabilities-out");
     if (settingsOut) settingsOut.textContent = JSON.stringify(formSettings, null, 2);
@@ -739,8 +757,15 @@
       supports_xml: $("f-supports_xml").checked,
       labels: normalizeLabelList(formLabels),
       http_allowed_operations: split($("f-ops").value),
-      // Preserve blobs loaded with the form; do not accept free-form JSON edits here.
-      settings: formSettings && typeof formSettings === "object" ? formSettings : {},
+      // Preserve blobs loaded with the form; do not accept free-form JSON edits here
+      // (apart from the description).
+      settings: (() => {
+        const st = Object.assign({}, formSettings && typeof formSettings === "object" ? formSettings : {});
+        const d = $("f-description").value.trim();
+        if (d) st.description = d;
+        else delete st.description;
+        return st;
+      })(),
       capabilities:
         formCapabilities && typeof formCapabilities === "object" ? formCapabilities : {},
     };
@@ -2200,6 +2225,21 @@
   document.querySelectorAll(".tab").forEach((b) => {
     b.addEventListener("click", () => setTab(b.dataset.tab));
   });
+
+  if (SCOPE === "project") {
+    // only this project's corpus: no server-wide tabs, no new entries
+    document.querySelectorAll(".tab").forEach((b) => {
+      if (b.dataset.tab !== "edit") b.hidden = true;
+    });
+    const nb = $("btn-new");
+    if (nb) nb.hidden = true;
+    const h1 = document.querySelector("header.top h1");
+    if (h1) h1.textContent = "Corpus listing";
+    const sub = document.querySelector("header.top .muted");
+    if (sub) sub.textContent = "How this project's corpus appears in the corpus lists of this server (FQS catalogue)";
+    const lh = document.querySelector("#tab-edit .list-panel h2");
+    if (lh) lh.textContent = "This corpus";
+  }
 
   try {
     localStorage.removeItem(TOKEN_KEY);

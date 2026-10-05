@@ -7024,8 +7024,38 @@ fn mark_reindex_job_finished(
             "indexed",
             &json!({"message": message}),
         )?;
+        // the catalogue follows the new index: features and languages, size, date
+        if let Err(e) = refresh_catalog_after_reindex(conn, &existing.corpus_id) {
+            eprintln!("[fqs] catalogue update after reindex of {}: {e:#}", existing.corpus_id);
+        }
     }
     get_reindex_job(conn, job_id)
+}
+
+/// After a successful reindex: detect the corpus's features and languages again (the
+/// same as `fqs corpora enrich`), take its size from the new Pando index, and note the
+/// update time — so that corpus lists show what the corpus now contains.
+fn refresh_catalog_after_reindex(conn: &Connection, corpus_id: &str) -> Result<()> {
+    let mut entry = get_corpus(conn, corpus_id)?;
+    let _ = enrich::enrich_corpus_entry(&mut entry);
+    if let Ok(dir) = resolve_pando_index_dir(&entry) {
+        if let Ok(info) = fs::read_to_string(dir.join("corpus.info")) {
+            if let Some(n) = info
+                .lines()
+                .find_map(|l| l.strip_prefix("size="))
+                .and_then(|v| v.trim().parse::<i64>().ok())
+            {
+                entry.corpus_size = Some(n);
+                entry.corpus_size_updated_at = Some(now_rfc3339());
+            }
+        }
+    }
+    entry.last_corpus_update_at = Some(now_rfc3339());
+    upsert_corpus(conn, &entry)
+}
+
+fn now_rfc3339() -> String {
+    time::OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default()
 }
 
 fn list_corpora(
@@ -8078,7 +8108,7 @@ fn raw_entries_from_json(payload: &str) -> Vec<Value> {
 }
 
 /// The admin's choices inside settings, which registration payloads from TEITOK do not
-/// carry: `fcs.enabled`, `kontext.{corpname,public_url,url}`.
+/// carry: `fcs.enabled`, `kontext.{corpname,public_url,url}` (and `description`, below).
 const ADMIN_OWNED_SETTINGS: &[(&str, &str)] = &[
     ("fcs", "enabled"),
     ("kontext", "corpname"),
@@ -8106,6 +8136,15 @@ fn merge_upsert_entry(old: &CorpusEntry, new: &CorpusEntry, raw: &Value) -> Resu
     let mut merged: CorpusEntry = serde_json::from_value(new_v)?;
     if !merged.settings.is_object() {
         merged.settings = json!({});
+    }
+    // the description written in the admin (or in the TEITOK project and sent along)
+    if let Some(d) = old.settings.get("description") {
+        let set_in_payload = raw_obj.get("settings").and_then(|s| s.get("description")).is_some();
+        if !set_in_payload {
+            if let Some(o) = merged.settings.as_object_mut() {
+                o.insert("description".into(), d.clone());
+            }
+        }
     }
     for (block, key) in ADMIN_OWNED_SETTINGS {
         let Some(old_val) = old.settings.get(*block).and_then(|b| b.get(*key)) else {
