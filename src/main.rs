@@ -5126,6 +5126,17 @@ fn browse_corpus_dto(c: &CorpusEntry) -> Value {
         &c.capabilities,
     )
     .into_iter()
+    // a frontend switched off in the corpus settings (kontext.enabled = false, …) is not offered
+    .filter(|h| {
+        let block = match h.kind.as_str() {
+            "cqpweb" => c.settings.get("cqpweb").or_else(|| c.settings.get("cqp_web")),
+            k => c.settings.get(k),
+        };
+        block
+            .and_then(|b| b.get("enabled"))
+            .and_then(Value::as_bool)
+            != Some(false)
+    })
     .map(|h| {
         json!({
             "kind": h.kind,
