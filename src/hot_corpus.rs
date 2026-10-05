@@ -286,6 +286,25 @@ impl HotCorpusManager {
         self.lib.request(ctx, method, path, query, body)
     }
 
+    /// TEITOK XML around corpus spans from the project's xidx (see PandoLib::xidx_fragments).
+    pub fn xidx_fragments(
+        &self,
+        corpus_id: &str,
+        project_root: &Path,
+        spans: &[(i64, i64)],
+        context_scope: &str,
+        context: i32,
+    ) -> Result<Vec<Option<(Option<String>, String)>>> {
+        let ctx = {
+            let g = self.inner.lock().expect("hcm lock");
+            let e = g
+                .get(corpus_id)
+                .ok_or_else(|| anyhow!("corpus '{corpus_id}' is not warm (acquire first)"))?;
+            e.ctx
+        };
+        self.lib.xidx_fragments(ctx, project_root, spans, context_scope, context)
+    }
+
     /// Evict down to `max_warm`, choosing each victim without touching the
     /// engine: the least-recently-used unreferenced entry (FQS-local
     /// `last_used` only). `busy()` is checked once per entry actually removed —
@@ -423,6 +442,76 @@ impl HotGuard {
         self.hcm
             .request(&self.corpus_id, method, path, query, body)
     }
+
+    pub fn xidx_fragments(
+        &self,
+        project_root: &Path,
+        spans: &[(i64, i64)],
+        context_scope: &str,
+        context: i32,
+    ) -> Result<Vec<Option<(Option<String>, String)>>> {
+        self.hcm.xidx_fragments(&self.corpus_id, project_root, spans, context_scope, context)
+    }
+}
+
+/// Real TEITOK XML for the hits of a pando-server /query answer (and both sides of its
+/// aligned pairs), from the project's xidx: `fragment` / `context_xml` / `context_data`,
+/// as flexicorp-pando gives them, so KWIC rows show the XML and highlight by token id.
+/// Leaves hits that already carry a fragment (synthetic "fragment": true mode) alone.
+pub fn add_xidx_fragments(
+    guard: &HotGuard,
+    project_root: &Path,
+    engine: &mut Value,
+    context_scope: &str,
+    context: i32,
+) -> Result<usize> {
+    let Some(result) = engine.get_mut("result") else { return Ok(0) };
+    // the hits to fill, as JSON pointers below `result`
+    let mut targets: Vec<String> = Vec::new();
+    if let Some(hits) = result.get("hits").and_then(Value::as_array) {
+        for i in 0..hits.len() {
+            targets.push(format!("/hits/{i}"));
+        }
+    }
+    if let Some(pairs) = result.get("pairs").and_then(Value::as_array) {
+        for i in 0..pairs.len() {
+            targets.push(format!("/pairs/{i}/source"));
+            targets.push(format!("/pairs/{i}/target"));
+        }
+    }
+    let mut spans = Vec::new();
+    let mut slots = Vec::new();
+    for t in &targets {
+        let Some(h) = result.pointer(t) else { continue };
+        if h.get("fragment").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) {
+            continue;
+        }
+        let (Some(a), Some(b)) = (
+            h.get("match_start").and_then(Value::as_i64),
+            h.get("match_end").and_then(Value::as_i64),
+        ) else {
+            continue;
+        };
+        spans.push((a, b));
+        slots.push(t.clone());
+    }
+    if spans.is_empty() {
+        return Ok(0);
+    }
+    let frags = guard.xidx_fragments(project_root, &spans, context_scope, context)?;
+    let mut n = 0;
+    for (slot, f) in slots.iter().zip(frags) {
+        let (Some((doc, xml)), Some(h)) = (f, result.pointer_mut(slot)) else { continue };
+        let Some(o) = h.as_object_mut() else { continue };
+        o.insert("fragment".into(), Value::String(xml.clone()));
+        o.insert("context_xml".into(), Value::String(xml.clone()));
+        o.insert("context_data".into(), Value::String(xml));
+        if let Some(d) = doc {
+            o.entry("doc_xml").or_insert(Value::String(d));
+        }
+        n += 1;
+    }
+    Ok(n)
 }
 
 impl Drop for HotGuard {

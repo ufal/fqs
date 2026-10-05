@@ -3,6 +3,7 @@
 //! api_version >= 2: flexicorp_pando_request
 //! api_version >= 3: busy, idle_seconds, build_json (ServerApi embedding contract)
 //! api_version >= 4: open_opts (server options JSON: limits by tier, sessions, …)
+//! api_version >= 5: xidx_fragments (TEITOK XML around hits from the project's xidx)
 
 use anyhow::{anyhow, bail, Context, Result};
 use libloading::{Library, Symbol};
@@ -30,6 +31,14 @@ type FreeFn = unsafe extern "C" fn(*mut c_void);
 type LastErrorFn = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 type BusyFn = unsafe extern "C" fn(*mut c_void) -> usize;
 type IdleSecondsFn = unsafe extern "C" fn(*mut c_void) -> c_double;
+type XidxFragmentsFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const c_char,
+    *const i64,
+    usize,
+    *const c_char,
+    c_int,
+) -> *mut c_char;
 
 pub struct PandoLib {
     _lib: Library,
@@ -43,6 +52,7 @@ pub struct PandoLib {
     last_error: LastErrorFn,
     busy_fn: Option<BusyFn>,
     idle_seconds_fn: Option<IdleSecondsFn>,
+    xidx_fragments_fn: Option<XidxFragmentsFn>,
     cached_api_version: i32,
 }
 
@@ -93,6 +103,11 @@ impl PandoLib {
             } else {
                 None
             };
+            let xidx_fragments_fn = if ver >= 5 {
+                lib.get::<XidxFragmentsFn>(b"flexicorp_pando_xidx_fragments\0").ok().map(|s| *s)
+            } else {
+                None
+            };
             if ver >= 3 && (busy_fn.is_none() || idle_seconds_fn.is_none()) {
                 bail!(
                     "libflexicorp_pando at {} claims api_version {} but missing busy/idle_seconds",
@@ -111,6 +126,7 @@ impl PandoLib {
                 last_error: *last_error,
                 busy_fn,
                 idle_seconds_fn,
+                xidx_fragments_fn,
                 cached_api_version: ver,
                 _lib: lib,
             }))
@@ -236,6 +252,44 @@ impl PandoLib {
             let val: Value = serde_json::from_str(&s)
                 .with_context(|| format!("pando response is not JSON (status {status}): {s}"))?;
             Ok((status as i32, val))
+        }
+    }
+
+    /// The project's XML around each `(start, end)` corpus span, from its xidx: one entry per
+    /// span, `None` where xidx has none (or the library cannot do it).
+    pub fn xidx_fragments(
+        &self,
+        ctx: *mut c_void,
+        project_root: &Path,
+        spans: &[(i64, i64)],
+        context_scope: &str,
+        context: i32,
+    ) -> Result<Vec<Option<(Option<String>, String)>>> {
+        let Some(f) = self.xidx_fragments_fn else {
+            return Ok(vec![None; spans.len()]);
+        };
+        let root_c = CString::new(project_root.to_string_lossy().as_bytes())?;
+        let scope_c = CString::new(context_scope)?;
+        let flat: Vec<i64> = spans.iter().flat_map(|(a, b)| [*a, *b]).collect();
+        unsafe {
+            let ptr = f(ctx, root_c.as_ptr(), flat.as_ptr(), spans.len(), scope_c.as_ptr(), context as c_int);
+            if ptr.is_null() {
+                let err = self.last_error_ptr(ctx);
+                bail!("flexicorp_pando_xidx_fragments returned null: {err}");
+            }
+            let s = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+            (self.free)(ptr.cast());
+            let v: Value = serde_json::from_str(&s).context("xidx fragments are not JSON")?;
+            let arr = v.get("fragments").and_then(Value::as_array).cloned().unwrap_or_default();
+            let mut out = Vec::with_capacity(spans.len());
+            for i in 0..spans.len() {
+                out.push(arr.get(i).and_then(|f| {
+                    let frag = f.get("fragment")?.as_str()?.to_string();
+                    let doc = f.get("doc_id").and_then(Value::as_str).map(str::to_string);
+                    Some((doc, frag))
+                }));
+            }
+            Ok(out)
         }
     }
 

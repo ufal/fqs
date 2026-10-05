@@ -39,7 +39,8 @@ mod services;
 mod frontends;
 
 use hot_corpus::{
-    pando_query_body, wrap_pando_server_as_fqs_raw, HotCorpusConfig, HotCorpusManager, HotGuard,
+    add_xidx_fragments, pando_query_body, wrap_pando_server_as_fqs_raw, HotCorpusConfig,
+    HotCorpusManager, HotGuard,
 };
 use limits::{set_engine_tier, Caller, Limits};
 use activity::{ActivityLog, UserMode};
@@ -7584,9 +7585,28 @@ fn run_pando_query(
             }
         }
         let body = pando_query_body(query_text, start, size, window, sentence, total_mode, &extra);
-        let (status, engine) = guard.request("POST", "/query", "", &body)?;
+        let (status, mut engine) = guard.request("POST", "/query", "", &body)?;
         if status >= 400 {
             return Err(EngineHttpError { status: status as u16, payload: engine }.into());
+        }
+        // a TEITOK project: the hits' own XML from its xidx (as the flexicorp-pando command
+        // line gives it), unless plain text was asked for or the hits carry synthetic XML
+        let wants_xml = query_options
+            .and_then(|q| q.context_format.as_deref())
+            .map(|f| !f.trim().eq_ignore_ascii_case("text"))
+            .unwrap_or(true);
+        if wants_xml && !extra.contains_key("fragment") {
+            let root = &corpus.project_root;
+            if root.join("xidx").join("tokens.bin").is_file() {
+                let scope = query_options
+                    .and_then(|q| q.context_scope.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("s");
+                if let Err(e) = add_xidx_fragments(&guard, root, &mut engine, scope, window.unwrap_or(5) as i32) {
+                    eprintln!("[fqs] {}: xidx fragments: {e:#}", corpus.id);
+                }
+            }
         }
         let payload = wrap_pando_server_as_fqs_raw(engine);
         return Ok(PandoExecResult {
