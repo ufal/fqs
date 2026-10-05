@@ -271,38 +271,45 @@ fn detect_from_disk(root: &Path, entry: &CorpusEntry) -> Detected {
         }
     }
 
-    // Feature folders / TEITOK layout
-    if dir_nonempty(&root.join("Audio"))
-        || dir_nonempty(&root.join("audio"))
-        || dir_nonempty(&root.join("Media"))
-        || dir_nonempty(&root.join("media"))
+    // Media and page images: only real evidence counts — a non-empty folder, or media,
+    // time stamps and facsimile references in the documents themselves. The words in
+    // settings.xml do not: stock settings (teiHeader fields, menus, help texts) mention
+    // "audio" and "facsimile" in projects that have neither.
+    let xml_ev = sample_xml_evidence(root);
+    let media_dir = dir_nonempty(&root.join("Media")) || dir_nonempty(&root.join("media"));
+    if dir_nonempty(&root.join("Audio")) || dir_nonempty(&root.join("audio")) || xml_ev.audio
+        || (media_dir && !xml_ev.video)
     {
         features.push("spoken".into());
-        notes.push("spoken: Audio/Media folder".into());
+        notes.push(if xml_ev.audio {
+            "spoken: audio media in the documents".to_string()
+        } else {
+            "spoken: Audio/Media folder".to_string()
+        });
     }
-    if dir_nonempty(&root.join("Facsimile"))
-        || dir_nonempty(&root.join("facsimile"))
-        || settings_xml_mentions(root, &["facsimile", "pageimg", "page_image"])
-        || settings_xml_mentions(root, &["folder=\"facsimile\"", "folder='facsimile'"])
-    {
+    if dir_nonempty(&root.join("Facsimile")) || dir_nonempty(&root.join("facsimile")) || xml_ev.facs {
         features.push("facsimile".into());
-        notes.push("facsimile: Facsimile folder or settings".into());
+        notes.push(if xml_ev.facs {
+            "facsimile: facs / surface references in the documents".to_string()
+        } else {
+            "facsimile: Facsimile folder".to_string()
+        });
     }
     // Do not treat Pages/ as facsimile — that is TEITOK site PHP/HTML.
-    if dir_nonempty(&root.join("Video"))
-        || dir_nonempty(&root.join("video"))
-        || settings_xml_mentions(root, &["folder=\"video\"", "folder='video'", ".mp4", ".webm"])
-    {
+    if dir_nonempty(&root.join("Video")) || dir_nonempty(&root.join("video")) || xml_ev.video {
         features.push("video".into());
-        notes.push("video: Video folder or media extensions".into());
+        notes.push("video: Video folder or video media in the documents".into());
     }
     if settings_xml_mentions(
         root,
         &[
+            // not the bare words "geolocation" / "latitude": the stock teiHeader template
+            // describes its place fields as "Geolocation coordinates (lat lng)"
             "<geomap",
-            "geolocation",
-            "latitude",
-            "longitude",
+            "key=\"latitude\"",
+            "key='latitude'",
+            "key=\"longitude\"",
+            "key='longitude'",
             "key=\"lat\"",
             "key='lat'",
             "key=\"lon\"",
@@ -344,23 +351,10 @@ fn detect_from_disk(root: &Path, entry: &CorpusEntry) -> Detected {
         // not a browse "feature" chip necessarily; drives interfaces
     }
 
-    // CQP settings spoken cues
-    if settings_xml_mentions(root, &["wavesurfer", "chunk_url", "u_media", "audio"])
-        && !features.iter().any(|f| f == "spoken")
-    {
-        features.push("spoken".into());
-        notes.push("spoken: settings media fields".into());
-    }
-
-    // audio whose transcription has times (utterances with start / end, a wave view)
-    if features.iter().any(|f| f == "spoken")
-        && settings_xml_mentions(
-            root,
-            &["key=\"start\"", "key='start'", "key=\"begin\"", "key='begin'", "wavesurfer", "timeline", "chunk_url"],
-        )
-    {
+    // audio whose transcription has times (utterances or tokens with start / end, a timeline)
+    if features.iter().any(|f| f == "spoken") && xml_ev.timed {
         features.push("timealigned".into());
-        notes.push("timealigned: start/end times or a wave view in settings".into());
+        notes.push("timealigned: start / end times in the documents".into());
     }
     // documents described by dialect / variety
     if settings_xml_mentions(root, &["key=\"dialect\"", "key='dialect'", "display=\"dialect", "key=\"variety\"", "key='variety'"]) {
@@ -560,6 +554,88 @@ fn sample_xmlfiles_langs(root: &Path) -> Vec<String> {
     out
 }
 
+/// What a sample of the documents shows about media and page images.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) struct XmlEvidence {
+    pub audio: bool,
+    pub video: bool,
+    pub timed: bool,
+    pub facs: bool,
+}
+
+/// Look at up to 30 XML files under xmlfiles/ (the first 512 KB of each) for `<media>`
+/// elements (audio or video by mime type or extension), start / begin times, and facsimile
+/// references (`facs=`, `<facsimile>`, `<surface>`, `bbox=`).
+fn sample_xml_evidence(root: &Path) -> XmlEvidence {
+    use std::io::Read;
+    let mut ev = XmlEvidence::default();
+    let mut stack = vec![root.join("xmlfiles")];
+    let mut seen = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        let mut entries: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+        entries.sort();
+        for p in entries {
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+            if ext != "xml" && ext != "tei" {
+                continue;
+            }
+            let Ok(f) = fs::File::open(&p) else { continue };
+            let mut buf = Vec::new();
+            if f.take(512 * 1024).read_to_end(&mut buf).is_err() {
+                continue;
+            }
+            let txt = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+            xml_evidence_in(&txt, &mut ev);
+            seen += 1;
+            if seen >= 30 || (ev.audio && ev.video && ev.timed && ev.facs) {
+                return ev;
+            }
+        }
+    }
+    ev
+}
+
+/// The evidence in one document's (lower-cased) text.
+pub(crate) fn xml_evidence_in(txt: &str, ev: &mut XmlEvidence) {
+    for (i, _) in txt.match_indices("<media") {
+        let tag = &txt[i..txt[i..].find('>').map(|e| i + e).unwrap_or(txt.len())];
+        if ["audio", ".wav", ".mp3", ".ogg", ".m4a", ".flac"].iter().any(|n| tag.contains(n)) {
+            ev.audio = true;
+        }
+        if ["video", ".mp4", ".webm", ".mov"].iter().any(|n| tag.contains(n)) {
+            ev.video = true;
+        }
+    }
+    for key in [" start=\"", " start='", " begin=\"", " begin='"] {
+        for (i, _) in txt.match_indices(key) {
+            if txt[i + key.len()..].chars().next().is_some_and(|c| c.is_ascii_digit()) {
+                ev.timed = true;
+                break;
+            }
+        }
+    }
+    if txt.contains("<timeline") {
+        ev.timed = true;
+    }
+    for key in [" facs=\"", " facs='"] {
+        for (i, _) in txt.match_indices(key) {
+            let next = txt[i + key.len()..].chars().next();
+            if next.is_some_and(|c| c != '"' && c != '\'') {
+                ev.facs = true;
+                break;
+            }
+        }
+    }
+    if txt.contains("<facsimile") || txt.contains("<surface") || txt.contains(" bbox=\"") {
+        ev.facs = true;
+    }
+}
+
 fn settings_xml_mentions(root: &Path, needles: &[&str]) -> bool {
     let path = root.join("Resources/settings.xml");
     let Ok(txt) = fs::read_to_string(path) else {
@@ -750,5 +826,25 @@ mod tests {
             &["key=\"country_or\"", "xpath=\"@country"]
         ));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn xml_evidence_needs_the_documents_not_settings_words() {
+        let mut ev = XmlEvidence::default();
+        // a plain written document: a header describing recordings in general, empty facs
+        xml_evidence_in(
+            &"<TEI><teiHeader><note>audio/video recording; facsimile</note></teiHeader><text><s id=\"s1\"><tok facs=\"\">x</tok></s></text></TEI>"
+                .to_ascii_lowercase(),
+            &mut ev,
+        );
+        assert_eq!(ev, XmlEvidence::default());
+        xml_evidence_in(
+            &"<recordingStmt><media mimeType=\"audio/wav\" url=\"a.wav\"/></recordingStmt><u start=\"1.25\" end=\"2.5\">".to_ascii_lowercase(),
+            &mut ev,
+        );
+        assert!(ev.audio && ev.timed && !ev.video && !ev.facs);
+        let mut ev2 = XmlEvidence::default();
+        xml_evidence_in(&"<pb n=\"1\" facs=\"page1.jpg\"/>".to_ascii_lowercase(), &mut ev2);
+        assert!(ev2.facs && !ev2.audio);
     }
 }

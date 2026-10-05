@@ -480,6 +480,8 @@ cargo run -- corpora validate --full --strict-full --enrich --id my_corpus
 
 `--reset-features` replaces the `feature:` labels instead of only adding to them (the report lists `removed_labels`); other labels stay.
 
+Audio (`spoken`, `timealigned`), video and facsimile come only from real evidence: a non-empty `Audio/`, `Media/`, `Video/` or `Facsimile/` folder, or a sample of the documents (up to 30 files under `xmlfiles/`): `<media>` with an audio or video type or extension, `start=` / `begin=` times or `<timeline>`, and `facs=`, `<facsimile>`, `<surface>` or `bbox=`. Words in `settings.xml` do not count, because stock settings (the teiHeader template, menus) mention audio, facsimiles and geolocation in projects that have none. Geolocation needs a `<geomap>`, coordinate or country fields (`key="lat"`, …), `Resources/geo.json` or a `Geo/` folder.
+
 Validation records `corpus_size`: the `size=` of the Pando index's `corpus.info` (also for a quick validation), else, in `--full` mode, the total of a small probe (`cqp` corpora: a CQP probe; `pando`: `flexicorp-pando` with `settings.pando_probe_query`, default `[word=".*"]`). Pando entries get this probe even when `interfaces` is empty. Saving an entry without a size (registration, scan, admin form) and a reindex take it from `corpus.info` too.
 
 ## Database
