@@ -872,6 +872,10 @@ struct EnrichArgs {
     /// Dry-run: print detections without writing the catalogue
     #[arg(long, default_value_t = false)]
     dry_run: bool,
+    /// Replace the feature labels (feature:…) with what is detected now, instead of only
+    /// adding new ones (labels detected earlier that no longer apply go; other labels stay)
+    #[arg(long, default_value_t = false)]
+    reset_features: bool,
     #[command(flatten)]
     db: DbPathArg,
 }
@@ -1436,6 +1440,11 @@ fn handle_corpora(args: CorporaArgs) -> Result<()> {
                     let raw = raws.get(i).cloned().unwrap_or(Value::Null);
                     *entry = merge_upsert_entry(&old, entry, &raw)?;
                 }
+                // a new entry, or one without labels yet (registered from TEITOK before this):
+                // its languages and features from the project, as `corpora enrich` finds them
+                if !existed || entry.labels.is_empty() {
+                    let _ = enrich::enrich_corpus_entry(entry);
+                }
                 upsert_corpus(&conn, entry)?;
                 if existed {
                     updated_ids.push(entry.id.clone());
@@ -1521,7 +1530,19 @@ fn handle_corpora(args: CorporaArgs) -> Result<()> {
             let mut reports = Vec::new();
             let mut written = 0usize;
             for mut corpus in corpora {
-                let report = enrich::enrich_corpus_entry(&mut corpus);
+                let before = corpus.labels.clone();
+                if args.reset_features {
+                    corpus.labels.retain(|l| !l.to_ascii_lowercase().starts_with("feature:"));
+                }
+                let mut report = enrich::enrich_corpus_entry(&mut corpus);
+                if args.reset_features {
+                    let lower = |v: &Vec<String>| v.iter().map(|x| x.to_ascii_lowercase()).collect::<Vec<_>>();
+                    let (b, a) = (lower(&before), lower(&corpus.labels));
+                    // only what really changed: labels re-detected are not "added"
+                    report.added_labels.retain(|l| !b.contains(&l.to_ascii_lowercase()));
+                    report.removed_labels = before.iter().filter(|l| !a.contains(&l.to_ascii_lowercase())).cloned().collect();
+                    report.changed = report.changed || !report.removed_labels.is_empty();
+                }
                 if report.changed && !args.dry_run {
                     upsert_corpus(&conn, &corpus)?;
                     written += 1;
@@ -7039,20 +7060,23 @@ fn mark_reindex_job_finished(
 fn refresh_catalog_after_reindex(conn: &Connection, corpus_id: &str) -> Result<()> {
     let mut entry = get_corpus(conn, corpus_id)?;
     let _ = enrich::enrich_corpus_entry(&mut entry);
-    if let Ok(dir) = resolve_pando_index_dir(&entry) {
-        if let Ok(info) = fs::read_to_string(dir.join("corpus.info")) {
-            if let Some(n) = info
-                .lines()
-                .find_map(|l| l.strip_prefix("size="))
-                .and_then(|v| v.trim().parse::<i64>().ok())
-            {
-                entry.corpus_size = Some(n);
-                entry.corpus_size_updated_at = Some(now_rfc3339());
-            }
-        }
+    if let Some(n) = pando_index_size(&entry) {
+        entry.corpus_size = Some(n);
+        entry.corpus_size_updated_at = Some(now_rfc3339());
     }
     entry.last_corpus_update_at = Some(now_rfc3339());
     upsert_corpus(conn, &entry)
+}
+
+/// Tokens in the corpus's Pando index (`size=` in its corpus.info): exact and cheap,
+/// unlike counting a query's hits (the probe query needs a `word` attribute).
+fn pando_index_size(entry: &CorpusEntry) -> Option<i64> {
+    let dir = resolve_pando_index_dir(entry).ok()?;
+    let info = fs::read_to_string(dir.join("corpus.info")).ok()?;
+    info.lines()
+        .find_map(|l| l.strip_prefix("size="))
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
 }
 
 fn now_rfc3339() -> String {
@@ -7119,6 +7143,14 @@ fn get_corpus(conn: &Connection, id: &str) -> Result<CorpusEntry> {
 }
 
 fn upsert_corpus(conn: &Connection, entry: &CorpusEntry) -> Result<()> {
+    // no size given (registration from TEITOK, a scan, the admin form): the Pando index's
+    let (corpus_size, corpus_size_updated_at) = match entry.corpus_size {
+        Some(_) => (entry.corpus_size, entry.corpus_size_updated_at.clone()),
+        None => match pando_index_size(entry) {
+            Some(n) => (Some(n), Some(now_rfc3339())),
+            None => (None, None),
+        },
+    };
     conn.execute(
         r#"
 INSERT INTO corpora
@@ -7179,8 +7211,8 @@ ON CONFLICT(id) DO UPDATE SET
             serde_json::to_string(&entry.settings)?,
             entry.first_corpus_update_at,
             entry.last_corpus_update_at,
-            entry.corpus_size,
-            entry.corpus_size_updated_at,
+            corpus_size,
+            corpus_size_updated_at,
             entry.last_validated_at,
             entry.last_validation_ok.map(|v| if v { 1 } else { 0 }),
             entry.last_validation_message,
@@ -7255,7 +7287,8 @@ fn validate_corpus(corpus: &CorpusEntry, full: bool, strict_full: bool) -> Valid
             Ok(ref b) if b == "pando" => match run_pando_probe(corpus) {
                 Ok(size) => {
                     query_probe = "ok".to_string();
-                    corpus_size = size;
+                    // the index's own size; the probe's hit count only as a fallback
+                    corpus_size = pando_index_size(corpus).or(size);
                     message = "pando query probe succeeded".to_string();
                 }
                 Err(err) => {
@@ -7296,6 +7329,15 @@ fn validate_corpus(corpus: &CorpusEntry, full: bool, strict_full: bool) -> Valid
                 ok = false;
                 message = format!("backend resolution failed: {err}");
             }
+        }
+    }
+
+    // the size from the Pando index itself: also for a quick validation (no query), and
+    // when the probe gives none
+    if corpus_size.is_none() {
+        if let Some(n) = pando_index_size(corpus) {
+            checks.push(format!("pando index: {n} tokens (corpus.info)"));
+            corpus_size = Some(n);
         }
     }
 

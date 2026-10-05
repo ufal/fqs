@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 pub struct EnrichReport {
     pub id: String,
     pub added_labels: Vec<String>,
+    /// `fqs corpora enrich --reset-features`: feature labels that no longer apply
+    pub removed_labels: Vec<String>,
     pub added_interfaces: Vec<String>,
     pub features: Vec<String>,
     pub languages: Vec<String>,
@@ -350,6 +352,22 @@ fn detect_from_disk(root: &Path, entry: &CorpusEntry) -> Detected {
         notes.push("spoken: settings media fields".into());
     }
 
+    // audio whose transcription has times (utterances with start / end, a wave view)
+    if features.iter().any(|f| f == "spoken")
+        && settings_xml_mentions(
+            root,
+            &["key=\"start\"", "key='start'", "key=\"begin\"", "key='begin'", "wavesurfer", "timeline", "chunk_url"],
+        )
+    {
+        features.push("timealigned".into());
+        notes.push("timealigned: start/end times or a wave view in settings".into());
+    }
+    // documents described by dialect / variety
+    if settings_xml_mentions(root, &["key=\"dialect\"", "key='dialect'", "display=\"dialect", "key=\"variety\"", "key='variety'"]) {
+        features.push("dialect".into());
+        notes.push("dialect: dialect / variety metadata".into());
+    }
+
     for lang in &languages {
         labels.push(format!("lang:{lang}"));
     }
@@ -627,6 +645,7 @@ pub fn report_json(r: &EnrichReport) -> Value {
         "id": r.id,
         "changed": r.changed,
         "added_labels": r.added_labels,
+        "removed_labels": r.removed_labels,
         "added_interfaces": r.added_interfaces,
         "languages": r.languages,
         "features": r.features,

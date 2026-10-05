@@ -469,15 +469,18 @@ Strict full mode (mark missing query probe as failure):
 cargo run -- corpora validate --full --strict-full
 ```
 
-One-shot catalogue enrich (languages; spoken/facsimile/video/geo/deps/parallel/ner/ud features; interfaces — additive; see [FQS-TEITOK-CORPORA-LISTING.md](../dev/FQS-TEITOK-CORPORA-LISTING.md) §1.1b):
+One-shot catalogue enrich (languages; spoken/timealigned/facsimile/video/geo/dialect/deps/parallel/ner/ud features; interfaces — additive; see [FQS-TEITOK-CORPORA-LISTING.md](../dev/FQS-TEITOK-CORPORA-LISTING.md) §1.1b):
 
 ```bash
 cargo run -- corpora enrich --dry-run
 cargo run -- corpora enrich --id my_corpus
+cargo run -- corpora enrich --id my_corpus --reset-features   # feature labels = what is detected now
 cargo run -- corpora validate --full --strict-full --enrich --id my_corpus
 ```
 
-In `--full` mode, `cqp` corpora run a small CQP probe; `pando` corpora run `flexicorp-pando` and persist the JSON `total` as `corpus_size` (override the probe CQL with `settings.pando_probe_query`, default `[word=".*"]`). Pando entries get this probe even when `interfaces` is empty.
+`--reset-features` replaces the `feature:` labels instead of only adding to them (the report lists `removed_labels`); other labels stay.
+
+Validation records `corpus_size`: the `size=` of the Pando index's `corpus.info` (also for a quick validation), else, in `--full` mode, the total of a small probe (`cqp` corpora: a CQP probe; `pando`: `flexicorp-pando` with `settings.pando_probe_query`, default `[word=".*"]`). Pando entries get this probe even when `interfaces` is empty. Saving an entry without a size (registration, scan, admin form) and a reindex take it from `corpus.info` too.
 
 ## Database
 
