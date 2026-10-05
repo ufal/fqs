@@ -127,9 +127,9 @@ The admin listener can stay on localhost; no proxy rule or token handling needed
   - `POST /admin/api/self/restart` — only when `fqs.restart` is set in `/etc/fqs/fqs.json` (same methods as frontend restart)
   - `GET /admin/api/health` — full diagnostics (db path, slots, pando, limits)
   - `GET /admin/api/settings` — **report-only** effective process settings (bind, db, auth trust, limits file, warm pool, FCS, logs, scan allowlist) with CLI/`fqs.json` how-to-change hints; no secret values; not editable via API
-  - `GET /admin/api/frontends` — frontend kinds / instances; `GET /admin/api/coverage` — KonText corplist gaps + FCS undecided
+  - `GET /admin/api/frontends` — frontend kinds / instances; `GET /admin/api/coverage` — KonText corplist gaps + FCS not-yet-enabled
   - `POST /admin/api/frontends/{id}/corplist/append` — append `<corpus ident=…/>` to allowlisted `frontends[].corplist` (optional `corpus_id` syncs `settings.kontext.corpname`)
-  - `POST /admin/api/corpora/{id}/fcs-enabled` — body `{ "enabled": true|false }` for FCS opt-in/out
+  - `POST /admin/api/corpora/{id}/fcs-enabled` — body `{ "enabled": true|false }` for FCS Add / Exclude
   - `GET /admin/api/activity` — activity-log overview when `--activity-log` / `FQS_ACTIVITY_LOG` is set (`?event=interesting|query|warm|admin|all&limit=&corpus=`); summary + recent events from a tailed window
 - **Behind a path-stripping proxy** (e.g. hub `/services/test-kontext/fqsadmin/` → `/fqsadmin/`): set `FQS_ADMIN_BASE_HREF=/services/test-kontext/fqsadmin/` so `index.html` gets a `<base href>` and CSS/JS/API resolve under that prefix. Prefer a trailing-slash public URL.
 - **Audit:** each write (upsert, supersede/deactivate, validate, scan, restart) appends an activity-log line when `--activity-log` is set (`by`, corpus/frontend id, before/after hash where applicable).
@@ -138,8 +138,10 @@ The admin listener can stay on localhost; no proxy rule or token handling needed
 - **Scan allowlist:** `FQS_SCAN_ROOTS` / `fqs.json` `scan_roots` (see `fqs.example.json`). Binary defaults are only generic paths (`/srv/teitok`, `/data/corpora`, `~/corpora`, …) — not developer trees.
 
 Example `frontends` entry in `/etc/fqs/fqs.json` (restart for gunicorn/KonText).
-Set `corplist` so the admin **Frontends → Coverage gaps** panel can find TEITOK/pando
-corpora missing from KonText and optionally append them (allowlisted path only):
+Set `corplist` so the admin Frontends tab can find TEITOK corpora missing from
+KonText and offer **Add to KonText** (allowlisted path only). If omitted, FQS
+also looks for `/opt/kontext/conf/corplist.xml` and the path in KonText
+`config.xml`, or `FQS_KONTEXT_CORPLIST`:
 
 ```json
 {

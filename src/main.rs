@@ -4448,6 +4448,7 @@ async fn http_admin_frontends(
 ) -> admin::AdminResult<Json<Value>> {
     let _ = admin::require_admin(&state.limits, &headers)?;
     let mut hints = Vec::new();
+    let mut corpus_index = serde_json::Map::new();
     for c in state.catalog.list(None, true, None) {
         let project_root = c.project_root.to_string_lossy();
         hints.extend(services::hints_from_catalog_row(
@@ -4460,10 +4461,40 @@ async fn http_admin_frontends(
             Some(project_root.as_ref()),
             &c.capabilities,
         ));
+        let fcs_enabled = c
+            .settings
+            .get("fcs")
+            .and_then(|f| f.get("enabled"))
+            .and_then(|v| v.as_bool())
+            .or_else(|| {
+                c.capabilities
+                    .get("fcs")
+                    .and_then(|f| f.get("enabled"))
+                    .and_then(|v| v.as_bool())
+            });
+        corpus_index.insert(
+            c.id.clone(),
+            json!({
+                "id": c.id,
+                "label": c.label,
+                "preferred_backend": c.preferred_backend,
+                "project_url": c.project_url,
+                "project_root": if project_root.is_empty() { Value::Null } else { json!(project_root.as_ref()) },
+                "http_policy_mode": c.http_policy_mode,
+                "interface_preference": c.interface_preference,
+                "source_kind": c.source_kind,
+                "supports_xml": c.supports_xml,
+                "fcs_enabled": fcs_enabled,
+            }),
+        );
     }
-    let report = tokio::task::spawn_blocking(move || services::probe_frontends(&hints))
-        .await
-        .map_err(|e| admin::AdminError::msg(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let report = tokio::task::spawn_blocking(move || {
+        let mut report = services::probe_frontends(&hints);
+        services::attach_frontend_corpus_details(&mut report, &corpus_index);
+        report
+    })
+    .await
+    .map_err(|e| admin::AdminError::msg(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(report))
 }
 

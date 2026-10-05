@@ -1257,25 +1257,29 @@
       ""
     );
     html += "</div>";
+
+    const advNotes = [];
     if (!showAll && hidden > 0) {
-      html +=
-        '<p class="muted muted-sm85">' +
-        esc(String(hidden)) +
-        " other supported kind" +
-        (hidden === 1 ? "" : "s") +
-        " hidden (Korp, CQPweb, NoSketch Engine, … when unused). Tick <em>Show all supported kinds</em> to list them.</p>";
+      advNotes.push(
+        hidden +
+          " other supported kind" +
+          (hidden === 1 ? "" : "s") +
+          " hidden until “Show all supported kinds”."
+      );
     }
-    if (data.corpora_note) {
-      html += '<p class="muted muted-sm85">' + esc(data.corpora_note) + "</p>";
+    if (data.corpora_note) advNotes.push(data.corpora_note);
+    if (data.restart_policy) advNotes.push(data.restart_policy);
+    if (cov && cov.help) {
+      if (cov.help.kontext_corplist) advNotes.push(cov.help.kontext_corplist);
+      if (cov.help.fcs) advNotes.push(cov.help.fcs);
     }
-    if (data.restart_policy) {
-      html += '<p class="muted muted-sm85">' + esc(data.restart_policy) + "</p>";
+    const advEl = $("frontends-advanced-notes");
+    if (advEl) {
+      advEl.innerHTML = advNotes.map((n) => "<div>" + esc(n) + "</div>").join("");
     }
 
     if (!kinds.length) {
-      html += showAll
-        ? '<p class="muted">No frontend kinds returned.</p>'
-        : '<p class="muted">No frontends in use or configured yet. Tick <em>Show all supported kinds</em> to see what FQS can handle.</p>';
+      html += '<p class="muted">No frontends in use yet.</p>';
     } else {
       kinds.forEach((k) => {
         const st = k.status || "not_configured";
@@ -1291,7 +1295,6 @@
           pillLabel = "catalog";
           pillCls = "warn";
         } else if (st === "not_configured") {
-          // Per-corpus UIs (TEITOK) are not a single install — "unused" ≠ missing software.
           pillLabel = k.centralized === false ? "unused" : "not set";
           pillCls = "";
         }
@@ -1311,15 +1314,12 @@
           esc(st) +
           (k.corpus_count ? " · " + k.corpus_count + " corpora" : "") +
           "</span></div>";
-        if (k.notes) {
-          html += '<p class="muted muted-sm kind-notes">' + esc(k.notes) + "</p>";
-        }
         const instances = k.instances || [];
         if (!instances.length) {
           html +=
             k.centralized === false
-              ? '<p class="muted muted-sm85">No catalog corpora linked yet (set <code>project_url</code>, <code>interface_preference=teitok</code>, <code>supports_xml</code>, or a TEITOK <code>project_root</code>). This does not mean TEITOK is missing from the server.</p>'
-              : '<p class="muted muted-sm85">Not configured in catalog or <code>fqs.json</code>.</p>';
+              ? '<p class="muted muted-sm85">No catalog corpora linked yet.</p>'
+              : '<p class="muted muted-sm85">Not configured.</p>';
         } else {
           instances.forEach((f) => {
             const h = f.health || {};
@@ -1350,39 +1350,31 @@
             }
             html += "</div>";
             if (h.error) {
-              html +=
-                '<div class="err err-xs">' +
-                esc(h.error) +
-                "</div>";
+              html += '<div class="err err-xs">' + esc(h.error) + "</div>";
             } else if (h.note) {
               html +=
-                '<div class="muted muted-xs-mt">' +
-                esc(h.note) +
-                "</div>";
+                '<div class="muted muted-xs-mt">' + esc(h.note) + "</div>";
             }
-            html += '<div class="mt-sm"><span class="muted label-sm">Corpora served</span>' +
-              corporaServedCell(f) +
-              "</div>";
+            html += corporaDetailsFold(f.corpus_details || [], "Corpora", f.corpus_aliases);
             html += "</div>";
           });
         }
-        // Kind-level corpora when no instance nested them (summary)
         if (
           k.centralized &&
           (!instances.length || instances.every((i) => !(i.corpora || []).length)) &&
-          (k.corpora || []).length
+          ((k.corpus_details || []).length || (k.corpora || []).length)
         ) {
-          html +=
-            '<div class="mt-sm"><span class="muted label-sm">Corpora (catalog)</span>' +
-            corporaServedCell({ centralized: true, corpora: k.corpora }) +
-            "</div>";
+          html += corporaDetailsFold(
+            k.corpus_details || corpusIdsToDetails(k.corpora || []),
+            "Corpora (catalog)"
+          );
         }
         html += "</div>";
       });
     }
 
     if (data.gunicorn_processes && data.gunicorn_processes.length) {
-      html += '<h3 class="section-title">gunicorn processes (informational)</h3>';
+      html += '<h3 class="section-title">gunicorn processes</h3>';
       html +=
         '<table class="data-table"><thead><tr><th>PID</th><th>Command</th></tr></thead><tbody>';
       data.gunicorn_processes.forEach((g) => {
@@ -1425,84 +1417,82 @@
 
   function renderCoverageSection(cov) {
     if (!cov || cov.error) {
-      return (
-        '<h3 class="section-title">Coverage gaps</h3>' +
-        '<p class="muted">' +
-        esc(cov && cov.error ? cov.error : "Coverage not loaded.") +
-        "</p>"
-      );
+      return "";
     }
-    let html = '<h3 class="section-title">Coverage gaps</h3>';
-    html +=
-      '<p class="muted muted-sm85">TEITOK/pando corpora missing from a configured KonText corplist, and FCS-servable corpora not yet opted in or out.</p>';
-
+    let html = "";
     const kontextRows = cov.kontext || [];
-    if (!kontextRows.length) {
+    kontextRows.forEach((k) => {
+      const missing = k.missing || [];
+      if (!missing.length && !k.setup_hint) return;
+      html += '<div class="frontend-kind coverage-block">';
       html +=
-        '<p class="muted muted-sm85">No KonText frontend in <code>fqs.json</code>. Add one with a <code>corplist</code> path to detect gaps.</p>';
-    } else {
-      kontextRows.forEach((k) => {
-        html += '<div class="frontend-kind coverage-block">';
+        '<div class="frontend-kind-head"><strong>Not in KonText</strong>' +
+        (k.corplist_path
+          ? ' <span class="muted mono">' + esc(k.corplist_path) + "</span>"
+          : "") +
+        "</div>";
+      if (k.setup_hint && !missing.length) {
+        html += '<p class="muted muted-sm85">' + esc(k.setup_hint) + "</p>";
+      }
+      if (missing.length) {
+        const open = missing.length <= 12 ? " open" : "";
         html +=
-          '<div class="frontend-kind-head"><strong>KonText</strong> <span class="muted mono">' +
-          esc(k.frontend_id || "") +
-          (k.corplist_path ? " · " + esc(k.corplist_path) : "") +
-          "</span></div>";
-        if (k.error) {
-          html += '<p class="err err-xs">' + esc(k.error) + "</p>";
-        }
-        const missing = k.missing || [];
-        if (!missing.length && !k.error) {
+          '<details class="corpus-fold"' +
+          open +
+          "><summary>Missing <span class=\"muted\">(" +
+          missing.length +
+          ")</span></summary>";
+        html +=
+          '<div class="corpus-fold-body"><table class="data-table"><thead><tr><th>Corpus</th><th>Backend</th><th>Ident</th><th></th></tr></thead><tbody>';
+        missing.forEach((m) => {
           html +=
-            '<p class="muted muted-sm85">No TEITOK/pando gaps — every eligible catalog corpus is in the corplist.</p>';
-        } else if (missing.length) {
-          html +=
-            '<table class="data-table"><thead><tr><th>Corpus</th><th>Suggested ident</th><th>XML</th><th></th></tr></thead><tbody>';
-          missing.forEach((m) => {
+            "<tr><td><strong>" +
+            esc(m.label || m.id) +
+            '</strong><div class="mono muted muted-xs">' +
+            esc(m.id) +
+            "</div></td><td class='mono'>" +
+            esc(m.preferred_backend || "—") +
+            "</td><td class='mono'>" +
+            esc(m.suggested_ident || "") +
+            "</td><td>";
+          if (k.appendable) {
             html +=
-              "<tr><td><strong>" +
-              esc(m.label || m.id) +
-              '</strong><div class="mono muted muted-xs">' +
+              "<button type='button' class='secondary btn-corplist-append' data-frontend='" +
+              esc(k.frontend_id) +
+              "' data-ident='" +
+              esc(m.suggested_ident || m.id) +
+              "' data-corpus='" +
               esc(m.id) +
-              "</div></td><td class='mono'>" +
-              esc(m.suggested_ident || "") +
-              "</td><td class='mono muted-xs'>" +
-              esc(m.suggested_xml || "") +
-              "</td><td>";
-            if (k.appendable) {
-              html +=
-                "<button type='button' class='secondary btn-corplist-append' data-frontend='" +
-                esc(k.frontend_id) +
-                "' data-ident='" +
-                esc(m.suggested_ident || m.id) +
-                "' data-corpus='" +
-                esc(m.id) +
-                "'>Add to corplist</button>";
-            } else {
-              html += '<span class="muted">copy XML into corplist</span>';
-            }
-            html += "</td></tr>";
-          });
-          html += "</tbody></table>";
-        }
-        html += "</div>";
-      });
-    }
+              "'>Add to KonText</button>";
+          } else {
+            html +=
+              '<span class="muted muted-xs">' +
+              esc(k.setup_hint || m.suggested_xml || "") +
+              "</span>";
+          }
+          html += "</td></tr>";
+        });
+        html += "</tbody></table></div></details>";
+      }
+      html += "</div>";
+    });
 
-    const undecided = (cov.fcs && cov.fcs.undecided) || [];
-    html += '<div class="frontend-kind coverage-block">';
-    html +=
-      '<div class="frontend-kind-head"><strong>FCS</strong> <span class="muted">undecided (servable, not flagged)</span></div>';
-    if (cov.fcs && cov.fcs.note) {
-      html += '<p class="muted muted-sm85">' + esc(cov.fcs.note) + "</p>";
-    }
-    if (!undecided.length) {
+    const fcsMissing =
+      (cov.fcs && (cov.fcs.missing || cov.fcs.undecided)) || [];
+    if (fcsMissing.length) {
+      html += '<div class="frontend-kind coverage-block">';
       html +=
-        '<p class="muted muted-sm85">None — every FCS-servable corpus already has <code>settings.fcs.enabled</code> true or false.</p>';
-    } else {
+        '<div class="frontend-kind-head"><strong>Not in FCS</strong></div>';
+      const open = fcsMissing.length <= 12 ? " open" : "";
       html +=
-        '<table class="data-table"><thead><tr><th>Corpus</th><th>Backend</th><th></th></tr></thead><tbody>';
-      undecided.forEach((u) => {
+        '<details class="corpus-fold"' +
+        open +
+        "><summary>Missing <span class=\"muted\">(" +
+        fcsMissing.length +
+        ")</span></summary>";
+      html +=
+        '<div class="corpus-fold-body"><table class="data-table"><thead><tr><th>Corpus</th><th>Backend</th><th></th></tr></thead><tbody>';
+      fcsMissing.forEach((u) => {
         html +=
           "<tr><td><strong>" +
           esc(u.label || u.id) +
@@ -1513,15 +1503,14 @@
           "</td><td class='row row-start-wrap'>" +
           "<button type='button' class='secondary btn-fcs-flag' data-corpus='" +
           esc(u.id) +
-          "' data-enabled='1'>Enable FCS</button>" +
+          "' data-enabled='1'>Add to FCS</button>" +
           "<button type='button' class='secondary btn-fcs-flag' data-corpus='" +
           esc(u.id) +
-          "' data-enabled='0'>Exclude FCS</button>" +
+          "' data-enabled='0'>Exclude</button>" +
           "</td></tr>";
       });
-      html += "</tbody></table>";
+      html += "</tbody></table></div></details></div>";
     }
-    html += "</div>";
     return html;
   }
 
@@ -1572,24 +1561,61 @@
     await refreshFrontends();
   }
 
-  function corporaServedCell(f) {
-    const corps = f.corpora || [];
-    if (!corps.length) {
+  function corpusIdsToDetails(ids) {
+    return (ids || []).map((id) =>
+      typeof id === "string" ? { id: id, label: id } : id
+    );
+  }
+
+  /** Foldable corpus table; open by default when small, collapsed when many. */
+  function corporaDetailsFold(details, title, aliases) {
+    const rows = details && details.length ? details : [];
+    if (!rows.length) {
       return '<p class="muted corpus-none">none in FQS catalog yet</p>';
     }
-    const aliases = f.corpus_aliases || {};
-    let html = '<ul class="corpus-served">';
-    corps.forEach((id) => {
-      const alias = aliases[id];
+    const aliasMap = aliases || {};
+    const open = rows.length <= 12 ? " open" : "";
+    let html =
+      '<details class="corpus-fold"' +
+      open +
+      "><summary>" +
+      esc(title || "Corpora") +
+      ' <span class="muted">(' +
+      rows.length +
+      ")</span></summary>";
+    html +=
+      '<div class="corpus-fold-body"><table class="data-table corpus-detail-table"><thead><tr>' +
+      "<th>Corpus</th><th>Backend</th><th>Alias</th><th>Policy</th><th>URL</th>" +
+      "</tr></thead><tbody>";
+    rows.forEach((r) => {
+      const id = r.id || "";
+      const alias = r.alias || aliasMap[id] || "";
+      const url = r.project_url || "";
       html +=
-        '<li class="mono">' +
+        "<tr><td><strong>" +
+        esc(r.label || id) +
+        '</strong><div class="mono muted muted-xs">' +
         esc(id) +
-        (alias && alias !== id
-          ? ' <span class="muted">(' + esc(alias) + ")</span>"
-          : "") +
-        "</li>";
+        "</div></td><td class='mono'>" +
+        esc(r.preferred_backend || "—") +
+        "</td><td class='mono'>" +
+        esc(alias && alias !== id ? alias : "—") +
+        "</td><td class='mono muted-xs'>" +
+        esc(r.http_policy_mode || "—") +
+        "</td><td class='mono muted-xs'>";
+      if (url) {
+        html +=
+          '<a href="' +
+          esc(url) +
+          '" target="_blank" rel="noopener">' +
+          esc(url.length > 48 ? url.slice(0, 46) + "…" : url) +
+          "</a>";
+      } else {
+        html += "—";
+      }
+      html += "</td></tr>";
     });
-    html += "</ul>";
+    html += "</tbody></table></div></details>";
     return html;
   }
 
@@ -1793,7 +1819,7 @@
   });
   if ($("frontends-show-all")) {
     $("frontends-show-all").addEventListener("change", () => {
-      if (lastFrontendsData) renderFrontends(lastFrontendsData);
+      if (lastFrontendsData) renderFrontends(lastFrontendsData, lastCoverageData);
     });
   }
   $("btn-settings-refresh").addEventListener("click", () => {

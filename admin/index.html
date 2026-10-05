@@ -167,18 +167,21 @@
   <section id="tab-frontends" class="tab-body page" hidden>
     <div class="row actions">
       <button type="button" id="btn-frontends-refresh" class="secondary">Refresh frontends</button>
-      <label class="check-inline" title="Include Korp, CQPweb, NoSketch Engine, etc. even when not configured on this server">
-        <input type="checkbox" id="frontends-show-all" />
-        Show all supported kinds
-      </label>
     </div>
-    <p class="muted">By default only frontends that are installed or linked from the catalog. Tick <em>Show all supported kinds</em> to see every UI FQS can talk to (Korp, CQPweb, NoSketch Engine, …) even when unused here. Below: <strong>Coverage gaps</strong> — TEITOK/pando corpora missing from a KonText <code>corplist</code> (set <code>frontends[].corplist</code> in <code>fqs.json</code>), and FCS-servable corpora not yet opted in/out. Restart only when configured in <code>fqs.json</code>.</p>
     <div id="frontends-view" class="view-panel">
       <p class="muted">Open this tab (with a JWT) to load frontends.</p>
     </div>
     <details class="raw-json">
-      <summary>Raw JSON</summary>
-      <pre id="frontends-out" class="out">—</pre>
+      <summary>Advanced</summary>
+      <label class="check-inline adv-show-all" title="Include Korp, CQPweb, NoSketch Engine, etc. even when not configured on this server">
+        <input type="checkbox" id="frontends-show-all" />
+        Show all supported kinds
+      </label>
+      <p class="muted muted-sm85" id="frontends-advanced-notes"></p>
+      <details class="raw-json nested-raw">
+        <summary>Raw JSON</summary>
+        <pre id="frontends-out" class="out">—</pre>
+      </details>
     </details>
   </section>
 

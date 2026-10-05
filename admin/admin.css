@@ -377,6 +377,27 @@ label.check-inline input { width: auto; margin: 0; }
 }
 .coverage-block { margin-top: 0.75rem; }
 .frontend-kind-head { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.corpus-fold {
+  margin-top: 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #fff;
+  padding: 0.35rem 0.55rem;
+}
+.corpus-fold > summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--ink);
+  user-select: none;
+}
+.corpus-fold > summary .muted { font-weight: normal; }
+.corpus-fold-body {
+  margin-top: 0.4rem;
+  max-height: 22rem;
+  overflow: auto;
+}
+.corpus-detail-table { margin: 0; }
+.corpus-detail-table th { white-space: nowrap; }
 .frontend-instance {
   margin: 0.6rem 0 0.2rem;
   padding: 0.6rem 0.75rem;
@@ -398,6 +419,8 @@ label.check-inline input { width: auto; margin: 0; }
   font-size: 0.85rem;
   margin-bottom: 0.35rem;
 }
+.raw-json.nested-raw { margin-top: 0.75rem; margin-left: 0.25rem; }
+.adv-show-all { display: inline-flex; margin: 0.35rem 0 0.5rem; }
 label.inline {
   display: flex;
   flex-direction: column;

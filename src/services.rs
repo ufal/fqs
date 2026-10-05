@@ -390,6 +390,74 @@ pub fn probe_frontends(catalog_hints: &[FrontendHint]) -> Value {
     })
 }
 
+/// Catalog row summary attached to frontend corpora lists (admin UI tables).
+pub type CorpusDetailIndex = Map<String, Value>;
+
+/// Build `corpus_details` on each kind/instance from id lists + catalog index.
+pub fn attach_frontend_corpus_details(report: &mut Value, index: &CorpusDetailIndex) {
+    let Some(root) = report.as_object_mut() else {
+        return;
+    };
+    if let Some(kinds) = root.get_mut("kinds").and_then(|v| v.as_array_mut()) {
+        for kind in kinds {
+            attach_details_on_node(kind, index);
+            if let Some(instances) = kind
+                .get_mut("instances")
+                .and_then(|v| v.as_array_mut())
+            {
+                for inst in instances {
+                    attach_details_on_node(inst, index);
+                }
+            }
+        }
+    }
+    if let Some(frontends) = root.get_mut("frontends").and_then(|v| v.as_array_mut()) {
+        for fe in frontends {
+            attach_details_on_node(fe, index);
+        }
+    }
+}
+
+fn attach_details_on_node(node: &mut Value, index: &CorpusDetailIndex) {
+    let Some(o) = node.as_object_mut() else {
+        return;
+    };
+    let ids: Vec<String> = o
+        .get("corpora")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if ids.is_empty() {
+        o.insert("corpus_details".into(), json!([]));
+        return;
+    }
+    let aliases = o
+        .get("corpus_aliases")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let mut details = Vec::with_capacity(ids.len());
+    for id in ids {
+        let mut row = index.get(&id).cloned().unwrap_or_else(|| {
+            json!({
+                "id": id,
+                "label": id,
+            })
+        });
+        if let Some(obj) = row.as_object_mut() {
+            if let Some(a) = aliases.get(&id).and_then(|v| v.as_str()) {
+                obj.insert("alias".into(), json!(a));
+            }
+        }
+        details.push(row);
+    }
+    o.insert("corpus_details".into(), Value::Array(details));
+}
+
 struct FrontendKindSpec {
     id: &'static str,
     label: &'static str,
@@ -1599,22 +1667,56 @@ pub fn compute_frontend_coverage(corpora: &[CoverageCorpus<'_>]) -> Value {
         kontext_reports.push(kontext_coverage_for_frontend(&id, &cfg, corpora));
     }
 
-    let mut undecided = Vec::new();
+    // Catalog may show KonText even when fqs.json has no frontends[] entry — still
+    // surface TEITOK corpora that are not in a corplist.
+    if kontext_reports.is_empty() {
+        let url = corpora.iter().find_map(|c| {
+            c.settings
+                .get("kontext")
+                .and_then(|k| k.get("url").or_else(|| k.get("base")))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        });
+        let any_eligible = corpora
+            .iter()
+            .any(|c| c.is_current && corpus_eligible_for_kontext(c));
+        let discovered = resolve_kontext_corplist(None).0.is_some();
+        if url.is_some() || any_eligible || discovered {
+            let mut cfg = Map::new();
+            cfg.insert("kind".into(), json!("kontext"));
+            if let Some(u) = url {
+                cfg.insert("url".into(), json!(u));
+            }
+            kontext_reports.push(kontext_coverage_for_frontend(
+                "kontext",
+                &Value::Object(cfg),
+                corpora,
+            ));
+        }
+    }
+
+    // FCS gaps: queryable / TEITOK corpora with no explicit settings.fcs.enabled yet.
+    // Opt-out is only when enabled is false; absence means “not added”, same as KonText.
+    let mut missing_fcs = Vec::new();
     for c in corpora {
         if !c.is_current {
             continue;
         }
-        if !corpus_can_serve_fcs(c) {
+        if !corpus_eligible_for_fcs_suggest(c) {
             continue;
         }
-        if fcs_enabled_flag(c.settings, c.capabilities).is_some() {
-            continue; // explicitly in or out
+        match fcs_enabled_flag(c.settings, c.capabilities) {
+            Some(true) => continue,  // already in FCS
+            Some(false) => continue, // explicitly excluded
+            None => {}
         }
-        undecided.push(json!({
+        missing_fcs.push(json!({
             "id": c.id,
             "label": c.label,
             "preferred_backend": c.preferred_backend,
-            "action_hint": "Set settings.fcs.enabled to true (publish) or false (exclude).",
+            "project_url": c.project_url,
+            "reason": "fcs_not_enabled",
         }));
     }
 
@@ -1622,45 +1724,18 @@ pub fn compute_frontend_coverage(corpora: &[CoverageCorpus<'_>]) -> Value {
         "ok": true,
         "kontext": kontext_reports,
         "fcs": {
-            "undecided": undecided,
-            "note": "Only corpora FQS can serve via FCS that are not yet flagged settings.fcs.enabled true/false. Opted-in and opted-out rows are omitted.",
+            "missing": missing_fcs.clone(),
+            // Alias kept for older admin UI builds.
+            "undecided": missing_fcs,
         },
         "help": {
-            "kontext_corplist": "Set frontends[].corplist (path to KonText corplist.xml) in fqs.json to detect gaps. Append uses that allowlisted path only.",
-            "fcs": "Use Enable FCS / Exclude FCS to set settings.fcs.enabled without guessing.",
+            "kontext_corplist": "Optional: set frontends[].corplist in fqs.json (or FQS_KONTEXT_CORPLIST). Otherwise FQS looks under /opt/kontext/conf/.",
+            "fcs": "Add to FCS sets settings.fcs.enabled=true; Exclude sets false.",
         },
     })
 }
 
 fn kontext_coverage_for_frontend(frontend_id: &str, cfg: &Value, corpora: &[CoverageCorpus<'_>]) -> Value {
-    let corplist_path = cfg
-        .get("corplist")
-        .or_else(|| cfg.get("corplist_path"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
-
-    let Some(path) = corplist_path else {
-        return json!({
-            "frontend_id": frontend_id,
-            "url": cfg.get("url").cloned().unwrap_or(Value::Null),
-            "corplist_path": Value::Null,
-            "configured": true,
-            "error": "No corplist path on this KonText frontend. Add \"corplist\": \"/path/to/corplist.xml\" under the frontends[] entry in fqs.json.",
-            "idents": [],
-            "missing": [],
-        });
-    };
-
-    let parsed = read_kontext_corplist_idents(&path);
-    let (idents, read_err) = match parsed {
-        Ok(ids) => (ids, None),
-        Err(e) => (Vec::new(), Some(e)),
-    };
-    let ident_set: std::collections::HashSet<String> =
-        idents.iter().map(|s| s.to_ascii_lowercase()).collect();
-
     let frontend_url = cfg
         .get("url")
         .or_else(|| cfg.get("base"))
@@ -1668,12 +1743,44 @@ fn kontext_coverage_for_frontend(frontend_id: &str, cfg: &Value, corpora: &[Cove
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
+    let (corplist_path, path_source) = resolve_kontext_corplist(Some(cfg));
+
+    let (idents, path_display, setup_hint, appendable) = match &corplist_path {
+        Some(path) => match read_kontext_corplist_idents(path) {
+            Ok(ids) => (
+                ids,
+                Some(path.display().to_string()),
+                None,
+                path.is_file(),
+            ),
+            Err(e) => (
+                Vec::new(),
+                Some(path.display().to_string()),
+                Some(e),
+                false,
+            ),
+        },
+        None => (
+            Vec::new(),
+            None,
+            Some(
+                "No KonText corplist.xml found (set frontends[].corplist or FQS_KONTEXT_CORPLIST)."
+                    .into(),
+            ),
+            false,
+        ),
+    };
+
+    let ident_set: std::collections::HashSet<String> =
+        idents.iter().map(|s| s.to_ascii_lowercase()).collect();
+    let have_corplist = corplist_path.is_some() && setup_hint.is_none();
+
     let mut missing = Vec::new();
     for c in corpora {
         if !c.is_current {
             continue;
         }
-        if !corpus_eligible_for_kontext_pando(c) {
+        if !corpus_eligible_for_kontext(c) {
             continue;
         }
         let suggested = suggested_kontext_ident(c);
@@ -1685,10 +1792,15 @@ fn kontext_coverage_for_frontend(frontend_id: &str, cfg: &Value, corpora: &[Cove
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
-        let covered = ident_set.contains(&suggested.to_ascii_lowercase())
-            || catalog_corpname
-                .map(|n| ident_set.contains(&n.to_ascii_lowercase()))
-                .unwrap_or(false);
+        let covered = if have_corplist {
+            ident_set.contains(&suggested.to_ascii_lowercase())
+                || catalog_corpname
+                    .map(|n| ident_set.contains(&n.to_ascii_lowercase()))
+                    .unwrap_or(false)
+        } else {
+            // Without a readable corplist we cannot claim coverage — list gaps.
+            false
+        };
         if covered {
             continue;
         }
@@ -1700,9 +1812,15 @@ fn kontext_coverage_for_frontend(frontend_id: &str, cfg: &Value, corpora: &[Cove
         missing.push(json!({
             "id": c.id,
             "label": c.label,
+            "preferred_backend": c.preferred_backend,
+            "project_url": c.project_url,
             "suggested_ident": suggested,
             "catalog_corpname": catalog_corpname,
-            "reason": "teitok_pando_not_in_corplist",
+            "reason": if have_corplist {
+                "teitok_not_in_corplist"
+            } else {
+                "teitok_corplist_unresolved"
+            },
             "suggested_xml": xml,
             "frontend_url": frontend_url,
         }));
@@ -1711,17 +1829,19 @@ fn kontext_coverage_for_frontend(frontend_id: &str, cfg: &Value, corpora: &[Cove
     json!({
         "frontend_id": frontend_id,
         "url": frontend_url,
-        "corplist_path": path.display().to_string(),
+        "corplist_path": path_display,
+        "corplist_source": path_source,
         "configured": true,
-        "error": read_err,
+        "setup_hint": setup_hint,
         "idents": idents,
         "missing": missing,
-        "appendable": read_err.is_none() && path.is_file(),
+        "appendable": appendable,
     })
 }
 
-fn corpus_eligible_for_kontext_pando(c: &CoverageCorpus<'_>) -> bool {
-    let teitok = corpus_is_teitok_listable(
+/// TEITOK-listable corpora that can be published into a KonText corplist.
+fn corpus_eligible_for_kontext(c: &CoverageCorpus<'_>) -> bool {
+    corpus_is_teitok_listable(
         c.interface_preference,
         c.source_kind,
         c.supports_xml,
@@ -1729,8 +1849,7 @@ fn corpus_eligible_for_kontext_pando(c: &CoverageCorpus<'_>) -> bool {
         c.project_url,
         c.settings,
         c.capabilities,
-    );
-    teitok && corpus_looks_pando_servable(c)
+    )
 }
 
 fn corpus_looks_pando_servable(c: &CoverageCorpus<'_>) -> bool {
@@ -1775,6 +1894,22 @@ fn corpus_can_serve_fcs(c: &CoverageCorpus<'_>) -> bool {
     corpus_looks_pando_servable(c)
 }
 
+/// Corpora to suggest for FCS opt-in: anything queryable via FQS, plus TEITOK
+/// corpora (same set people expect to publish to KonText) when backend is auto.
+fn corpus_eligible_for_fcs_suggest(c: &CoverageCorpus<'_>) -> bool {
+    if c.http_policy_mode.trim().eq_ignore_ascii_case("disabled") {
+        return false;
+    }
+    if corpus_can_serve_fcs(c) {
+        return true;
+    }
+    let b = c.preferred_backend.trim().to_ascii_lowercase();
+    if b == "auto" || b.is_empty() {
+        return corpus_eligible_for_kontext(c) || corpus_looks_pando_servable(c);
+    }
+    corpus_eligible_for_kontext(c)
+}
+
 fn fcs_enabled_flag(settings: &Value, capabilities: &Value) -> Option<bool> {
     settings
         .get("fcs")
@@ -1797,6 +1932,146 @@ fn suggested_kontext_ident(c: &CoverageCorpus<'_>) -> String {
         .filter(|s| !s.is_empty())
         .unwrap_or(c.id)
         .to_string()
+}
+
+/// Resolve a KonText corplist.xml path: fqs.json → env → discovery under common installs.
+/// Returns `(path, source)` where source is `fqs.json`, `env`, `config.xml`, or `discovered`.
+fn resolve_kontext_corplist(cfg: Option<&Value>) -> (Option<PathBuf>, Option<&'static str>) {
+    if let Some(cfg) = cfg {
+        if let Some(p) = cfg
+            .get("corplist")
+            .or_else(|| cfg.get("corplist_path"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+        {
+            return (Some(p), Some("fqs.json"));
+        }
+    }
+    if let Ok(p) = std::env::var("FQS_KONTEXT_CORPLIST") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return (Some(PathBuf::from(p)), Some("env"));
+        }
+    }
+    for (path, src) in kontext_corplist_candidates() {
+        if path.is_file() {
+            return (Some(path), Some(src));
+        }
+    }
+    (None, None)
+}
+
+fn kontext_corplist_candidates() -> Vec<(PathBuf, &'static str)> {
+    let mut out: Vec<(PathBuf, &'static str)> = Vec::new();
+    let mut push = |p: PathBuf, src: &'static str| {
+        if !out.iter().any(|(x, _)| x == &p) {
+            out.push((p, src));
+        }
+    };
+
+    // Paths referenced from config.xml next to common KonText installs.
+    for conf_dir in [
+        "/opt/kontext/conf",
+        "/opt/kontext/installation/conf",
+        "/var/www/kontext/conf",
+        "/usr/local/share/kontext/conf",
+    ] {
+        let config = Path::new(conf_dir).join("config.xml");
+        if let Some(p) = corplist_path_from_kontext_config(&config) {
+            push(p, "config.xml");
+        }
+        push(Path::new(conf_dir).join("corplist.xml"), "discovered");
+    }
+
+    // Sibling of gunicorn cwd when KonText was started from its install root.
+    if let Ok(out_cmd) = Command::new("pgrep").args(["-af", "gunicorn"]).output() {
+        if out_cmd.status.success() {
+            for line in String::from_utf8_lossy(&out_cmd.stdout).lines() {
+                for token in line.split_whitespace() {
+                    if let Some(idx) = token.find("/conf/") {
+                        let root = Path::new(&token[..idx]);
+                        push(root.join("conf").join("corplist.xml"), "discovered");
+                    }
+                    if token.ends_with("corplist.xml") {
+                        push(PathBuf::from(token), "discovered");
+                    }
+                }
+            }
+        }
+    }
+
+    out
+}
+
+fn corplist_path_from_kontext_config(config_xml: &Path) -> Option<PathBuf> {
+    let text = fs::read_to_string(config_xml).ok()?;
+    // Prefer <file …>…corplist.xml</file> (lindat / tree_corparch).
+    let lower = text.to_ascii_lowercase();
+    let mut search_from = 0;
+    while let Some(rel) = lower[search_from..].find("<file") {
+        let start = search_from + rel;
+        let after = &text[start..];
+        let Some(close) = after.find("</file>") else {
+            break;
+        };
+        let inner = &after[..close];
+        if let Some(gt) = inner.find('>') {
+            let path = inner[gt + 1..].trim();
+            if path.to_ascii_lowercase().contains("corplist") && !path.is_empty() {
+                let p = PathBuf::from(path);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+        search_from = start + close.max(1);
+    }
+    None
+}
+
+fn corplist_path_is_allowed(path: &Path) -> bool {
+    let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    for (id, cfg) in configured_frontends() {
+        let kind = cfg
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if kind != "kontext" && id.to_ascii_lowercase() != "kontext" {
+            continue;
+        }
+        if let Some(p) = cfg
+            .get("corplist")
+            .or_else(|| cfg.get("corplist_path"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+        {
+            let pc = p.canonicalize().unwrap_or(p);
+            if pc == canon {
+                return true;
+            }
+        }
+    }
+    if let Ok(p) = std::env::var("FQS_KONTEXT_CORPLIST") {
+        let p = PathBuf::from(p.trim());
+        if !p.as_os_str().is_empty() {
+            let pc = p.canonicalize().unwrap_or(p);
+            if pc == canon {
+                return true;
+            }
+        }
+    }
+    for (cand, _) in kontext_corplist_candidates() {
+        let cc = cand.canonicalize().unwrap_or(cand);
+        if cc == canon {
+            return true;
+        }
+    }
+    false
 }
 
 fn read_kontext_corplist_idents(path: &Path) -> Result<Vec<String>, String> {
@@ -1848,7 +2123,11 @@ fn xml_escape_attr(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Append a corpus line to the allowlisted KonText corplist for `frontend_id`.
+/// Append a corpus line to an allowlisted KonText corplist for `frontend_id`.
+///
+/// Path resolution: `frontends[].corplist` → `FQS_KONTEXT_CORPLIST` → discovered
+/// `/opt/kontext/conf/corplist.xml` (and config.xml references). Works for a
+/// synthesized `kontext` id when discovery finds a file.
 pub fn append_kontext_corplist_corpus(
     frontend_id: &str,
     ident: &str,
@@ -1873,24 +2152,33 @@ pub fn append_kontext_corplist_corpus(
     let cfg = configured
         .iter()
         .find(|(id, _)| id == frontend_id)
-        .map(|(_, v)| v)
-        .ok_or_else(|| format!("frontend '{frontend_id}' not in fqs.json"))?;
-    let kind = cfg
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if kind != "kontext" && frontend_id.to_ascii_lowercase() != "kontext" {
-        return Err("append is only supported for KonText frontends".into());
+        .map(|(_, v)| v);
+    if let Some(cfg) = cfg {
+        let kind = cfg
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if kind != "kontext" && frontend_id.to_ascii_lowercase() != "kontext" {
+            return Err("append is only supported for KonText frontends".into());
+        }
+    } else if frontend_id.to_ascii_lowercase() != "kontext" {
+        return Err(format!(
+            "frontend '{frontend_id}' not in fqs.json and is not the default KonText id"
+        ));
     }
-    let path = cfg
-        .get("corplist")
-        .or_else(|| cfg.get("corplist_path"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| "frontend has no corplist path in fqs.json".to_string())?;
+
+    let (path, source) = resolve_kontext_corplist(cfg);
+    let path = path.ok_or_else(|| {
+        "No KonText corplist.xml found. Set frontends[].corplist in fqs.json or FQS_KONTEXT_CORPLIST."
+            .to_string()
+    })?;
+    if !corplist_path_is_allowed(&path) {
+        return Err(format!(
+            "corplist path {} is not allowlisted",
+            path.display()
+        ));
+    }
 
     let text = fs::read_to_string(&path)
         .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
@@ -1901,6 +2189,7 @@ pub fn append_kontext_corplist_corpus(
             "already_present": true,
             "ident": ident,
             "corplist_path": path.display().to_string(),
+            "corplist_source": source,
         }));
     }
 
@@ -1927,6 +2216,7 @@ pub fn append_kontext_corplist_corpus(
         "already_present": false,
         "ident": ident,
         "corplist_path": path.display().to_string(),
+        "corplist_source": source,
         "appended_xml": line.trim(),
     }))
 }
@@ -2081,6 +2371,38 @@ mod tests {
     }
 
     #[test]
+    fn attach_corpus_details_joins_catalog_index() {
+        let mut report = json!({
+            "kinds": [{
+                "id": "kontext",
+                "corpora": ["migrantstories", "ud_pando"],
+                "instances": [{
+                    "id": "kontext",
+                    "corpora": ["ud_pando"],
+                    "corpus_aliases": { "ud_pando": "ud" }
+                }]
+            }],
+            "frontends": []
+        });
+        let mut index = Map::new();
+        index.insert(
+            "migrantstories".into(),
+            json!({"id": "migrantstories", "label": "Migrant Stories", "preferred_backend": "pando"}),
+        );
+        index.insert(
+            "ud_pando".into(),
+            json!({"id": "ud_pando", "label": "UD Pando", "preferred_backend": "pando"}),
+        );
+        attach_frontend_corpus_details(&mut report, &index);
+        let kind_details = report["kinds"][0]["corpus_details"].as_array().unwrap();
+        assert_eq!(kind_details.len(), 2);
+        assert_eq!(kind_details[0]["label"], "Migrant Stories");
+        let inst = &report["kinds"][0]["instances"][0]["corpus_details"][0];
+        assert_eq!(inst["alias"], "ud");
+        assert_eq!(inst["preferred_backend"], "pando");
+    }
+
+    #[test]
     fn corplist_idents_parse() {
         let xml = r#"<?xml version="1.0"?>
 <kontext><corplist>
@@ -2093,6 +2415,107 @@ mod tests {
     }
 
     #[test]
+    fn corplist_path_from_config_xml() {
+        let dir = std::env::temp_dir().join(format!(
+            "fqs-corplist-cfg-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let corplist = dir.join("corplist.xml");
+        fs::write(
+            &corplist,
+            r#"<?xml version="1.0"?><corplist name="root">
+  <corpus ident="ud_pando" sentence_struct="s"/>
+</corplist>"#,
+        )
+        .unwrap();
+        let config = dir.join("config.xml");
+        fs::write(
+            &config,
+            format!(
+                r#"<kontext><plugins><corparch>
+            <file extension-by="lindat">{}</file>
+            <root_elm_path extension-by="lindat">/corplist</root_elm_path>
+        </corparch></plugins></kontext>"#,
+                corplist.display()
+            ),
+        )
+        .unwrap();
+        let found = corplist_path_from_kontext_config(&config).unwrap();
+        assert_eq!(found, corplist);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn coverage_lists_missing_teitok_when_corplist_configured() {
+        let dir = std::env::temp_dir().join(format!(
+            "fqs-coverage-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let corplist = dir.join("corplist.xml");
+        fs::write(
+            &corplist,
+            r#"<?xml version="1.0"?><corplist name="root">
+  <corpus ident="ud_pando" sentence_struct="s"/>
+</corplist>"#,
+        )
+        .unwrap();
+
+        let settings = json!({});
+        let caps = json!({});
+        let rows = [CoverageCorpus {
+            id: "migrantstories",
+            label: "Migrant Stories",
+            preferred_backend: "pando",
+            is_current: true,
+            http_policy_mode: "public_query",
+            interface_preference: Some("teitok"),
+            source_kind: "teitok",
+            supports_xml: true,
+            project_root: None,
+            project_url: Some("https://example/teitok/migrantstories/index.php"),
+            settings: &settings,
+            capabilities: &caps,
+        }];
+        let cfg = json!({
+            "kind": "kontext",
+            "corplist": corplist.display().to_string(),
+        });
+        let report = kontext_coverage_for_frontend("kontext", &cfg, &rows);
+        let missing = report["missing"].as_array().unwrap();
+        assert!(
+            missing.iter().any(|m| m["id"] == "migrantstories"),
+            "expected migrantstories in missing: {report}"
+        );
+        assert_eq!(report["appendable"], true);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn teitok_corpus_is_kontext_eligible_without_pando_flag() {
+        let settings = json!({});
+        let caps = json!({});
+        let c = CoverageCorpus {
+            id: "migrantstories",
+            label: "Migrant Stories",
+            preferred_backend: "auto",
+            is_current: true,
+            http_policy_mode: "public_query",
+            interface_preference: Some("teitok"),
+            source_kind: "teitok",
+            supports_xml: true,
+            project_root: None,
+            project_url: Some("https://example/teitok/migrantstories/index.php"),
+            settings: &settings,
+            capabilities: &caps,
+        };
+        assert!(corpus_eligible_for_kontext(&c));
+    }
+
+    #[test]
     fn fcs_undecided_only_when_flag_absent() {
         assert_eq!(fcs_enabled_flag(&json!({}), &json!({})), None);
         assert_eq!(
@@ -2102,6 +2525,33 @@ mod tests {
         assert_eq!(
             fcs_enabled_flag(&json!({"fcs": {"enabled": false}}), &json!({})),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn fcs_suggests_teitok_auto_without_explicit_backend() {
+        let settings = json!({});
+        let caps = json!({});
+        let c = CoverageCorpus {
+            id: "migrantstories",
+            label: "Migrant Stories",
+            preferred_backend: "auto",
+            is_current: true,
+            http_policy_mode: "public_query",
+            interface_preference: Some("teitok"),
+            source_kind: "teitok",
+            supports_xml: true,
+            project_root: None,
+            project_url: Some("https://example/teitok/migrantstories/index.php"),
+            settings: &settings,
+            capabilities: &caps,
+        };
+        assert!(corpus_eligible_for_fcs_suggest(&c));
+        let report = compute_frontend_coverage(&[c]);
+        let missing = report["fcs"]["missing"].as_array().unwrap();
+        assert!(
+            missing.iter().any(|m| m["id"] == "migrantstories"),
+            "expected migrantstories in FCS missing: {report}"
         );
     }
 
