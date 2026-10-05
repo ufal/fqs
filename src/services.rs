@@ -1173,24 +1173,43 @@ fn resolve_frontend_merge_id(by_id: &Map<String, Value>, hint: &FrontendHint) ->
     if by_id.contains_key(&hint.id) {
         return hint.id.clone();
     }
+    let hint_kind = normalize_frontend_kind(&hint.kind);
     let hint_url = hint.url.as_deref().unwrap_or("");
-    for (id, v) in by_id {
-        let kind = v
-            .get("kind")
-            .and_then(Value::as_str)
-            .map(normalize_frontend_kind)
-            .unwrap_or_default();
-        if kind != normalize_frontend_kind(&hint.kind) {
-            continue;
+    // configured instances (fqs.json) of the same kind
+    let same_kind: Vec<(&String, &Value)> = by_id
+        .iter()
+        .filter(|(_, v)| {
+            v.get("kind")
+                .and_then(Value::as_str)
+                .map(normalize_frontend_kind)
+                .unwrap_or_default()
+                == hint_kind
+        })
+        .collect();
+    // the catalogue holds the public address (behind a proxy, say), fqs.json often the
+    // internal one (127.0.0.1:8080) next to `public_url`: compare with all of them
+    for (id, v) in &same_kind {
+        let matches = ["url", "health_url", "public_url"].iter().any(|k| {
+            v.get(*k)
+                .and_then(Value::as_str)
+                .is_some_and(|u| !hint_url.is_empty() && urls_same_service(u, hint_url))
+        });
+        if matches {
+            return (*id).clone();
         }
-        let url = v
-            .get("url")
-            .or_else(|| v.get("health_url"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if !hint_url.is_empty() && urls_same_service(url, hint_url) {
-            return id.clone();
-        }
+    }
+    // one configured instance of this kind: the catalogue means that one
+    let configured: Vec<&String> = same_kind
+        .iter()
+        .filter(|(_, v)| {
+            v.get("source")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.starts_with("fqs.json"))
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    if configured.len() == 1 {
+        return configured[0].clone();
     }
     hint.id.clone()
 }
@@ -1795,6 +1814,36 @@ pub fn publish_to_frontend(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn catalog_hint_merges_into_configured_instance_by_public_url() {
+        let mut by_id = Map::new();
+        by_id.insert(
+            "kontext".into(),
+            json!({"id":"kontext","kind":"kontext","source":"fqs.json",
+                   "url":"http://127.0.0.1:8080","public_url":"https://lindat.cz/services/test-kontext",
+                   "restart":{"method":"systemctl","unit":"kontext"}}),
+        );
+        let hint = FrontendHint {
+            id: "kontext:lindat.cz".into(),
+            kind: "kontext".into(),
+            label: "KonText".into(),
+            url: Some("https://lindat.cz/services/test-kontext".into()),
+            corpus_id: "ntrex".into(),
+            corpus_alias: None,
+            centralized: true,
+        };
+        assert_eq!(resolve_frontend_merge_id(&by_id, &hint), "kontext");
+        // no public_url, but the only configured KonText: still that one
+        by_id.get_mut("kontext").unwrap().as_object_mut().unwrap().remove("public_url");
+        assert_eq!(resolve_frontend_merge_id(&by_id, &hint), "kontext");
+        // two configured ones and no url match: a separate catalogue instance
+        by_id.insert(
+            "kontext2".into(),
+            json!({"id":"kontext2","kind":"kontext","source":"fqs.json","url":"http://127.0.0.1:8081"}),
+        );
+        assert_eq!(resolve_frontend_merge_id(&by_id, &hint), "kontext:lindat.cz");
+    }
     use super::*;
     use serde_json::json;
 
