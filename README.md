@@ -150,22 +150,37 @@ backup, mode and owner kept, atomic when possible) and the Pando index helpers.
 
 **KonText (`kontext.rs`).** The KonText card shows KonText's processes (Sanic or
 gunicorn) and, per corpus, what KonText still lacks; **Add to KonText** does all of it.
+It only offers corpora that already have a Pando index: those are the ones
+kontext-pando serves through FQS. Manatee corpora are KonText's own (they do not go
+through FQS), and a corpus without an index has to be built first — publishing only
+lists corpora that are ready.
 A corpus opens in KonText (kontext-pando) when:
 
 1. it is in `corplist.xml` — FQS adds it (checked to be well-formed XML);
 2. `pando_corpora.json` sends its queries to Pando — FQS adds `"backend": "fqs"` with
    this FQS's URL (no `size`: kontext-pando asks FQS's `/info`, which stays right after
    a reindex);
-3. Manatee has a registry file for it, since KonText opens every corpus as a Manatee
-   corpus — FQS writes a registry *shell* from the Pando index's `corpus.info`
-   (positional attributes, structures and their attributes, multivalue attributes,
-   language, DOCSTRUCTURE / FULLREF), with a one-token vertical, and encodes it with
-   Manatee's `encodevert`. Concordances, frequencies and text types still come from
-   Pando through FQS. The registry carries a `# fqs: corpus=… index_id=…` line: after a
-   reindex the card shows it as outdated and **Add to KonText** rebuilds it; registries
-   FQS did not write are never touched;
+3. Manatee has a registry file for it, since KonText opens every corpus with
+   `manatee.Corpus(registry)` and refuses one whose `PATH` folder does not exist — FQS
+   writes the registry from the Pando index's `corpus.info` (positional attributes,
+   structures and their attributes, multivalue attributes, language, DOCSTRUCTURE /
+   FULLREF) and creates its `PATH` folder. kontext-pando answers concordances,
+   frequencies, text types and the corpus info from Pando, so the Manatee data is not
+   read for those. Only when Manatee's `encodevert` is available does FQS also encode a
+   one-token vertical (a "shell"), so that the KonText functions that still read Manatee
+   data directly (word list, keywords, collocations) find a tiny corpus instead of
+   missing files; they do not give real results for Pando corpora either way. The
+   registry carries a `# fqs: corpus=… index_id=…` line: after a reindex the card shows
+   it as outdated and **Add to KonText** rebuilds it (and encodes it once `encodevert`
+   is found); registries FQS did not write are never touched;
 4. KonText is restarted (offered when `restart` is configured) and users have access
    to the corpus in KonText's auth — that last step is KonText's own.
+
+FQS must be able to write these files: the systemd unit has `ProtectSystem=strict`, so
+their folders need `ReadWritePaths` (a drop-in), and the service user needs write
+permission. `fqs frontends paths` lists them; `install/install-stack.pl` sets both up
+(an ACL for the service user, `/etc/systemd/system/fqs.service.d/frontends.conf`). The
+KonText card says which of the two is missing for each file.
 
 FQS edits only files at paths from fqs.json, the environment (`FQS_KONTEXT_CORPLIST`,
 `PANDO_CORPORA_CONFIG`, `MANATEE_REGISTRY`) or KonText's own `config.xml` / install

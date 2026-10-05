@@ -457,3 +457,36 @@ label.scan-roots-field { min-width: 18rem; flex: 1; }
 .step { display: inline-block; min-width: 1.2em; text-align: center; font-weight: 600; color: var(--muted); }
 .step.ok { color: var(--accent); }
 .step.bad { color: var(--danger); }
+
+/* TEITOK session ended (inside TEITOK): log in again, the page carries on */
+.session-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: rgba(28, 26, 22, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+.session-overlay[hidden] { display: none; }
+.session-box {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  max-width: 32rem;
+  padding: 1.25rem 1.5rem;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
+}
+.session-box h2 { margin: 0 0 0.5rem; font-size: 1.15rem; }
+.session-box .row { display: flex; gap: 0.75rem; align-items: center; margin-top: 1rem; }
+a.button {
+  display: inline-block;
+  background: var(--accent);
+  color: #fff;
+  border-radius: 4px;
+  padding: 0.45rem 0.9rem;
+  text-decoration: none;
+  font: inherit;
+}
+a.button:hover { filter: brightness(1.05); }

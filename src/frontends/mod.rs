@@ -65,6 +65,11 @@ pub trait FrontendModule: Sync {
     fn processes(&self) -> Vec<Value> {
         Vec::new()
     }
+    /// The files (false) and folders (true) publishing writes — for the installer, which
+    /// makes them writable for the FQS service (systemd ReadWritePaths, group write).
+    fn write_paths(&self, _cfg: &Value) -> Vec<(PathBuf, bool)> {
+        Vec::new()
+    }
     fn coverage(&self, frontend_id: &str, cfg: &Value, corpora: &[CatalogCorpus<'_>]) -> Value;
     fn publish(&self, frontend_id: &str, cfg: Option<&Value>, req: &PublishRequest<'_>) -> Result<Value, String>;
 }
@@ -430,3 +435,69 @@ pub(crate) fn corpus_can_serve_fcs(c: &CatalogCorpus<'_>) -> bool {
     corpus_looks_pando_servable(c)
 }
 
+/// The user (and groups) this process runs as, for messages: "fqs (groups fqs, www-data)".
+pub(crate) fn process_user() -> String {
+    let status = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |k: &str| -> Vec<String> {
+        status
+            .lines()
+            .find(|l| l.starts_with(k))
+            .map(|l| l[k.len()..].split_whitespace().map(str::to_string).collect())
+            .unwrap_or_default()
+    };
+    let name_of = |file: &str, id: &str| -> String {
+        fs::read_to_string(file)
+            .unwrap_or_default()
+            .lines()
+            .find_map(|l| {
+                let f: Vec<&str> = l.split(':').collect();
+                (f.len() > 2 && f[2] == id).then(|| f[0].to_string())
+            })
+            .unwrap_or_else(|| id.to_string())
+    };
+    let uid = field("Uid:");
+    let Some(u) = uid.first() else {
+        return "the FQS user".into();
+    };
+    let user = name_of("/etc/passwd", u);
+    let mut groups: Vec<String> = field("Gid:").into_iter().take(1).chain(field("Groups:")).collect();
+    groups.dedup();
+    let groups: Vec<String> = groups.iter().map(|g| name_of("/etc/group", g)).collect();
+    if groups.is_empty() {
+        user
+    } else {
+        format!("{user} (groups {})", groups.join(", "))
+    }
+}
+
+/// Can FQS write `path` (a file; with `in_dir`, create files in that folder)? Else why
+/// not, in words that say what to change: the file's permissions, or the systemd
+/// sandbox of the FQS service (ProtectSystem=strict makes everything outside its
+/// ReadWritePaths read-only, whoever owns it).
+pub(crate) fn write_problem(path: &Path, in_dir: bool) -> Option<String> {
+    let res = if in_dir {
+        let probe = path.join(format!(".fqs-write-test-{}", std::process::id()));
+        let r = fs::write(&probe, "");
+        let _ = fs::remove_file(&probe);
+        r
+    } else {
+        fs::OpenOptions::new().write(true).open(path).map(|_| ())
+    };
+    let e = res.err()?;
+    // EROFS (30 on Linux and macOS): mounted read-only for this process
+    if e.raw_os_error() == Some(30) {
+        return Some(format!(
+            "{} is read-only for FQS: its systemd service has ProtectSystem=strict. Allow it with `sudo systemctl edit fqs`: [Service] ReadWritePaths={} — then `sudo systemctl restart fqs`.",
+            path.display(),
+            path.display()
+        ));
+    }
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        return Some(format!(
+            "FQS runs as {} and may not write {}: make it writable for that user or one of its groups.",
+            process_user(),
+            path.display()
+        ));
+    }
+    Some(format!("FQS cannot write {}: {e}", path.display()))
+}

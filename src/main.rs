@@ -72,6 +72,21 @@ enum Command {
     Reindex(ReindexArgs),
     /// Mint a short-lived admin JWT (`aud=fqs-admin`) for `/admin/api/*`
     AdminToken(AdminTokenArgs),
+    /// Frontend modules (KonText, …): what they need
+    Frontends(FrontendsArgs),
+}
+
+#[derive(Args, Debug)]
+struct FrontendsArgs {
+    #[command(subcommand)]
+    action: FrontendsAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum FrontendsAction {
+    /// The files and folders frontend modules write (for the installer: systemd
+    /// ReadWritePaths and permissions), as JSON
+    Paths,
 }
 
 #[derive(Args, Debug)]
@@ -1216,6 +1231,11 @@ async fn main() -> Result<()> {
         Command::Status(args) => handle_status(args)?,
         Command::Reindex(args) => handle_reindex(args)?,
         Command::AdminToken(args) => handle_admin_token(args)?,
+        Command::Frontends(args) => match args.action {
+            FrontendsAction::Paths => {
+                println!("{}", serde_json::to_string_pretty(&services::frontend_write_paths())?);
+            }
+        },
     }
     Ok(())
 }

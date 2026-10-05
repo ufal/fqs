@@ -19,7 +19,8 @@
     return m ? m.getAttribute("content") || "" : "";
   };
   const PROXY = meta("fqs-admin-proxy");
-  const PROXY_CSRF = meta("fqs-admin-csrf");
+  // the session's CSRF value; replaced when the TEITOK session is renewed (see below)
+  let proxyCsrf = meta("fqs-admin-csrf");
   const PROXY_USER = meta("fqs-admin-user");
 
   /** URL of an admin API call: `path` like "/corpora/x?full=1". */
@@ -167,10 +168,139 @@
       });
   }
 
+  // ── TEITOK session (inside TEITOK only) ───────────────────────────────────
+  // The page talks to FQS through TEITOK, so it needs the TEITOK session. When that
+  // ends, calls get 401 + login_required: the page asks to log in again (in another
+  // tab), waits for the new session, picks up its CSRF value and repeats the call.
+  // While someone works on the page, a ping keeps the session alive; it stops after
+  // half an hour without activity, and the session is checked again when the page
+  // comes back into view (e.g. after the computer slept).
+
+  const SESSION_PING_MS = 4 * 60 * 1000;
+  const IDLE_AFTER_MS = 30 * 60 * 1000;
+  let lastActivity = Date.now();
+  let lastSessionCheck = Date.now();
+  let loginWait = null;
+
+  async function fetchSession() {
+    lastSessionCheck = Date.now();
+    const res = await fetch(PROXY + "&fqsa=session&t=" + Date.now(), {
+      credentials: "same-origin",
+      headers: { Accept: "application/json" },
+    });
+    return res.json();
+  }
+
+  function sessionOverlay(loginUrl, note) {
+    let o = $("session-overlay");
+    if (!o) {
+      o = document.createElement("div");
+      o.id = "session-overlay";
+      o.className = "session-overlay";
+      o.setAttribute("role", "alertdialog");
+      o.setAttribute("aria-modal", "true");
+      const box = document.createElement("div");
+      box.className = "session-box";
+      const h = document.createElement("h2");
+      h.textContent = "Your TEITOK session has ended";
+      const p = document.createElement("p");
+      p.textContent =
+        "The FQS admin works through TEITOK and needs you to be logged in. Log in again in a new tab: this page carries on by itself once you are, and repeats what you were doing.";
+      const n = document.createElement("p");
+      n.id = "session-note";
+      n.className = "muted";
+      const row = document.createElement("div");
+      row.className = "row";
+      const a = document.createElement("a");
+      a.id = "session-login";
+      a.className = "button";
+      a.target = "_blank";
+      a.rel = "opener";
+      a.textContent = "Log in again";
+      const r = document.createElement("button");
+      r.type = "button";
+      r.className = "secondary";
+      r.textContent = "Reload page";
+      r.addEventListener("click", () => window.location.reload());
+      row.appendChild(a);
+      row.appendChild(r);
+      box.appendChild(h);
+      box.appendChild(p);
+      box.appendChild(n);
+      box.appendChild(row);
+      o.appendChild(box);
+      document.body.appendChild(o);
+    }
+    if (loginUrl) $("session-login").href = loginUrl;
+    $("session-note").textContent = note || "";
+    o.hidden = false;
+  }
+
+  /** Wait (one shared wait) until there is a TEITOK session again that may use the admin. */
+  function waitForLogin(loginUrl) {
+    if (loginWait) return loginWait;
+    sessionOverlay(loginUrl, "");
+    loginWait = new Promise((resolve) => {
+      const tick = async () => {
+        try {
+          const st = await fetchSession();
+          if (st.logged_in && st.allowed && st.csrf) {
+            proxyCsrf = st.csrf;
+            const o = $("session-overlay");
+            if (o) o.hidden = true;
+            loginWait = null;
+            resolve();
+            return;
+          }
+          sessionOverlay(
+            st.login_url || loginUrl,
+            st.logged_in ? "Logged in as " + st.user + ", who may not use the FQS admin." : ""
+          );
+        } catch (_) {}
+        setTimeout(tick, 3000);
+      };
+      setTimeout(tick, 3000);
+    });
+    return loginWait;
+  }
+
+  async function checkSession() {
+    if (!PROXY || loginWait) return;
+    try {
+      const st = await fetchSession();
+      if (st.logged_in && st.allowed) {
+        if (st.csrf) proxyCsrf = st.csrf;
+      } else {
+        waitForLogin(st.login_url);
+      }
+    } catch (_) {
+      // TEITOK unreachable for a moment: the next call reports it
+    }
+  }
+
+  if (PROXY) {
+    const active = () => {
+      const idleBefore = Date.now() - lastActivity;
+      lastActivity = Date.now();
+      // back after a pause: check now rather than at the first click that fails
+      if (idleBefore > SESSION_PING_MS || Date.now() - lastSessionCheck > SESSION_PING_MS) checkSession();
+    };
+    ["mousedown", "keydown", "wheel", "touchstart"].forEach((ev) =>
+      document.addEventListener(ev, active, { passive: true })
+    );
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible") checkSession();
+    });
+    setInterval(() => {
+      if (document.visibilityState === "visible" && Date.now() - lastActivity < IDLE_AFTER_MS) checkSession();
+    }, SESSION_PING_MS);
+  }
+
   async function api(path, opts = {}) {
     const headers = Object.assign({ Accept: "application/json" }, opts.headers || {});
     if (PROXY) {
-      headers["X-FQS-Admin-CSRF"] = PROXY_CSRF;
+      if (loginWait) await loginWait;
+      headers["X-FQS-Admin-CSRF"] = proxyCsrf;
     } else {
       const t = token();
       if (t) headers.Authorization = "Bearer " + t;
@@ -195,6 +325,23 @@
         const snippet = String(text || "").replace(/\s+/g, " ").trim().slice(0, 160);
         throw new Error("The admin API answered with something that is not JSON (" +
           (res.headers.get("content-type") || "no content type") + "): " + snippet);
+      }
+    }
+    if (PROXY && !opts._retried) {
+      // TEITOK session ended: log in again, then repeat this call (it did not reach FQS)
+      if (res.status === 401 && data && data.login_required) {
+        await waitForLogin(data.login_url);
+        return api(path, Object.assign({}, opts, { _retried: true }));
+      }
+      // a newer session (logged in again elsewhere): fetch its CSRF value and repeat
+      if (res.status === 403 && data && data.csrf_stale) {
+        const st = await fetchSession().catch(() => null);
+        if (st && st.logged_in && st.allowed && st.csrf) {
+          proxyCsrf = st.csrf;
+        } else {
+          await waitForLogin(st && st.login_url);
+        }
+        return api(path, Object.assign({}, opts, { _retried: true }));
       }
     }
     if (!res.ok) {

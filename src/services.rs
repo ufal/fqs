@@ -1743,6 +1743,34 @@ pub(crate) fn fcs_enabled_flag(settings: &Value, capabilities: &Value) -> Option
 
 
 
+/// The files and folders the frontend modules write, for the frontends in fqs.json or
+/// found on this machine: `{"paths": [{"frontend", "path", "dir", "exists"}]}`.
+pub fn frontend_write_paths() -> Value {
+    let configured = configured_frontends();
+    let mut out = Vec::new();
+    for module in crate::frontends::modules() {
+        let mut cfgs: Vec<(String, Value)> = configured
+            .iter()
+            .filter(|(id, cfg)| {
+                normalize_frontend_kind(cfg.get("kind").and_then(Value::as_str).unwrap_or("")) == module.kind()
+                    || id.eq_ignore_ascii_case(module.kind())
+            })
+            .cloned()
+            .collect();
+        if cfgs.is_empty() {
+            if let Some(c) = module.discover(&[]) {
+                cfgs.push((module.kind().to_string(), c));
+            }
+        }
+        for (id, cfg) in cfgs {
+            for (path, dir) in module.write_paths(&cfg) {
+                out.push(json!({ "frontend": id, "path": path.display().to_string(), "dir": dir, "exists": path.exists() }));
+            }
+        }
+    }
+    json!({ "paths": out })
+}
+
 /// Publish a catalogue corpus to a frontend through its frontend module.
 pub fn publish_to_frontend(
     frontend_id: &str,

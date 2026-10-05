@@ -214,6 +214,15 @@ pub fn valid_kontext_ident(s: &str) -> bool {
 }
 
 
+/// The corpora this module offers to KonText: those with a Pando index (kontext-pando
+/// sends their queries to FQS). Not CWB or Manatee corpora: KonText serves Manatee
+/// corpora without FQS, and a corpus without an index is not ready for any frontend —
+/// building indexes is not what publishing does.
+fn kontext_listable(c: &CatalogCorpus<'_>) -> bool {
+    !c.http_policy_mode.trim().eq_ignore_ascii_case("disabled")
+        && pando_index_dir_for(c.settings, c.project_root).is_some()
+}
+
 /// A KonText corpus name made from an FQS corpus id.
 fn kontext_name_for_id(id: &str) -> String {
     let s: String = id
@@ -391,8 +400,12 @@ fn shell_structures(info: &PandoCorpusInfo) -> Vec<String> {
 
 
 /// The marker line FQS puts in registries it writes (to update them, and only them).
-fn registry_marker(corpus_id: &str, index_id: Option<&str>) -> String {
-    format!("# fqs: corpus={corpus_id} index_id={}", index_id.unwrap_or("-"))
+fn registry_marker(corpus_id: &str, index_id: Option<&str>, encoded: bool) -> String {
+    format!(
+        "# fqs: corpus={corpus_id} index_id={}{}",
+        index_id.unwrap_or("-"),
+        if encoded { "" } else { " encoded=no" }
+    )
 }
 
 
@@ -419,6 +432,8 @@ fn shell_paths(cfg: Option<&Value>, registry_dir: &Path, ident: &str) -> ShellPa
 
 
 pub struct ShellSpec<'a> {
+    /// whether the one-token shell gets encoded (Manatee data), see create_manatee_shell
+    pub encoded: bool,
     pub ident: &'a str,
     pub corpus_id: &'a str,
     pub label: &'a str,
@@ -435,7 +450,7 @@ pub fn manatee_registry_text(spec: &ShellSpec<'_>, paths: &ShellPaths) -> String
     let mut o = String::new();
     o.push_str("# Manatee registry shell, written by FQS for kontext-pando: queries, frequencies and\n");
     o.push_str("# text types of this corpus come from Pando through FQS; Manatee only opens it.\n");
-    o.push_str(&registry_marker(spec.corpus_id, info.index_id.as_deref()));
+    o.push_str(&registry_marker(spec.corpus_id, info.index_id.as_deref(), spec.encoded));
     o.push('\n');
     o.push_str(&format!("NAME {}\n", registry_quote(spec.label)));
     let info_text = spec
@@ -532,7 +547,8 @@ fn find_encodevert(cfg: Option<&Value>) -> Option<PathBuf> {
 
 
 /// State of the registry file for `ident`: "ok" (present, and up to date if FQS wrote
-/// it), "outdated" (written by FQS for an older index), "missing".
+/// it), "unencoded" (FQS wrote it without Manatee data), "outdated" (written by FQS for
+/// an older index), "missing".
 pub fn registry_state(dir: &Path, ident: &str, index_id: Option<&str>) -> &'static str {
     let p = if dir.join(ident).is_file() { dir.join(ident) } else { dir.join(ident.to_ascii_lowercase()) };
     let Ok(text) = fs::read_to_string(&p) else {
@@ -542,9 +558,10 @@ pub fn registry_state(dir: &Path, ident: &str, index_id: Option<&str>) -> &'stat
         // not written by FQS: whoever made it maintains it
         None => "ok",
         Some(line) => {
-            let have = line.split("index_id=").nth(1).map(str::trim);
+            let have = line.split("index_id=").nth(1).and_then(|v| v.split_whitespace().next());
             match (have, index_id) {
                 (Some(h), Some(want)) if h != want => "outdated",
+                _ if line.contains("encoded=no") => "unencoded",
                 _ => "ok",
             }
         }
@@ -552,22 +569,33 @@ pub fn registry_state(dir: &Path, ident: &str, index_id: Option<&str>) -> &'stat
 }
 
 
-/// Write (or update, when FQS wrote it) the Manatee registry shell of a Pando corpus and
-/// encode it. Never touches a registry FQS did not write.
+/// Write (or update, when FQS wrote it) the Manatee registry shell of a Pando corpus.
+/// Never touches a registry FQS did not write.
+///
+/// The registry is what KonText needs: it opens every corpus with manatee.Corpus(registry)
+/// and refuses one whose PATH folder does not exist. kontext-pando sends concordances,
+/// frequencies, text types and the corpus info to Pando, so for those the Manatee data is
+/// never read. Some KonText functions still read Manatee data directly (word list,
+/// keywords, collocations, ...): with `encodevert` available FQS encodes a one-token
+/// vertical so that they find a (tiny, empty-looking) corpus instead of missing files;
+/// without it the registry and an empty data folder are written, and those functions fail
+/// for this corpus (they do not work on Pando corpora either way).
 pub fn create_manatee_shell(cfg: Option<&Value>, registry_dir: &Path, spec: &ShellSpec<'_>) -> Value {
     if !valid_kontext_ident(spec.ident) {
         return json!({ "status": "error", "message": "invalid corpus name" });
     }
     let paths = shell_paths(cfg, registry_dir, spec.ident);
     let state = registry_state(registry_dir, spec.ident, spec.info.index_id.as_deref());
-    if state == "ok" {
-        return json!({ "status": "ok", "path": paths.registry.display().to_string() });
+    let encodevert = find_encodevert(cfg);
+    if state == "ok" || (state == "unencoded" && encodevert.is_none()) {
+        return json!({ "status": "ok", "path": paths.registry.display().to_string(), "encoded": state == "ok" });
     }
-    // past this point the registry is missing, or FQS wrote it for an older index
-    let Some(encodevert) = find_encodevert(cfg) else {
-        return json!({ "status": "missing", "path": paths.registry.display().to_string(),
-            "message": "Manatee's encodevert was not found (set frontends[].encodevert in fqs.json), so FQS cannot build the registry shell." });
+    // past this point the registry is missing, FQS wrote it for an older index, or it can
+    // now be encoded
+    let Some(encodevert) = encodevert else {
+        return write_unencoded_shell(registry_dir, &paths, spec, state);
     };
+    let spec = &ShellSpec { encoded: true, ..*spec };
     let text = manatee_registry_text(spec, &paths);
     let vert = manatee_shell_vertical(spec.info);
     let _guard = FILES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -614,10 +642,38 @@ pub fn create_manatee_shell(cfg: Option<&Value>, registry_dir: &Path, spec: &She
         fs::write(&reg_tmp, &text).map_err(|e| format!("Cannot write in {}: {e}", registry_dir.display()))?;
         fs::rename(&reg_tmp, &paths.registry).map_err(|e| format!("Cannot write {}: {e}", paths.registry.display()))?;
         Ok(json!({
-            "status": if state == "outdated" { "updated" } else { "added" },
+            "status": if state == "missing" { "added" } else { "updated" },
             "path": paths.registry.display().to_string(),
             "data": paths.data.display().to_string(),
             "vertical": paths.vertical.display().to_string(),
+            "encoded": true,
+        }))
+    };
+    step().unwrap_or_else(|e| json!({ "status": "error", "path": paths.registry.display().to_string(), "message": e }))
+}
+
+/// The registry without Manatee data: an empty PATH folder (and the one-token vertical,
+/// so that `encodevert` can still be run later; FQS does so itself once it finds it).
+fn write_unencoded_shell(registry_dir: &Path, paths: &ShellPaths, spec: &ShellSpec<'_>, state: &str) -> Value {
+    let spec = &ShellSpec { encoded: false, ..*spec };
+    let text = manatee_registry_text(spec, paths);
+    let vert = manatee_shell_vertical(spec.info);
+    let _guard = FILES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let step = || -> Result<Value, String> {
+        for d in [Some(registry_dir), Some(paths.data.as_path()), paths.vertical.parent()].into_iter().flatten() {
+            fs::create_dir_all(d).map_err(|e| format!("Cannot create {}: {e}", d.display()))?;
+        }
+        fs::write(&paths.vertical, &vert).map_err(|e| format!("Cannot write {}: {e}", paths.vertical.display()))?;
+        let reg_tmp = registry_dir.join(format!(".{}.fqs-new", spec.ident));
+        fs::write(&reg_tmp, &text).map_err(|e| format!("Cannot write in {}: {e}", registry_dir.display()))?;
+        fs::rename(&reg_tmp, &paths.registry).map_err(|e| format!("Cannot write {}: {e}", paths.registry.display()))?;
+        Ok(json!({
+            "status": if state == "missing" { "added" } else { "updated" },
+            "path": paths.registry.display().to_string(),
+            "data": paths.data.display().to_string(),
+            "vertical": paths.vertical.display().to_string(),
+            "encoded": false,
+            "message": "Registry written without Manatee data (encodevert not found): searching works through Pando; KonText's word list, keywords and collocations do not work for this corpus.",
         }))
     };
     step().unwrap_or_else(|e| json!({ "status": "error", "path": paths.registry.display().to_string(), "message": e }))
@@ -627,6 +683,12 @@ pub fn create_manatee_shell(cfg: Option<&Value>, registry_dir: &Path, spec: &She
 /// Add a corpus to KonText: corplist.xml and (kontext-pando) pando_corpora.json, and
 /// report what else KonText needs (Manatee registry, restart).
 fn publish_kontext(cfg: Option<&Value>, req: &PublishRequest<'_>) -> Result<Value, String> {
+    if !req.index_dir.as_deref().is_some_and(|d| d.join("corpus.info").is_file()) {
+        return Err(format!(
+            "'{}' has no Pando index: only Pando corpora are published to KonText from FQS (index the corpus with Pando first; Manatee corpora are configured in KonText itself)",
+            req.corpus_id
+        ));
+    }
     let suggested = kontext_name_for_id(req.corpus_id);
     let ident = req.name.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(&suggested);
     if !valid_kontext_ident(ident) {
@@ -708,6 +770,7 @@ fn publish_kontext(cfg: Option<&Value>, req: &PublishRequest<'_>) -> Result<Valu
                 cfg,
                 &dir,
                 &ShellSpec {
+                    encoded: true,
                     ident,
                     corpus_id: req.corpus_id,
                     label: if req.label.trim().is_empty() { ident } else { req.label.trim() },
@@ -777,13 +840,12 @@ fn kontext_coverage_for_frontend(frontend_id: &str, cfg: &Value, corpora: &[Cata
             Some("No KonText corplist.xml found (set frontends[].corplist in fqs.json or FQS_KONTEXT_CORPLIST).".to_string()),
         ),
     };
-    let writable = |p: &Option<PathBuf>| {
-        p.as_ref()
-            .map(|p| fs::OpenOptions::new().write(true).open(p).is_ok())
-            .unwrap_or(false)
-    };
-    let corplist_writable = writable(&corplist_path);
-    let pando_writable = writable(&pando_path);
+    // the real files (corplist.xml may be a symlink)
+    let real = |p: &Option<PathBuf>| p.as_ref().map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()));
+    let corplist_problem = real(&corplist_path).and_then(|p| write_problem(&p, false));
+    let pando_problem = real(&pando_path).and_then(|p| write_problem(&p, false));
+    let corplist_writable = corplist_path.is_some() && corplist_problem.is_none();
+    let pando_writable = pando_path.is_some() && pando_problem.is_none();
     let have_corplist = corplist_path.is_some() && setup_hint.is_none();
     let ident_set: std::collections::HashSet<String> = idents.iter().map(|s| s.to_ascii_lowercase()).collect();
     let pando_set = pando_path.as_deref().and_then(pando_corpora_idents);
@@ -793,7 +855,7 @@ fn kontext_coverage_for_frontend(frontend_id: &str, cfg: &Value, corpora: &[Cata
     let mut missing = Vec::new();
     if have_corplist {
         for c in corpora {
-            if !c.is_current || !corpus_servable_through_fqs(c) {
+            if !c.is_current || !kontext_listable(c) {
                 continue;
             }
             let ident = suggested_kontext_ident(c);
@@ -805,7 +867,7 @@ fn kontext_coverage_for_frontend(frontend_id: &str, cfg: &Value, corpora: &[Cata
                 .and_then(|d| read_pando_corpus_info(&d))
                 .and_then(|i| i.index_id);
             let registry_st = registry.as_deref().map(|d| registry_state(d, &ident, index_id.as_deref()));
-            let in_registry = registry_st.map(|st| st == "ok");
+            let in_registry = registry_st.map(|st| st == "ok" || st == "unencoded");
             if in_corplist && in_pando != Some(false) && in_registry != Some(false) {
                 continue;
             }
@@ -835,29 +897,31 @@ fn kontext_coverage_for_frontend(frontend_id: &str, cfg: &Value, corpora: &[Cata
     if have_corplist && pando_path.is_none() {
         hints.push("No pando_corpora.json found: KonText can only serve Pando corpora with kontext-pando; set frontends[].pando_corpora in fqs.json if it is installed.".into());
     }
-    if have_corplist && !corplist_writable {
-        hints.push(format!("FQS cannot write {}: give the FQS user write access to add corpora from here.",
-            corplist_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()));
+    if have_corplist {
+        if let Some(h) = &corplist_problem {
+            hints.push(h.clone());
+        }
     }
-    if pando_path.is_some() && !pando_writable {
-        hints.push(format!("FQS cannot write {}.",
-            pando_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()));
+    if let Some(h) = &pando_problem {
+        hints.push(h.clone());
     }
     if registry.is_none() && have_corplist {
         hints.push("Manatee registry folder not found (set frontends[].registry): FQS cannot check or build the registry files KonText needs.".into());
     }
-    let registry_writable = registry.as_ref().is_some_and(|d| {
-        let probe = d.join(format!(".fqs-write-test-{}", std::process::id()));
-        let ok = fs::write(&probe, "").is_ok();
-        let _ = fs::remove_file(&probe);
-        ok
-    });
-    if registry.is_some() && have_corplist && !registry_writable {
-        hints.push(format!("FQS cannot write in {}: it cannot build registry files there.",
-            registry.as_ref().map(|p| p.display().to_string()).unwrap_or_default()));
+    // registry files, their data and verticals: all three folders
+    if let (Some(reg), true) = (&registry, have_corplist) {
+        let paths = shell_paths(Some(cfg), reg, "x");
+        let dirs = [Some(reg.clone()), paths.data.parent().map(Path::to_path_buf), paths.vertical.parent().map(Path::to_path_buf)];
+        for d in dirs.into_iter().flatten() {
+            if !d.is_dir() {
+                hints.push(format!("{} does not exist: create it (writable for FQS) for the Manatee registry files.", d.display()));
+            } else if let Some(h) = write_problem(&d, true) {
+                hints.push(h);
+            }
+        }
     }
     if registry.is_some() && have_corplist && find_encodevert(Some(cfg)).is_none() {
-        hints.push("Manatee's encodevert not found (set frontends[].encodevert): FQS cannot build registry files.".into());
+        hints.push("Manatee's encodevert not found (set frontends[].encodevert): registry files are written without Manatee data, which is enough for searching through Pando; KonText's word list, keywords and collocations then fail for those corpora.".into());
     }
     let mut files = vec![];
     if let Some(p) = &corplist_path {
@@ -926,6 +990,25 @@ impl FrontendModule for Kontext {
     }
     fn processes(&self) -> Vec<Value> {
         discover_kontext_processes()
+    }
+    fn write_paths(&self, cfg: &Value) -> Vec<(PathBuf, bool)> {
+        let mut out = Vec::new();
+        let real = |p: PathBuf| p.canonicalize().unwrap_or(p);
+        let (corplist, _) = resolve_kontext_corplist(Some(cfg));
+        if let Some(c) = &corplist {
+            out.push((real(c.clone()), false));
+        }
+        if let (Some(p), _) = resolve_pando_corpora(Some(cfg), corplist.as_deref()) {
+            out.push((real(p), false));
+        }
+        if let Some(reg) = resolve_manatee_registry(Some(cfg)) {
+            let paths = shell_paths(Some(cfg), &reg, "x");
+            out.push((reg.clone(), true));
+            for d in [paths.data.parent(), paths.vertical.parent()].into_iter().flatten() {
+                out.push((d.to_path_buf(), true));
+            }
+        }
+        out
     }
     fn coverage(&self, frontend_id: &str, cfg: &Value, corpora: &[CatalogCorpus<'_>]) -> Value {
         kontext_coverage_for_frontend(frontend_id, cfg, corpora)
@@ -1002,22 +1085,32 @@ mod tests {
         )
         .unwrap();
 
+        // a TEITOK project with a Pando index, and one with only CWB (not offered)
+        let pando_root = dir.join("migrantstories");
+        fs::create_dir_all(pando_root.join("pando")).unwrap();
+        fs::write(pando_root.join("pando/corpus.info"), "size=1\npositional=word\n").unwrap();
+        let cwb_root = dir.join("cwbonly");
+        fs::create_dir_all(cwb_root.join("cqp")).unwrap();
+        let (pr, cr) = (pando_root.display().to_string(), cwb_root.display().to_string());
         let settings = json!({});
         let caps = json!({});
-        let rows = [CatalogCorpus {
-            id: "migrantstories",
-            label: "Migrant Stories",
-            preferred_backend: "pando",
+        let row = |id: &'static str, root: &'static str| CatalogCorpus {
+            id,
+            label: id,
+            preferred_backend: "auto",
             is_current: true,
             http_policy_mode: "public_query",
             interface_preference: Some("teitok"),
             source_kind: "teitok",
             supports_xml: true,
-            project_root: None,
-            project_url: Some("https://example/teitok/migrantstories/index.php"),
+            project_root: Some(root),
+            project_url: Some("https://example/teitok/x/index.php"),
             settings: &settings,
             capabilities: &caps,
-        }];
+        };
+        let pr: &'static str = Box::leak(pr.into_boxed_str());
+        let cr: &'static str = Box::leak(cr.into_boxed_str());
+        let rows = [row("migrantstories", pr), row("cwbonly", cr)];
         let cfg = json!({
             "kind": "kontext",
             "corplist": corplist.display().to_string(),
@@ -1028,29 +1121,9 @@ mod tests {
             missing.iter().any(|m| m["id"] == "migrantstories"),
             "expected migrantstories in missing: {report}"
         );
+        assert!(!missing.iter().any(|m| m["id"] == "cwbonly"), "a corpus without a Pando index is not offered: {report}");
         assert_eq!(report["appendable"], true);
         let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn teitok_corpus_is_kontext_eligible_without_pando_flag() {
-        let settings = json!({});
-        let caps = json!({});
-        let c = CatalogCorpus {
-            id: "migrantstories",
-            label: "Migrant Stories",
-            preferred_backend: "auto",
-            is_current: true,
-            http_policy_mode: "public_query",
-            interface_preference: Some("teitok"),
-            source_kind: "teitok",
-            supports_xml: true,
-            project_root: None,
-            project_url: Some("https://example/teitok/migrantstories/index.php"),
-            settings: &settings,
-            capabilities: &caps,
-        };
-        assert!(corpus_servable_through_fqs(&c));
     }
 
     #[test]
@@ -1113,7 +1186,10 @@ mod tests {
     const UD_INFO: &str = "size=7493\npositional=deprel,feats,form,id,lemma,upos,word,xpos\nstructural=del,s,text\nregion_attrs=s_id,del_tok_id,del_id,text_id\ndefault_within=text\nzerowidth=del\nkv_pipe=feats\nhead_attrs=upos,deprel,lemma\nindex_id=20261004T114036536Z-1306bb72\n";
 
     fn ud_info() -> PandoCorpusInfo {
-        let d = std::env::temp_dir().join(format!("fqs-ci-{}", std::process::id()));
+        // one folder per call: tests run in parallel
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let d = std::env::temp_dir().join(format!("fqs-ci-{}-{n}", std::process::id()));
         fs::create_dir_all(&d).unwrap();
         fs::write(d.join("corpus.info"), UD_INFO).unwrap();
         let info = read_pando_corpus_info(&d).unwrap();
@@ -1135,7 +1211,7 @@ mod tests {
             data: PathBuf::from("/var/lib/manatee/data/ud-demo"),
             vertical: PathBuf::from("/var/lib/manatee/vert/ud-demo.vert"),
         };
-        let spec = ShellSpec { ident: "ud-demo", corpus_id: "ud-demo", label: "UD demo \"EWT\"",
+        let spec = ShellSpec { encoded: true, ident: "ud-demo", corpus_id: "ud-demo", label: "UD demo \"EWT\"",
             description: None, language: Some("en"), info: &info };
         let reg = manatee_registry_text(&spec, &paths);
         assert!(reg.contains("NAME \"UD demo \\\"EWT\\\"\"\n"), "{reg}");
@@ -1167,7 +1243,7 @@ mod tests {
         let cfg = json!({ "encodevert": ev.display().to_string() });
         let mut info = ud_info();
         let spec = |info: &PandoCorpusInfo| create_manatee_shell(Some(&cfg), &reg_dir, &ShellSpec {
-            ident: "ud-demo", corpus_id: "ud-demo", label: "UD demo", description: None, language: None, info });
+            encoded: true, ident: "ud-demo", corpus_id: "ud-demo", label: "UD demo", description: None, language: None, info });
         let r = spec(&info);
         assert_eq!(r["status"], "added", "{r}");
         assert!(d.join("data/ud-demo/word.lex").is_file());
@@ -1183,9 +1259,28 @@ mod tests {
         fs::write(reg_dir.join("other"), "NAME \"hand made\"\n").unwrap();
         assert_eq!(registry_state(&reg_dir, "other", Some("x")), "ok");
         let r = create_manatee_shell(Some(&cfg), &reg_dir, &ShellSpec {
-            ident: "other", corpus_id: "other", label: "x", description: None, language: None, info: &info });
+            encoded: true, ident: "other", corpus_id: "other", label: "x", description: None, language: None, info: &info });
         assert_eq!(r["status"], "ok");
         assert_eq!(fs::read_to_string(reg_dir.join("other")).unwrap(), "NAME \"hand made\"\n");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+
+    #[test]
+    fn registry_without_encodevert_has_an_empty_data_folder() {
+        let d = std::env::temp_dir().join(format!("fqs-noenc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        let reg_dir = d.join("registry");
+        let info = ud_info();
+        let spec = ShellSpec { encoded: true, ident: "ud-demo", corpus_id: "ud-demo", label: "UD demo",
+            description: None, language: None, info: &info };
+        let r = write_unencoded_shell(&reg_dir, &shell_paths(None, &reg_dir, "ud-demo"), &spec, "missing");
+        assert_eq!(r["status"], "added", "{r}");
+        assert_eq!(r["encoded"], false);
+        assert!(d.join("data/ud-demo").is_dir());
+        assert!(fs::read_dir(d.join("data/ud-demo")).unwrap().next().is_none());
+        assert!(fs::read_to_string(reg_dir.join("ud-demo")).unwrap().contains(" encoded=no\n"));
+        assert_eq!(registry_state(&reg_dir, "ud-demo", info.index_id.as_deref()), "unencoded");
         let _ = fs::remove_dir_all(&d);
     }
 
