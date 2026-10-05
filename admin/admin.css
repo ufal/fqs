@@ -452,3 +452,8 @@ label.scan-roots-field { min-width: 18rem; flex: 1; }
 .label-sm { font-size: 0.8rem; }
 .corpus-none { font-size: 0.85rem; margin: 0.25rem 0; }
 .err-xs { font-size: 0.75rem; margin-top: 0.25rem; }
+
+/* KonText publishing steps (corplist / Pando / registry) */
+.step { display: inline-block; min-width: 1.2em; text-align: center; font-weight: 600; color: var(--muted); }
+.step.ok { color: var(--accent); }
+.step.bad { color: var(--danger); }

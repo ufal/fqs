@@ -621,6 +621,12 @@
     }
   }
 
+  /** Only http(s) and relative links become clickable (no javascript: and the like). */
+  function safeHref(u) {
+    const t = String(u || "").trim();
+    return /^https?:\/\//i.test(t) || (t.startsWith("/") && !t.startsWith("//")) || /^[\w.-]+(\/|\?|$)/.test(t) && !/^[\w+.-]+:/.test(t);
+  }
+
   function esc(s) {
     return String(s == null ? "" : s)
       .replace(/&/g, "&amp;")
@@ -1278,6 +1284,7 @@
       advEl.innerHTML = advNotes.map((n) => "<div>" + esc(n) + "</div>").join("");
     }
 
+    const placed = { fcs: false };
     if (!kinds.length) {
       html += '<p class="muted">No frontends in use yet.</p>';
     } else {
@@ -1336,11 +1343,11 @@
               "</div></div>";
             if (f.url) {
               html +=
-                '<div class="mono"><a href="' +
-                esc(f.url) +
-                '" target="_blank" rel="noopener">' +
-                esc(f.url) +
-                "</a></div>";
+                '<div class="mono">' +
+                (safeHref(f.url)
+                  ? '<a href="' + esc(f.url) + '" target="_blank" rel="noopener">' + esc(f.url) + "</a>"
+                  : esc(f.url)) +
+                "</div>";
             }
             if (f.restartable) {
               html +=
@@ -1369,26 +1376,48 @@
             "Corpora (catalog)"
           );
         }
+        // what belongs to this frontend: its processes and the corpora it still lacks
+        // (frontends with a module in FQS)
+        if (k.processes) html += processesHtml(k.processes);
+        const fcov = frontendCoverageHtml(cov, k.id);
+        if (fcov) {
+          html += fcov;
+          placed[k.id] = true;
+        }
+        if (k.id === "fcs") {
+          html += fcsCoverageHtml(cov);
+          placed.fcs = true;
+        }
         html += "</div>";
       });
     }
 
-    if (data.gunicorn_processes && data.gunicorn_processes.length) {
-      html += '<h3 class="section-title">gunicorn processes</h3>';
-      html +=
-        '<table class="data-table"><thead><tr><th>PID</th><th>Command</th></tr></thead><tbody>';
-      data.gunicorn_processes.forEach((g) => {
+    // reports of frontends whose card is not shown: a small card of their own
+    const reportKinds = [];
+    ((cov && cov.frontends) || []).forEach((r) => {
+      if (r.kind && !placed[r.kind] && reportKinds.indexOf(r.kind) < 0) reportKinds.push(r.kind);
+    });
+    reportKinds.forEach((kind) => {
+      const inner = frontendCoverageHtml(cov, kind);
+      const label = ((cov.frontends || []).find((r) => r.kind === kind) || {}).label || kind;
+      if (inner) {
         html +=
-          "<tr><td class='mono'>" +
-          esc(g.pid) +
-          "</td><td class='mono'>" +
-          esc(g.cmd) +
-          "</td></tr>";
-      });
-      html += "</tbody></table>";
+          '<div class="frontend-kind"><div class="frontend-kind-head"><strong>' +
+          esc(label) +
+          "</strong></div>" +
+          inner +
+          "</div>";
+      }
+    });
+    if (!placed.fcs) {
+      const inner = fcsCoverageHtml(cov);
+      if (inner) {
+        html +=
+          '<div class="frontend-kind"><div class="frontend-kind-head"><strong>CLARIN FCS</strong></div>' +
+          inner +
+          "</div>";
+      }
     }
-
-    html += renderCoverageSection(cov);
 
     $("frontends-view").innerHTML = html;
     $("frontends-out").textContent = JSON.stringify(
@@ -1399,9 +1428,15 @@
     $("frontends-view").querySelectorAll(".btn-fe-restart").forEach((btn) => {
       btn.addEventListener("click", () => restartFrontend(btn.dataset.id));
     });
-    $("frontends-view").querySelectorAll(".btn-corplist-append").forEach((btn) => {
+    $("frontends-view").querySelectorAll(".btn-fe-publish").forEach((btn) => {
       btn.addEventListener("click", () =>
-        appendCorplist(btn.dataset.frontend, btn.dataset.ident, btn.dataset.corpus).catch((e) =>
+        publishToFrontend(
+          btn.dataset.frontend,
+          btn.dataset.corpus,
+          btn.dataset.name,
+          btn.dataset.label,
+          btn.dataset.restartable === "1"
+        ).catch((e) =>
           showBanner(e.message, true)
         )
       );
@@ -1415,36 +1450,78 @@
     });
   }
 
-  function renderCoverageSection(cov) {
-    if (!cov || cov.error) {
-      return "";
-    }
-    let html = "";
-    const kontextRows = cov.kontext || [];
-    kontextRows.forEach((k) => {
-      const missing = k.missing || [];
-      if (!missing.length && !k.setup_hint) return;
-      html += '<div class="frontend-kind coverage-block">';
+  function processesHtml(procs) {
+    if (!procs || !procs.length) return "";
+    let html =
+      '<details class="corpus-fold"><summary>Processes <span class="muted">(' +
+      procs.length +
+      ")</span></summary>";
+    html +=
+      '<div class="corpus-fold-body"><table class="data-table"><thead><tr><th>PID</th><th>Server</th><th>Command</th></tr></thead><tbody>';
+    procs.forEach((g) => {
       html +=
-        '<div class="frontend-kind-head"><strong>Not in KonText</strong>' +
-        (k.corplist_path
-          ? ' <span class="muted mono">' + esc(k.corplist_path) + "</span>"
-          : "") +
-        "</div>";
-      if (k.setup_hint && !missing.length) {
-        html += '<p class="muted muted-sm85">' + esc(k.setup_hint) + "</p>";
+        "<tr><td class='mono'>" +
+        esc(g.pid) +
+        "</td><td class='mono'>" +
+        esc(g.server || "") +
+        "</td><td class='mono muted-xs'>" +
+        esc(g.cmd) +
+        "</td></tr>";
+    });
+    return html + "</tbody></table></div></details>";
+  }
+
+  function stepMark(v) {
+    if (v === true) return '<span class="step ok" title="done">✓</span>';
+    if (v === false) return '<span class="step bad" title="missing">✗</span>';
+    return '<span class="step" title="unknown">?</span>';
+  }
+
+  /**
+   * What a frontend (with a module in FQS) still lacks: per corpus, the module's steps
+   * (KonText: corpus list, Pando entry, Manatee registry), and a button to publish it.
+   */
+  function frontendCoverageHtml(cov, kind) {
+    if (!cov || cov.error) return "";
+    const reports = (cov.frontends || cov.kontext || []).filter((r) => (r.kind || "kontext") === kind);
+    let html = "";
+    reports.forEach((k) => {
+      const missing = k.missing || [];
+      const hints = k.hints || (k.setup_hint ? [k.setup_hint] : []);
+      const steps = k.steps || [["corplist", "List"], ["pando_corpora", "Pando"], ["registry", "Registry"]];
+      const label = k.label || kind;
+      if (!missing.length && !hints.length) return;
+      html += '<div class="coverage-block">';
+      const files = (k.files || []).map((f) => f[0] + " " + f[1]);
+      if (files.length) {
+        html += '<div class="muted mono muted-xs">' + files.map(esc).join(" · ") + "</div>";
       }
+      hints.forEach((h) => {
+        html += '<p class="muted muted-sm85">' + esc(h) + "</p>";
+      });
       if (missing.length) {
         const open = missing.length <= 12 ? " open" : "";
         html +=
           '<details class="corpus-fold"' +
           open +
-          "><summary>Missing <span class=\"muted\">(" +
+          "><summary>Not (fully) in " +
+          esc(label) +
+          ' <span class="muted">(' +
           missing.length +
           ")</span></summary>";
         html +=
-          '<div class="corpus-fold-body"><table class="data-table"><thead><tr><th>Corpus</th><th>Backend</th><th>Ident</th><th></th></tr></thead><tbody>';
+          '<div class="corpus-fold-body"><table class="data-table"><thead><tr><th>Corpus</th><th>Backend</th><th>Name in ' +
+          esc(label) +
+          "</th>" +
+          steps.map((st) => "<th>" + esc(st[1]) + "</th>").join("") +
+          "<th></th></tr></thead><tbody>";
         missing.forEach((m) => {
+          const ms = m.steps || {
+            corplist: m.in_corplist,
+            pando_corpora: m.in_pando_corpora,
+            registry: m.in_registry,
+          };
+          const name = m.suggested_name || m.suggested_ident || m.id;
           html +=
             "<tr><td><strong>" +
             esc(m.label || m.id) +
@@ -1453,22 +1530,33 @@
             "</div></td><td class='mono'>" +
             esc(m.preferred_backend || "—") +
             "</td><td class='mono'>" +
-            esc(m.suggested_ident || "") +
-            "</td><td>";
-          if (k.appendable) {
+            esc(name) +
+            "</td>" +
+            steps
+              .map((st) => {
+                let mark = stepMark(ms[st[0]]);
+                if (st[0] === "registry" && m.registry_outdated) {
+                  mark = '<span class="step bad" title="older than the Pando index">outdated</span>';
+                }
+                return "<td>" + mark + "</td>";
+              })
+              .join("") +
+            "<td>";
+          if (k.publishable !== false && k.appendable !== false) {
             html +=
-              "<button type='button' class='secondary btn-corplist-append' data-frontend='" +
+              "<button type='button' class='secondary btn-fe-publish' data-frontend='" +
               esc(k.frontend_id) +
-              "' data-ident='" +
-              esc(m.suggested_ident || m.id) +
+              "' data-name='" +
+              esc(name) +
               "' data-corpus='" +
               esc(m.id) +
-              "'>Add to KonText</button>";
-          } else {
-            html +=
-              '<span class="muted muted-xs">' +
-              esc(k.setup_hint || m.suggested_xml || "") +
-              "</span>";
+              "' data-label='" +
+              esc(label) +
+              "' data-restartable='" +
+              (k.restartable ? "1" : "0") +
+              "'>Add to " +
+              esc(label) +
+              "</button>";
           }
           html += "</td></tr>";
         });
@@ -1476,73 +1564,81 @@
       }
       html += "</div>";
     });
-
-    const fcsMissing =
-      (cov.fcs && (cov.fcs.missing || cov.fcs.undecided)) || [];
-    if (fcsMissing.length) {
-      html += '<div class="frontend-kind coverage-block">';
-      html +=
-        '<div class="frontend-kind-head"><strong>Not in FCS</strong></div>';
-      const open = fcsMissing.length <= 12 ? " open" : "";
-      html +=
-        '<details class="corpus-fold"' +
-        open +
-        "><summary>Missing <span class=\"muted\">(" +
-        fcsMissing.length +
-        ")</span></summary>";
-      html +=
-        '<div class="corpus-fold-body"><table class="data-table"><thead><tr><th>Corpus</th><th>Backend</th><th></th></tr></thead><tbody>';
-      fcsMissing.forEach((u) => {
-        html +=
-          "<tr><td><strong>" +
-          esc(u.label || u.id) +
-          '</strong><div class="mono muted muted-xs">' +
-          esc(u.id) +
-          "</div></td><td class='mono'>" +
-          esc(u.preferred_backend || "—") +
-          "</td><td class='row row-start-wrap'>" +
-          "<button type='button' class='secondary btn-fcs-flag' data-corpus='" +
-          esc(u.id) +
-          "' data-enabled='1'>Add to FCS</button>" +
-          "<button type='button' class='secondary btn-fcs-flag' data-corpus='" +
-          esc(u.id) +
-          "' data-enabled='0'>Exclude</button>" +
-          "</td></tr>";
-      });
-      html += "</tbody></table></div></details></div>";
-    }
     return html;
   }
 
-  async function appendCorplist(frontendId, ident, corpusId) {
+  /** "Not in FCS": corpora FCS could serve that have no decision yet. */
+  function fcsCoverageHtml(cov) {
+    if (!cov || cov.error) return "";
+    const fcsMissing = (cov.fcs && (cov.fcs.missing || cov.fcs.undecided)) || [];
+    if (!fcsMissing.length) return "";
+    const open = fcsMissing.length <= 12 ? " open" : "";
+    let html =
+      '<div class="coverage-block"><details class="corpus-fold"' +
+      open +
+      '><summary>Not in FCS <span class="muted">(' +
+      fcsMissing.length +
+      ")</span></summary>";
+    html +=
+      '<div class="corpus-fold-body"><table class="data-table"><thead><tr><th>Corpus</th><th>Backend</th><th></th></tr></thead><tbody>';
+    fcsMissing.forEach((u) => {
+      html +=
+        "<tr><td><strong>" +
+        esc(u.label || u.id) +
+        '</strong><div class="mono muted muted-xs">' +
+        esc(u.id) +
+        "</div></td><td class='mono'>" +
+        esc(u.preferred_backend || "—") +
+        "</td><td class='row row-start-wrap'>" +
+        "<button type='button' class='secondary btn-fcs-flag' data-corpus='" +
+        esc(u.id) +
+        "' data-enabled='1'>Add to FCS</button>" +
+        "<button type='button' class='secondary btn-fcs-flag' data-corpus='" +
+        esc(u.id) +
+        "' data-enabled='0'>Exclude</button>" +
+        "</td></tr>";
+    });
+    return html + "</tbody></table></div></details></div>";
+  }
+
+  async function publishToFrontend(frontendId, corpusId, name, label, restartable) {
     if (
       !confirm(
-        "Append <corpus ident=\"" +
-          ident +
-          "\" …/> to the allowlisted KonText corplist for '" +
+        "Add '" +
+          corpusId +
+          "' to " +
+          label +
+          " ('" +
           frontendId +
-          "'?"
+          "') as '" +
+          name +
+          "'? FQS writes the frontend's own files for it (backups are kept)."
       )
     ) {
       return;
     }
-    const data = await api(
-      "/frontends/" + encodeURIComponent(frontendId) + "/corplist/append",
-      {
-        method: "POST",
-        body: JSON.stringify({
-          ident,
-          corpus_id: corpusId || null,
-          sentence_struct: "s",
-        }),
+    const data = await api("/frontends/" + encodeURIComponent(frontendId) + "/publish", {
+      method: "POST",
+      body: JSON.stringify({ corpus_id: corpusId, name }),
+    });
+    const steps = data.steps || [];
+    const msgs = steps.map((st) => (st.label || st.key) + ": " + (st.status || "?"));
+    const problems = steps
+      .filter((st) => st.message && ["ok", "added", "updated", "present"].indexOf(st.status) < 0)
+      .map((st) => st.message);
+    let msg = name + " — " + msgs.join(", ") + (problems.length ? ". " + problems.join(" ") : "");
+    if (data.restart_needed) {
+      if (data.restartable || restartable) {
+        showBanner(msg, !data.complete);
+        if (confirm(label + " reads its corpus list at start-up. Restart '" + frontendId + "' now?")) {
+          await restartFrontend(frontendId, true);
+          return;
+        }
+      } else {
+        msg += " Restart " + label + " to make it appear (no restart configured in fqs.json).";
       }
-    );
-    showBanner(
-      data.already_present
-        ? "Already in corplist: " + ident
-        : "Added " + ident + " to corplist" + (data.catalog_kontext_synced ? " (catalog synced)" : ""),
-      false
-    );
+    }
+    showBanner(msg, !data.complete);
     await refreshFrontends();
   }
 
@@ -1603,13 +1699,11 @@
         "</td><td class='mono muted-xs'>" +
         esc(r.http_policy_mode || "—") +
         "</td><td class='mono muted-xs'>";
-      if (url) {
-        html +=
-          '<a href="' +
-          esc(url) +
-          '" target="_blank" rel="noopener">' +
-          esc(url.length > 48 ? url.slice(0, 46) + "…" : url) +
-          "</a>";
+      const shortUrl = url.length > 48 ? url.slice(0, 46) + "…" : url;
+      if (url && safeHref(url)) {
+        html += '<a href="' + esc(url) + '" target="_blank" rel="noopener">' + esc(shortUrl) + "</a>";
+      } else if (url) {
+        html += esc(shortUrl);
       } else {
         html += "—";
       }
@@ -1641,9 +1735,9 @@
     renderFrontends(fe, cov);
   }
 
-  async function restartFrontend(id) {
+  async function restartFrontend(id, confirmed) {
     try {
-      if (!confirm("Restart frontend '" + id + "' via its configured restart action?")) return;
+      if (!confirmed && !confirm("Restart frontend '" + id + "' via its configured restart action?")) return;
       const data = await api("/frontends/" + encodeURIComponent(id) + "/restart", {
         method: "POST",
         body: "{}",

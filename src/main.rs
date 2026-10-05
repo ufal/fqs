@@ -36,6 +36,7 @@ mod limits;
 mod pando_lib;
 mod scan;
 mod services;
+mod frontends;
 
 use hot_corpus::{
     pando_query_body, wrap_pando_server_as_fqs_raw, HotCorpusConfig, HotCorpusManager, HotGuard,
@@ -765,6 +766,11 @@ struct UpsertJsonArgs {
     /// Read JSON object or array from stdin
     #[arg(long, default_value_t = false)]
     stdin: bool,
+    /// Replace existing rows completely. Default: fields the JSON leaves out keep their
+    /// stored value, and so do choices made in the FQS admin (settings.fcs.enabled,
+    /// settings.kontext corpname / public_url / url) unless the JSON sets them.
+    #[arg(long = "replace", default_value_t = false)]
+    replace: bool,
     #[command(flatten)]
     db: DbPathArg,
 }
@@ -1388,11 +1394,17 @@ fn handle_corpora(args: CorporaArgs) -> Result<()> {
         CorporaAction::UpsertJson(args) => {
             let conn = open_db(&resolve_db_path(&args.db))?;
             let payload = read_json_input(&args)?;
-            let entries = parse_entries_from_json(&payload)?;
+            let mut entries = parse_entries_from_json(&payload)?;
+            let raws = raw_entries_from_json(&payload);
             let mut inserted_ids = Vec::<String>::new();
             let mut updated_ids = Vec::<String>::new();
-            for entry in &entries {
+            for (i, entry) in entries.iter_mut().enumerate() {
                 let existed = corpus_exists(&conn, &entry.id)?;
+                if existed && !args.replace {
+                    let old = get_corpus(&conn, &entry.id)?;
+                    let raw = raws.get(i).cloned().unwrap_or(Value::Null);
+                    *entry = merge_upsert_entry(&old, entry, &raw)?;
+                }
                 upsert_corpus(&conn, entry)?;
                 if existed {
                     updated_ids.push(entry.id.clone());
@@ -2607,8 +2619,12 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
                     post(http_admin_frontend_restart),
                 )
                 .route(
+                    "/admin/api/frontends/{id}/publish",
+                    post(http_admin_frontend_publish),
+                )
+                .route(
                     "/admin/api/frontends/{id}/corplist/append",
-                    post(http_admin_corplist_append),
+                    post(http_admin_frontend_publish),
                 )
                 .route(
                     "/admin/api/corpora/{id}/fcs-enabled",
@@ -4578,78 +4594,124 @@ async fn http_admin_coverage(
 }
 
 #[derive(Debug, Deserialize)]
-struct CorplistAppendBody {
-    ident: String,
-    #[serde(default)]
-    sentence_struct: Option<String>,
-    /// Optional FQS corpus id — when set, also sync settings.kontext on that row.
+struct FrontendPublishBody {
+    /// FQS catalogue id of the corpus to publish
     #[serde(default)]
     corpus_id: Option<String>,
+    /// the frontend's name for it (KonText: corplist ident); default: the module's suggestion
+    #[serde(default)]
+    name: Option<String>,
+    /// older admin UI builds: KonText ident
+    #[serde(default)]
+    ident: Option<String>,
+    #[serde(default)]
+    sentence_struct: Option<String>,
+    /// module-specific options
+    #[serde(default)]
+    options: Option<Value>,
 }
 
-async fn http_admin_corplist_append(
+/// Publish a catalogue corpus to a frontend (POST /admin/api/frontends/{id}/publish; the
+/// older /corplist/append is the same call). The frontend's module writes its files; FQS
+/// keeps the catalogue in step (the frontend's name for the corpus, its public URL).
+async fn http_admin_frontend_publish(
     State(state): State<HttpAppState>,
     headers: HeaderMap,
     AxumPath(frontend_id): AxumPath<String>,
-    Json(body): Json<CorplistAppendBody>,
+    Json(body): Json<FrontendPublishBody>,
 ) -> admin::AdminResult<Json<Value>> {
     let caller = admin::require_admin(&state.limits, &headers)?;
-    let ident = body.ident.clone();
-    let ss = body.sentence_struct.clone();
+    let corpus_id = body
+        .corpus_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| admin::AdminError::msg(StatusCode::BAD_REQUEST, "corpus_id is required".to_string()))?;
+    // the catalogue row first: a corpus that does not exist must not change a frontend
+    let entry = state.catalog.get(&corpus_id).map_err(|e| {
+        admin::AdminError::msg(StatusCode::NOT_FOUND, format!("corpus '{corpus_id}' not found: {e:#}"))
+    })?;
+    // where the frontend reaches this FQS, unless fqs.json says (frontends[].fqs_url)
+    let host = match state.host.as_str() {
+        "0.0.0.0" | "::" | "" => "127.0.0.1".to_string(),
+        h if h.contains(':') => format!("[{h}]"),
+        h => h.to_string(),
+    };
+    let fqs_url = format!("http://{host}:{}", state.port);
+    let name = body.name.clone().or(body.ident.clone()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let mut options = body.options.clone().unwrap_or_else(|| json!({}));
+    if let (Some(ss), Some(o)) = (body.sentence_struct.as_deref(), options.as_object_mut()) {
+        o.entry("sentence_struct").or_insert(json!(ss));
+    }
+    let index_dir = resolve_pando_index_dir(&entry).ok();
+    let language = entry
+        .settings
+        .get("languages")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| entry.labels.iter().find_map(|l| l.strip_prefix("lang:").map(str::to_string)));
+    let description = entry.settings.get("description").and_then(Value::as_str).map(str::to_string);
     let fid = frontend_id.clone();
+    let (cid, label) = (corpus_id.clone(), entry.label.clone());
     let result = tokio::task::spawn_blocking(move || {
-        services::append_kontext_corplist_corpus(&fid, &ident, ss.as_deref())
+        services::publish_to_frontend(
+            &fid,
+            &frontends::PublishRequest {
+                name: name.as_deref(),
+                corpus_id: &cid,
+                label: &label,
+                description: description.as_deref(),
+                language: language.as_deref(),
+                index_dir,
+                fqs_url: &fqs_url,
+                options: &options,
+            },
+        )
     })
     .await
     .map_err(|e| admin::AdminError::msg(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let mut body_out = result.map_err(|e| admin::AdminError::msg(StatusCode::BAD_REQUEST, e))?;
 
-    if let Some(cid) = body
-        .corpus_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        match state.catalog.get(cid) {
-            Ok(mut entry) => {
-                let mut kontext = entry
-                    .settings
-                    .get("kontext")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                if let Some(obj) = kontext.as_object_mut() {
-                    obj.insert("corpname".into(), json!(body.ident));
-                }
-                if let Some(obj) = entry.settings.as_object_mut() {
-                    obj.insert("kontext".into(), kontext);
-                }
-                let conn = open_db(&state.db_path).map_err(to_admin_err)?;
-                upsert_corpus(&conn, &entry).map_err(to_admin_err)?;
-                state.catalog.refresh(true);
-                if let Some(o) = body_out.as_object_mut() {
-                    o.insert("catalog_kontext_synced".into(), json!(true));
-                    o.insert("corpus_id".into(), json!(cid));
+    // catalogue: merge what the module reports (e.g. settings.kontext.corpname)
+    if let Some(patch) = body_out.get("catalog_settings").and_then(Value::as_object).cloned() {
+        let mut entry = entry;
+        if !entry.settings.is_object() {
+            entry.settings = json!({});
+        }
+        let settings = entry.settings.as_object_mut().expect("object");
+        for (block, vals) in patch {
+            let b = settings.entry(block).or_insert_with(|| json!({}));
+            if !b.is_object() {
+                *b = json!({});
+            }
+            if let (Some(bo), Some(vo)) = (b.as_object_mut(), vals.as_object()) {
+                for (k, v) in vo {
+                    bo.insert(k.clone(), v.clone());
                 }
             }
-            Err(err) => {
-                if let Some(o) = body_out.as_object_mut() {
-                    o.insert(
-                        "catalog_kontext_sync_error".into(),
-                        json!(format!("{err:#}")),
-                    );
-                }
-            }
+        }
+        let conn = open_db(&state.db_path).map_err(to_admin_err)?;
+        upsert_corpus(&conn, &entry).map_err(to_admin_err)?;
+        state.catalog.refresh(true);
+        if let Some(o) = body_out.as_object_mut() {
+            o.insert("catalog_synced".into(), json!(true));
+            o.insert("catalog_kontext_synced".into(), json!(true));
+            o.insert("corpus_id".into(), json!(corpus_id));
         }
     }
 
     admin_audit(
         &state,
-        "admin_corplist_append",
+        "admin_frontend_publish",
         &caller,
         activity::fields(vec![
             ("frontend_id", json!(frontend_id)),
-            ("ident", json!(body.ident)),
-            ("corpus_id", json!(body.corpus_id)),
+            ("corpus_id", json!(corpus_id)),
+            ("name", body_out.get("name").cloned().unwrap_or(Value::Null)),
+            ("steps", body_out.get("steps").cloned().unwrap_or(Value::Null)),
         ]),
     );
     Ok(Json(body_out))
@@ -4778,7 +4840,7 @@ async fn http_root_with_state(State(state): State<HttpAppState>) -> Json<Value> 
             json!({"method":"GET", "path":"/admin/api/backends", "description":"Admin: installed query backends + versions"}),
             json!({"method":"GET", "path":"/admin/api/frontends", "description":"Admin: known frontends + health"}),
             json!({"method":"GET", "path":"/admin/api/coverage", "description":"Admin: frontend coverage gaps (KonText corplist, FCS undecided)"}),
-            json!({"method":"POST", "path":"/admin/api/frontends/{id}/corplist/append", "description":"Admin: append corpus to allowlisted KonText corplist.xml"}),
+            json!({"method":"POST", "path":"/admin/api/frontends/{id}/publish", "description":"Admin: publish a catalogue corpus to a frontend through its frontend module (KonText: corplist, pando_corpora.json, Manatee registry shell)"}),
             json!({"method":"POST", "path":"/admin/api/corpora/{id}/fcs-enabled", "description":"Admin: set settings.fcs.enabled true/false"}),
             json!({"method":"POST", "path":"/admin/api/frontends/{id}/restart", "description":"Admin: restart configured frontend (fqs.json only)"}),
             json!({"method":"GET", "path":"/admin/api/self", "description":"Admin: this FQS version + update check"}),
@@ -7976,6 +8038,69 @@ fn read_json_input(args: &UpsertJsonArgs) -> Result<String> {
     anyhow::bail!("No JSON input provided; use --json, --json-file, or --stdin");
 }
 
+/// The JSON objects of an upsert payload as given (to see which fields it sets).
+fn raw_entries_from_json(payload: &str) -> Vec<Value> {
+    match serde_json::from_str::<Value>(payload) {
+        Ok(Value::Array(a)) => a,
+        Ok(v @ Value::Object(_)) => vec![v],
+        _ => Vec::new(),
+    }
+}
+
+/// The admin's choices inside settings, which registration payloads from TEITOK do not
+/// carry: `fcs.enabled`, `kontext.{corpname,public_url,url}`.
+const ADMIN_OWNED_SETTINGS: &[(&str, &str)] = &[
+    ("fcs", "enabled"),
+    ("kontext", "corpname"),
+    ("kontext", "public_url"),
+    ("kontext", "url"),
+];
+
+/// Upsert of an existing row: fields the payload leaves out keep their stored value;
+/// settings and capabilities are replaced as given, except the admin-owned keys above
+/// when the payload does not set them.
+fn merge_upsert_entry(old: &CorpusEntry, new: &CorpusEntry, raw: &Value) -> Result<CorpusEntry> {
+    let Some(raw_obj) = raw.as_object() else {
+        return Ok(new.clone());
+    };
+    let old_v = serde_json::to_value(old)?;
+    let mut new_v = serde_json::to_value(new)?;
+    if let (Some(o), Some(n)) = (old_v.as_object(), new_v.as_object_mut()) {
+        for (k, v) in o {
+            if k == "id" || raw_obj.contains_key(k) {
+                continue;
+            }
+            n.insert(k.clone(), v.clone());
+        }
+    }
+    let mut merged: CorpusEntry = serde_json::from_value(new_v)?;
+    if !merged.settings.is_object() {
+        merged.settings = json!({});
+    }
+    for (block, key) in ADMIN_OWNED_SETTINGS {
+        let Some(old_val) = old.settings.get(*block).and_then(|b| b.get(*key)) else {
+            continue;
+        };
+        let set_in_payload = raw_obj
+            .get("settings")
+            .and_then(|s| s.get(*block))
+            .and_then(|b| b.get(*key))
+            .is_some();
+        if set_in_payload {
+            continue;
+        }
+        let settings = merged.settings.as_object_mut().expect("object");
+        let b = settings.entry(block.to_string()).or_insert_with(|| json!({}));
+        if !b.is_object() {
+            *b = json!({});
+        }
+        if let Some(bo) = b.as_object_mut() {
+            bo.insert(key.to_string(), old_val.clone());
+        }
+    }
+    Ok(merged)
+}
+
 fn parse_entries_from_json(payload: &str) -> Result<Vec<CorpusEntry>> {
     let value: serde_json::Value = serde_json::from_str(payload).context("Invalid JSON input")?;
     match value {
@@ -8000,5 +8125,44 @@ mod fcs_address_tests {
         assert_eq!(super::fcs_public_address("https://lindat.cz/services/test-kontext/fcs"),
                    Some(("lindat.cz".into(), 443, "services/test-kontext/fcs".into())));
         assert_eq!(super::fcs_public_address("http://localhost:8797/fcs"), Some(("localhost".into(), 8797, "fcs".into())));
+    }
+}
+
+#[cfg(test)]
+mod upsert_merge_tests {
+    use super::*;
+
+    fn entry(v: Value) -> CorpusEntry {
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn reregistration_keeps_admin_choices_and_omitted_fields() {
+        let old = entry(json!({
+            "id": "c", "label": "My corpus", "project_root": "/p", "preferred_backend": "auto", "corpus_size": 42,
+            "project_url": "/teitok/c/index.php",
+            "settings": {"fcs": {"enabled": false}, "kontext": {"corpname": "c_k", "enabled": true}, "query_backend": "pando"},
+            "capabilities": {"fcs": {"enabled": true}}
+        }));
+        // what fqs.php / create-project send again
+        let raw = json!({
+            "id": "c", "label": "My corpus", "project_root": "/p", "preferred_backend": "pando",
+            "settings": {"kontext": {"enabled": true, "public": false, "corpus_id": "c"}},
+            "capabilities": {"fcs": {"enabled": true}}
+        });
+        let new = entry(raw.clone());
+        let m = merge_upsert_entry(&old, &new, &raw).unwrap();
+        assert_eq!(m.preferred_backend, "pando");
+        assert_eq!(m.corpus_size, Some(42));
+        assert_eq!(m.project_url.as_deref(), Some("/teitok/c/index.php"));
+        assert_eq!(m.settings["fcs"]["enabled"], false);
+        assert_eq!(m.settings["kontext"]["corpname"], "c_k");
+        assert_eq!(m.settings["kontext"]["corpus_id"], "c");
+        // other settings are replaced as given
+        assert!(m.settings.get("query_backend").is_none());
+        // an explicit value in the payload wins
+        let raw2 = json!({"id": "c", "label": "x", "project_root": "/p", "preferred_backend": "auto", "settings": {"fcs": {"enabled": true}}});
+        let m2 = merge_upsert_entry(&old, &entry(raw2.clone()), &raw2).unwrap();
+        assert_eq!(m2.settings["fcs"]["enabled"], true);
     }
 }

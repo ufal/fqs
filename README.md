@@ -128,7 +128,7 @@ The admin listener can stay on localhost; no proxy rule or token handling needed
   - `GET /admin/api/health` — full diagnostics (db path, slots, pando, limits)
   - `GET /admin/api/settings` — **report-only** effective process settings (bind, db, auth trust, limits file, warm pool, FCS, logs, scan allowlist) with CLI/`fqs.json` how-to-change hints; no secret values; not editable via API
   - `GET /admin/api/frontends` — frontend kinds / instances; `GET /admin/api/coverage` — KonText corplist gaps + FCS not-yet-enabled
-  - `POST /admin/api/frontends/{id}/corplist/append` — append `<corpus ident=…/>` to allowlisted `frontends[].corplist` (optional `corpus_id` syncs `settings.kontext.corpname`)
+  - `POST /admin/api/frontends/{id}/publish` — body `{ "corpus_id": "…", "name": "…" }`: publish a catalogue corpus to a frontend through its frontend module (see below); reports `steps`, `complete`, `restart_needed`, and merges the module's `catalog_settings` into the corpus (KonText: `settings.kontext.corpname` / `public_url`). `…/corplist/append` is the older name of the same call
   - `POST /admin/api/corpora/{id}/fcs-enabled` — body `{ "enabled": true|false }` for FCS Add / Exclude
   - `GET /admin/api/activity` — activity-log overview when `--activity-log` / `FQS_ACTIVITY_LOG` is set (`?event=interesting|query|warm|admin|all&limit=&corpus=`); summary + recent events from a tailed window
 - **Behind a path-stripping proxy** (e.g. hub `/services/test-kontext/fqsadmin/` → `/fqsadmin/`): set `FQS_ADMIN_BASE_HREF=/services/test-kontext/fqsadmin/` so `index.html` gets a `<base href>` and CSS/JS/API resolve under that prefix. Prefer a trailing-slash public URL.
@@ -137,11 +137,43 @@ The admin listener can stay on localhost; no proxy rule or token handling needed
 - **UI tabs:** Corpora, Scan, Backends, Frontends, Settings (report-only), Activity, Health, Reindex jobs.
 - **Scan allowlist:** `FQS_SCAN_ROOTS` / `fqs.json` `scan_roots` (see `fqs.example.json`). Binary defaults are only generic paths (`/srv/teitok`, `/data/corpora`, `~/corpora`, …) — not developer trees.
 
-Example `frontends` entry in `/etc/fqs/fqs.json` (restart for gunicorn/KonText).
-Set `corplist` so the admin Frontends tab can find TEITOK corpora missing from
-KonText and offer **Add to KonText** (allowlisted path only). If omitted, FQS
-also looks for `/opt/kontext/conf/corplist.xml` and the path in KonText
-`config.xml`, or `FQS_KONTEXT_CORPLIST`:
+### Frontend modules
+
+What FQS does *for* a frontend lives in a frontend module (`src/frontends/`), not in
+core FQS: finding the corpora the frontend lacks (the Frontends tab), and publishing
+a catalogue corpus to it. A module implements the `FrontendModule` trait in
+`src/frontends/mod.rs` (kind, discovery on this machine, processes, coverage, publish)
+and is listed in `modules()`; core FQS and the admin UI only use that interface, so a
+module for Korp, CQPweb or NoSketch Engine can be added next to `kontext.rs`. Modules
+share the safe file writing (through symlinks to the real file, a `.fqs-bak-<time>`
+backup, mode and owner kept, atomic when possible) and the Pando index helpers.
+
+**KonText (`kontext.rs`).** The KonText card shows KonText's processes (Sanic or
+gunicorn) and, per corpus, what KonText still lacks; **Add to KonText** does all of it.
+A corpus opens in KonText (kontext-pando) when:
+
+1. it is in `corplist.xml` — FQS adds it (checked to be well-formed XML);
+2. `pando_corpora.json` sends its queries to Pando — FQS adds `"backend": "fqs"` with
+   this FQS's URL (no `size`: kontext-pando asks FQS's `/info`, which stays right after
+   a reindex);
+3. Manatee has a registry file for it, since KonText opens every corpus as a Manatee
+   corpus — FQS writes a registry *shell* from the Pando index's `corpus.info`
+   (positional attributes, structures and their attributes, multivalue attributes,
+   language, DOCSTRUCTURE / FULLREF), with a one-token vertical, and encodes it with
+   Manatee's `encodevert`. Concordances, frequencies and text types still come from
+   Pando through FQS. The registry carries a `# fqs: corpus=… index_id=…` line: after a
+   reindex the card shows it as outdated and **Add to KonText** rebuilds it; registries
+   FQS did not write are never touched;
+4. KonText is restarted (offered when `restart` is configured) and users have access
+   to the corpus in KonText's auth — that last step is KonText's own.
+
+FQS edits only files at paths from fqs.json, the environment (`FQS_KONTEXT_CORPLIST`,
+`PANDO_CORPORA_CONFIG`, `MANATEE_REGISTRY`) or KonText's own `config.xml` / install
+folder — never from the request — and needs write access to them (and to the Manatee
+registry, data and vert folders). Registry data and verticals go next to the registry
+folder (`/var/lib/manatee/{registry,data,vert}`) unless `manatee_data` / `manatee_vert`
+say otherwise. `public_url` is what corpus lists link to; `fqs_url` is where KonText
+reaches FQS (default: FQS's own address):
 
 ```json
 {
@@ -151,14 +183,26 @@ also looks for `/opt/kontext/conf/corplist.xml` and the path in KonText
       "kind": "kontext",
       "label": "KonText",
       "url": "http://127.0.0.1:8080",
+      "public_url": "https://example.org/kontext",
       "corplist": "/opt/kontext/conf/corplist.xml",
-      "restart": { "method": "systemctl", "unit": "gunicorn" }
+      "pando_corpora": "/opt/kontext/conf/pando_corpora.json",
+      "registry": "/var/lib/manatee/registry",
+      "manatee_data": "/var/lib/manatee/data",
+      "manatee_vert": "/var/lib/manatee/vert",
+      "encodevert": "/usr/bin/encodevert",
+      "fqs_url": "http://127.0.0.1:8787",
+      "restart": { "method": "systemctl", "unit": "kontext" }
     }
   ]
 }
 ```
 
-Other restart methods: `hup_pidfile` with `"pidfile": "/run/gunicorn.pid"`, or `argv` with an allowlisted command array.
+Current KonText runs under Sanic (`kontext.service` on test-kontext); older ones under gunicorn (`"unit": "gunicorn"`). Other restart methods: `hup_pidfile` with `"pidfile": "/run/gunicorn.pid"`, or `argv` with an allowlisted command array.
+
+`fqs corpora upsert-json` on an existing corpus keeps the fields the JSON leaves out,
+and the choices made in the admin (`settings.fcs.enabled`, `settings.kontext`
+`corpname` / `public_url` / `url`) unless the JSON sets them, so re-registering a
+TEITOK project does not undo them; `--replace` replaces the row as given.
 
 Example FQS self-restart / update check in `/etc/fqs/fqs.json`:
 

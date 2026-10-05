@@ -15,8 +15,15 @@
       "kind": "kontext",
       "label": "KonText",
       "url": "http://127.0.0.1:8080",
+      "public_url": "https://example.org/kontext",
       "corplist": "/opt/kontext/conf/corplist.xml",
-      "restart": { "method": "systemctl", "unit": "gunicorn" }
+      "pando_corpora": "/opt/kontext/conf/pando_corpora.json",
+      "registry": "/var/lib/manatee/registry",
+      "manatee_data": "/var/lib/manatee/data",
+      "manatee_vert": "/var/lib/manatee/vert",
+      "encodevert": "/usr/bin/encodevert",
+      "fqs_url": "http://127.0.0.1:8787",
+      "restart": { "method": "systemctl", "unit": "kontext" }
     }
   ]
 }
