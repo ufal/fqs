@@ -1567,6 +1567,370 @@ fn parse_version_banner(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// One catalog row for coverage / gap analysis (admin Frontends tab).
+pub struct CoverageCorpus<'a> {
+    pub id: &'a str,
+    pub label: &'a str,
+    pub preferred_backend: &'a str,
+    pub is_current: bool,
+    pub http_policy_mode: &'a str,
+    pub interface_preference: Option<&'a str>,
+    pub source_kind: &'a str,
+    pub supports_xml: bool,
+    pub project_root: Option<&'a str>,
+    pub project_url: Option<&'a str>,
+    pub settings: &'a Value,
+    pub capabilities: &'a Value,
+}
+
+/// Compare FQS catalog to configured frontend inventories (KonText corplist, FCS opt-in).
+pub fn compute_frontend_coverage(corpora: &[CoverageCorpus<'_>]) -> Value {
+    let mut kontext_reports = Vec::new();
+    for (id, cfg) in configured_frontends() {
+        let kind = cfg
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if kind != "kontext" && id.to_ascii_lowercase() != "kontext" {
+            continue;
+        }
+        kontext_reports.push(kontext_coverage_for_frontend(&id, &cfg, corpora));
+    }
+
+    let mut undecided = Vec::new();
+    for c in corpora {
+        if !c.is_current {
+            continue;
+        }
+        if !corpus_can_serve_fcs(c) {
+            continue;
+        }
+        if fcs_enabled_flag(c.settings, c.capabilities).is_some() {
+            continue; // explicitly in or out
+        }
+        undecided.push(json!({
+            "id": c.id,
+            "label": c.label,
+            "preferred_backend": c.preferred_backend,
+            "action_hint": "Set settings.fcs.enabled to true (publish) or false (exclude).",
+        }));
+    }
+
+    json!({
+        "ok": true,
+        "kontext": kontext_reports,
+        "fcs": {
+            "undecided": undecided,
+            "note": "Only corpora FQS can serve via FCS that are not yet flagged settings.fcs.enabled true/false. Opted-in and opted-out rows are omitted.",
+        },
+        "help": {
+            "kontext_corplist": "Set frontends[].corplist (path to KonText corplist.xml) in fqs.json to detect gaps. Append uses that allowlisted path only.",
+            "fcs": "Use Enable FCS / Exclude FCS to set settings.fcs.enabled without guessing.",
+        },
+    })
+}
+
+fn kontext_coverage_for_frontend(frontend_id: &str, cfg: &Value, corpora: &[CoverageCorpus<'_>]) -> Value {
+    let corplist_path = cfg
+        .get("corplist")
+        .or_else(|| cfg.get("corplist_path"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+
+    let Some(path) = corplist_path else {
+        return json!({
+            "frontend_id": frontend_id,
+            "url": cfg.get("url").cloned().unwrap_or(Value::Null),
+            "corplist_path": Value::Null,
+            "configured": true,
+            "error": "No corplist path on this KonText frontend. Add \"corplist\": \"/path/to/corplist.xml\" under the frontends[] entry in fqs.json.",
+            "idents": [],
+            "missing": [],
+        });
+    };
+
+    let parsed = read_kontext_corplist_idents(&path);
+    let (idents, read_err) = match parsed {
+        Ok(ids) => (ids, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    let ident_set: std::collections::HashSet<String> =
+        idents.iter().map(|s| s.to_ascii_lowercase()).collect();
+
+    let frontend_url = cfg
+        .get("url")
+        .or_else(|| cfg.get("base"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let mut missing = Vec::new();
+    for c in corpora {
+        if !c.is_current {
+            continue;
+        }
+        if !corpus_eligible_for_kontext_pando(c) {
+            continue;
+        }
+        let suggested = suggested_kontext_ident(c);
+        let catalog_corpname = c
+            .settings
+            .get("kontext")
+            .and_then(|k| k.get("corpname").or_else(|| k.get("corpus")))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let covered = ident_set.contains(&suggested.to_ascii_lowercase())
+            || catalog_corpname
+                .map(|n| ident_set.contains(&n.to_ascii_lowercase()))
+                .unwrap_or(false);
+        if covered {
+            continue;
+        }
+
+        let xml = format!(
+            "<corpus ident=\"{}\" sentence_struct=\"s\"/>",
+            xml_escape_attr(&suggested)
+        );
+        missing.push(json!({
+            "id": c.id,
+            "label": c.label,
+            "suggested_ident": suggested,
+            "catalog_corpname": catalog_corpname,
+            "reason": "teitok_pando_not_in_corplist",
+            "suggested_xml": xml,
+            "frontend_url": frontend_url,
+        }));
+    }
+
+    json!({
+        "frontend_id": frontend_id,
+        "url": frontend_url,
+        "corplist_path": path.display().to_string(),
+        "configured": true,
+        "error": read_err,
+        "idents": idents,
+        "missing": missing,
+        "appendable": read_err.is_none() && path.is_file(),
+    })
+}
+
+fn corpus_eligible_for_kontext_pando(c: &CoverageCorpus<'_>) -> bool {
+    let teitok = corpus_is_teitok_listable(
+        c.interface_preference,
+        c.source_kind,
+        c.supports_xml,
+        c.project_root,
+        c.project_url,
+        c.settings,
+        c.capabilities,
+    );
+    teitok && corpus_looks_pando_servable(c)
+}
+
+fn corpus_looks_pando_servable(c: &CoverageCorpus<'_>) -> bool {
+    let b = c.preferred_backend.trim().to_ascii_lowercase();
+    if b == "pando" {
+        return true;
+    }
+    if let Some(arr) = c.settings.get("available_backends").and_then(|v| v.as_array()) {
+        if arr.iter().any(|v| v.as_str() == Some("pando")) {
+            return true;
+        }
+    }
+    if c.settings
+        .get("query_backend")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("pando"))
+    {
+        return true;
+    }
+    if let Some(root) = c.project_root.map(str::trim).filter(|s| !s.is_empty()) {
+        let p = Path::new(root);
+        if p.join("pando").is_dir() || p.join("Resources").join("pando").is_dir() {
+            return true;
+        }
+    }
+    false
+}
+
+fn corpus_can_serve_fcs(c: &CoverageCorpus<'_>) -> bool {
+    if c.http_policy_mode.trim().eq_ignore_ascii_case("disabled") {
+        return false;
+    }
+    let b = c.preferred_backend.trim().to_ascii_lowercase();
+    if b == "pando" || b == "cqp" || b == "cwb" {
+        return true;
+    }
+    if let Some(arr) = c.settings.get("available_backends").and_then(|v| v.as_array()) {
+        return arr
+            .iter()
+            .any(|v| matches!(v.as_str(), Some("pando") | Some("cqp") | Some("cwb")));
+    }
+    corpus_looks_pando_servable(c)
+}
+
+fn fcs_enabled_flag(settings: &Value, capabilities: &Value) -> Option<bool> {
+    settings
+        .get("fcs")
+        .and_then(|f| f.get("enabled"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            capabilities
+                .get("fcs")
+                .and_then(|f| f.get("enabled"))
+                .and_then(Value::as_bool)
+        })
+}
+
+fn suggested_kontext_ident(c: &CoverageCorpus<'_>) -> String {
+    c.settings
+        .get("kontext")
+        .and_then(|k| k.get("corpname").or_else(|| k.get("corpus")))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(c.id)
+        .to_string()
+}
+
+fn read_kontext_corplist_idents(path: &Path) -> Result<Vec<String>, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("Cannot read corplist {}: {}", path.display(), e))?;
+    Ok(parse_kontext_corplist_idents(&text))
+}
+
+fn parse_kontext_corplist_idents(text: &str) -> Vec<String> {
+    let mut idents = Vec::new();
+    let lower = text.to_ascii_lowercase();
+    let mut search_from = 0;
+    while let Some(rel) = lower[search_from..].find("<corpus") {
+        let start = search_from + rel;
+        let after = &text[start..];
+        let end_rel = after.find('>').unwrap_or(after.len());
+        let tag = &after[..end_rel];
+        if let Some(id) = attr_value_from_tag(tag, "ident").or_else(|| attr_value_from_tag(tag, "id"))
+        {
+            let id = id.trim();
+            if !id.is_empty() && !idents.iter().any(|x: &String| x == id) {
+                idents.push(id.to_string());
+            }
+        }
+        search_from = start + end_rel.max(1);
+    }
+    idents
+}
+
+fn attr_value_from_tag<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let lower = tag.to_ascii_lowercase();
+    let key = format!("{name}=");
+    let idx = lower.find(&key)?;
+    let rest = &tag[idx + key.len()..];
+    let rest = rest.trim_start();
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let inner = &rest[1..];
+    let end = inner.find(quote)?;
+    Some(&inner[..end])
+}
+
+fn xml_escape_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Append a corpus line to the allowlisted KonText corplist for `frontend_id`.
+pub fn append_kontext_corplist_corpus(
+    frontend_id: &str,
+    ident: &str,
+    sentence_struct: Option<&str>,
+) -> Result<Value, String> {
+    let ident = ident.trim();
+    if ident.is_empty() || ident.contains(['<', '>', '"', '\'', '/', '\\']) {
+        return Err("invalid corpus ident".into());
+    }
+    let ss = sentence_struct
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("s");
+    if ss
+        .chars()
+        .any(|c| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+    {
+        return Err("invalid sentence_struct".into());
+    }
+
+    let configured = configured_frontends();
+    let cfg = configured
+        .iter()
+        .find(|(id, _)| id == frontend_id)
+        .map(|(_, v)| v)
+        .ok_or_else(|| format!("frontend '{frontend_id}' not in fqs.json"))?;
+    let kind = cfg
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if kind != "kontext" && frontend_id.to_ascii_lowercase() != "kontext" {
+        return Err("append is only supported for KonText frontends".into());
+    }
+    let path = cfg
+        .get("corplist")
+        .or_else(|| cfg.get("corplist_path"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| "frontend has no corplist path in fqs.json".to_string())?;
+
+    let text = fs::read_to_string(&path)
+        .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
+    let idents = parse_kontext_corplist_idents(&text);
+    if idents.iter().any(|i| i.eq_ignore_ascii_case(ident)) {
+        return Ok(json!({
+            "ok": true,
+            "already_present": true,
+            "ident": ident,
+            "corplist_path": path.display().to_string(),
+        }));
+    }
+
+    let line = format!("        <corpus ident=\"{ident}\" sentence_struct=\"{ss}\"/>\n");
+    let updated = if let Some(idx) = text.rfind("</corplist>") {
+        let mut out = String::with_capacity(text.len() + line.len());
+        out.push_str(&text[..idx]);
+        out.push_str(&line);
+        out.push_str(&text[idx..]);
+        out
+    } else {
+        return Err("corplist.xml has no </corplist> closing tag".into());
+    };
+
+    let tmp = path.with_extension("xml.fqs-tmp");
+    fs::write(&tmp, &updated).map_err(|e| format!("Cannot write temp file: {e}"))?;
+    fs::rename(&tmp, &path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("Cannot replace {}: {e}", path.display())
+    })?;
+
+    Ok(json!({
+        "ok": true,
+        "already_present": false,
+        "ident": ident,
+        "corplist_path": path.display().to_string(),
+        "appended_xml": line.trim(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1714,6 +2078,31 @@ mod tests {
         assert_eq!(hints.len(), 1);
         assert_eq!(hints[0].kind, "cqpweb");
         assert!(hints[0].centralized);
+    }
+
+    #[test]
+    fn corplist_idents_parse() {
+        let xml = r#"<?xml version="1.0"?>
+<kontext><corplist>
+  <corpus ident="ud_pando" sentence_struct="s"/>
+  <corpus ident="SUSANNE"/>
+</corplist></kontext>"#;
+        let ids = parse_kontext_corplist_idents(xml);
+        assert!(ids.iter().any(|i| i == "ud_pando"));
+        assert!(ids.iter().any(|i| i == "SUSANNE"));
+    }
+
+    #[test]
+    fn fcs_undecided_only_when_flag_absent() {
+        assert_eq!(fcs_enabled_flag(&json!({}), &json!({})), None);
+        assert_eq!(
+            fcs_enabled_flag(&json!({"fcs": {"enabled": true}}), &json!({})),
+            Some(true)
+        );
+        assert_eq!(
+            fcs_enabled_flag(&json!({"fcs": {"enabled": false}}), &json!({})),
+            Some(false)
+        );
     }
 
     #[test]

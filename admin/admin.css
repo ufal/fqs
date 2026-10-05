@@ -170,6 +170,17 @@ label { font-size: 0.8rem; color: var(--muted); }
 label.block { display: block; margin-bottom: 0.75rem; }
 label.check { display: flex; align-items: center; gap: 0.4rem; margin-top: 1.4rem; }
 label.check input { width: auto; margin: 0; }
+label.check-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+  cursor: pointer;
+  user-select: none;
+}
+label.check-inline input { width: auto; margin: 0; }
 
 .labels-editor {
   display: block;
@@ -364,6 +375,7 @@ label.check input { width: auto; margin: 0; }
   margin: 0.75rem 0;
   background: #fbfaf7;
 }
+.coverage-block { margin-top: 0.75rem; }
 .frontend-kind-head { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
 .frontend-instance {
   margin: 0.6rem 0 0.2rem;

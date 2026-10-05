@@ -1218,18 +1218,36 @@
     $("backends-out").textContent = JSON.stringify(data, null, 2);
   }
 
-  function renderFrontends(data) {
-    const kinds = data.kinds || [];
+  function frontendKindIsRelevant(k) {
+    const st = (k && k.status) || "not_configured";
+    if (st === "not_configured") return false;
+    // Per-corpus UIs: show when any corpus is linked; hide empty TEITOK until used.
+    if (st === "unused") return false;
+    return true;
+  }
+
+  let lastFrontendsData = null;
+
+  let lastCoverageData = null;
+
+  function renderFrontends(data, coverage) {
+    lastFrontendsData = data;
+    if (coverage !== undefined) lastCoverageData = coverage;
+    const cov = coverage !== undefined ? coverage : lastCoverageData;
+    const showAll = !!($("frontends-show-all") && $("frontends-show-all").checked);
+    const allKinds = data.kinds || [];
+    const kinds = showAll ? allKinds : allKinds.filter(frontendKindIsRelevant);
+    const hidden = allKinds.length - kinds.length;
     const rows = data.frontends || [];
     let html = '<div class="stat-grid">';
-    html += stat("Kinds handled", String(kinds.length || 0), "");
+    html += stat(
+      showAll ? "Kinds handled" : "Kinds in use",
+      String(kinds.length || 0),
+      ""
+    );
     html += stat(
       "In use / configured",
-      String(
-        kinds.filter((k) =>
-          ["healthy", "configured", "present", "in_use", "catalog_only"].includes(k.status)
-        ).length
-      ),
+      String(allKinds.filter(frontendKindIsRelevant).length),
       "ok"
     );
     html += stat("Instances", String(rows.length), "");
@@ -1239,6 +1257,14 @@
       ""
     );
     html += "</div>";
+    if (!showAll && hidden > 0) {
+      html +=
+        '<p class="muted muted-sm85">' +
+        esc(String(hidden)) +
+        " other supported kind" +
+        (hidden === 1 ? "" : "s") +
+        " hidden (Korp, CQPweb, NoSketch Engine, … when unused). Tick <em>Show all supported kinds</em> to list them.</p>";
+    }
     if (data.corpora_note) {
       html += '<p class="muted muted-sm85">' + esc(data.corpora_note) + "</p>";
     }
@@ -1247,7 +1273,9 @@
     }
 
     if (!kinds.length) {
-      html += '<p class="muted">No frontend kinds returned.</p>';
+      html += showAll
+        ? '<p class="muted">No frontend kinds returned.</p>'
+        : '<p class="muted">No frontends in use or configured yet. Tick <em>Show all supported kinds</em> to see what FQS can handle.</p>';
     } else {
       kinds.forEach((k) => {
         const st = k.status || "not_configured";
@@ -1367,11 +1395,181 @@
       });
       html += "</tbody></table>";
     }
+
+    html += renderCoverageSection(cov);
+
     $("frontends-view").innerHTML = html;
-    $("frontends-out").textContent = JSON.stringify(data, null, 2);
+    $("frontends-out").textContent = JSON.stringify(
+      { frontends: data, coverage: cov },
+      null,
+      2
+    );
     $("frontends-view").querySelectorAll(".btn-fe-restart").forEach((btn) => {
       btn.addEventListener("click", () => restartFrontend(btn.dataset.id));
     });
+    $("frontends-view").querySelectorAll(".btn-corplist-append").forEach((btn) => {
+      btn.addEventListener("click", () =>
+        appendCorplist(btn.dataset.frontend, btn.dataset.ident, btn.dataset.corpus).catch((e) =>
+          showBanner(e.message, true)
+        )
+      );
+    });
+    $("frontends-view").querySelectorAll(".btn-fcs-flag").forEach((btn) => {
+      btn.addEventListener("click", () =>
+        setFcsEnabled(btn.dataset.corpus, btn.dataset.enabled === "1").catch((e) =>
+          showBanner(e.message, true)
+        )
+      );
+    });
+  }
+
+  function renderCoverageSection(cov) {
+    if (!cov || cov.error) {
+      return (
+        '<h3 class="section-title">Coverage gaps</h3>' +
+        '<p class="muted">' +
+        esc(cov && cov.error ? cov.error : "Coverage not loaded.") +
+        "</p>"
+      );
+    }
+    let html = '<h3 class="section-title">Coverage gaps</h3>';
+    html +=
+      '<p class="muted muted-sm85">TEITOK/pando corpora missing from a configured KonText corplist, and FCS-servable corpora not yet opted in or out.</p>';
+
+    const kontextRows = cov.kontext || [];
+    if (!kontextRows.length) {
+      html +=
+        '<p class="muted muted-sm85">No KonText frontend in <code>fqs.json</code>. Add one with a <code>corplist</code> path to detect gaps.</p>';
+    } else {
+      kontextRows.forEach((k) => {
+        html += '<div class="frontend-kind coverage-block">';
+        html +=
+          '<div class="frontend-kind-head"><strong>KonText</strong> <span class="muted mono">' +
+          esc(k.frontend_id || "") +
+          (k.corplist_path ? " · " + esc(k.corplist_path) : "") +
+          "</span></div>";
+        if (k.error) {
+          html += '<p class="err err-xs">' + esc(k.error) + "</p>";
+        }
+        const missing = k.missing || [];
+        if (!missing.length && !k.error) {
+          html +=
+            '<p class="muted muted-sm85">No TEITOK/pando gaps — every eligible catalog corpus is in the corplist.</p>';
+        } else if (missing.length) {
+          html +=
+            '<table class="data-table"><thead><tr><th>Corpus</th><th>Suggested ident</th><th>XML</th><th></th></tr></thead><tbody>';
+          missing.forEach((m) => {
+            html +=
+              "<tr><td><strong>" +
+              esc(m.label || m.id) +
+              '</strong><div class="mono muted muted-xs">' +
+              esc(m.id) +
+              "</div></td><td class='mono'>" +
+              esc(m.suggested_ident || "") +
+              "</td><td class='mono muted-xs'>" +
+              esc(m.suggested_xml || "") +
+              "</td><td>";
+            if (k.appendable) {
+              html +=
+                "<button type='button' class='secondary btn-corplist-append' data-frontend='" +
+                esc(k.frontend_id) +
+                "' data-ident='" +
+                esc(m.suggested_ident || m.id) +
+                "' data-corpus='" +
+                esc(m.id) +
+                "'>Add to corplist</button>";
+            } else {
+              html += '<span class="muted">copy XML into corplist</span>';
+            }
+            html += "</td></tr>";
+          });
+          html += "</tbody></table>";
+        }
+        html += "</div>";
+      });
+    }
+
+    const undecided = (cov.fcs && cov.fcs.undecided) || [];
+    html += '<div class="frontend-kind coverage-block">';
+    html +=
+      '<div class="frontend-kind-head"><strong>FCS</strong> <span class="muted">undecided (servable, not flagged)</span></div>';
+    if (cov.fcs && cov.fcs.note) {
+      html += '<p class="muted muted-sm85">' + esc(cov.fcs.note) + "</p>";
+    }
+    if (!undecided.length) {
+      html +=
+        '<p class="muted muted-sm85">None — every FCS-servable corpus already has <code>settings.fcs.enabled</code> true or false.</p>';
+    } else {
+      html +=
+        '<table class="data-table"><thead><tr><th>Corpus</th><th>Backend</th><th></th></tr></thead><tbody>';
+      undecided.forEach((u) => {
+        html +=
+          "<tr><td><strong>" +
+          esc(u.label || u.id) +
+          '</strong><div class="mono muted muted-xs">' +
+          esc(u.id) +
+          "</div></td><td class='mono'>" +
+          esc(u.preferred_backend || "—") +
+          "</td><td class='row row-start-wrap'>" +
+          "<button type='button' class='secondary btn-fcs-flag' data-corpus='" +
+          esc(u.id) +
+          "' data-enabled='1'>Enable FCS</button>" +
+          "<button type='button' class='secondary btn-fcs-flag' data-corpus='" +
+          esc(u.id) +
+          "' data-enabled='0'>Exclude FCS</button>" +
+          "</td></tr>";
+      });
+      html += "</tbody></table>";
+    }
+    html += "</div>";
+    return html;
+  }
+
+  async function appendCorplist(frontendId, ident, corpusId) {
+    if (
+      !confirm(
+        "Append <corpus ident=\"" +
+          ident +
+          "\" …/> to the allowlisted KonText corplist for '" +
+          frontendId +
+          "'?"
+      )
+    ) {
+      return;
+    }
+    const data = await api(
+      "/frontends/" + encodeURIComponent(frontendId) + "/corplist/append",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          ident,
+          corpus_id: corpusId || null,
+          sentence_struct: "s",
+        }),
+      }
+    );
+    showBanner(
+      data.already_present
+        ? "Already in corplist: " + ident
+        : "Added " + ident + " to corplist" + (data.catalog_kontext_synced ? " (catalog synced)" : ""),
+      false
+    );
+    await refreshFrontends();
+  }
+
+  async function setFcsEnabled(corpusId, enabled) {
+    const data = await api(
+      "/corpora/" + encodeURIComponent(corpusId) + "/fcs-enabled",
+      {
+        method: "POST",
+        body: JSON.stringify({ enabled: !!enabled }),
+      }
+    );
+    showBanner(
+      (enabled ? "FCS enabled for " : "FCS excluded for ") + (data.id || corpusId),
+      false
+    );
+    await refreshFrontends();
   }
 
   function corporaServedCell(f) {
@@ -1410,7 +1608,11 @@
         '<p class="list-empty"><strong>JWT required</strong></p>';
       return;
     }
-    renderFrontends(await api("/frontends"));
+    const [fe, cov] = await Promise.all([
+      api("/frontends"),
+      api("/coverage").catch((e) => ({ ok: false, error: e.message })),
+    ]);
+    renderFrontends(fe, cov);
   }
 
   async function restartFrontend(id) {
@@ -1589,6 +1791,11 @@
   $("btn-frontends-refresh").addEventListener("click", () => {
     refreshFrontends().catch((e) => showBanner(e.message, true));
   });
+  if ($("frontends-show-all")) {
+    $("frontends-show-all").addEventListener("change", () => {
+      if (lastFrontendsData) renderFrontends(lastFrontendsData);
+    });
+  }
   $("btn-settings-refresh").addEventListener("click", () => {
     refreshSettings().catch((e) => showBanner(e.message, true));
   });

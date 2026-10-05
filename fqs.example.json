@@ -8,5 +8,15 @@
   "fqs": {
     "update_check": true,
     "restart": { "method": "systemctl", "unit": "fqs" }
-  }
+  },
+  "frontends": [
+    {
+      "id": "kontext",
+      "kind": "kontext",
+      "label": "KonText",
+      "url": "http://127.0.0.1:8080",
+      "corplist": "/opt/kontext/conf/corplist.xml",
+      "restart": { "method": "systemctl", "unit": "gunicorn" }
+    }
+  ]
 }

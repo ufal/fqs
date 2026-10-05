@@ -2601,9 +2601,18 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
                 .route("/admin/api/scan", get(http_admin_scan).post(http_admin_scan_post))
                 .route("/admin/api/backends", get(http_admin_backends))
                 .route("/admin/api/frontends", get(http_admin_frontends))
+                .route("/admin/api/coverage", get(http_admin_coverage))
                 .route(
                     "/admin/api/frontends/{id}/restart",
                     post(http_admin_frontend_restart),
+                )
+                .route(
+                    "/admin/api/frontends/{id}/corplist/append",
+                    post(http_admin_corplist_append),
+                )
+                .route(
+                    "/admin/api/corpora/{id}/fcs-enabled",
+                    post(http_admin_set_fcs_enabled),
                 )
                 .route("/admin/api/self", get(http_admin_self))
                 .route("/admin/api/self/restart", post(http_admin_self_restart))
@@ -4458,6 +4467,212 @@ async fn http_admin_frontends(
     Ok(Json(report))
 }
 
+async fn http_admin_coverage(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+) -> admin::AdminResult<Json<Value>> {
+    let _ = admin::require_admin(&state.limits, &headers)?;
+    let corpora = state.catalog.list(None, true, None);
+    let owned: Vec<(
+        String,
+        String,
+        String,
+        bool,
+        String,
+        Option<String>,
+        String,
+        bool,
+        Option<String>,
+        Option<String>,
+        Value,
+        Value,
+    )> = corpora
+        .into_iter()
+        .map(|c| {
+            (
+                c.id,
+                c.label,
+                c.preferred_backend,
+                c.is_current,
+                c.http_policy_mode,
+                c.interface_preference,
+                c.source_kind,
+                c.supports_xml,
+                Some(c.project_root.to_string_lossy().into_owned())
+                    .filter(|s| !s.is_empty()),
+                c.project_url,
+                c.settings,
+                c.capabilities,
+            )
+        })
+        .collect();
+    let report = tokio::task::spawn_blocking(move || {
+        let rows: Vec<services::CoverageCorpus<'_>> = owned
+            .iter()
+            .map(
+                |(
+                    id,
+                    label,
+                    preferred_backend,
+                    is_current,
+                    http_policy_mode,
+                    interface_preference,
+                    source_kind,
+                    supports_xml,
+                    project_root,
+                    project_url,
+                    settings,
+                    capabilities,
+                )| services::CoverageCorpus {
+                    id,
+                    label,
+                    preferred_backend,
+                    is_current: *is_current,
+                    http_policy_mode,
+                    interface_preference: interface_preference.as_deref(),
+                    source_kind,
+                    supports_xml: *supports_xml,
+                    project_root: project_root.as_deref(),
+                    project_url: project_url.as_deref(),
+                    settings,
+                    capabilities,
+                },
+            )
+            .collect();
+        services::compute_frontend_coverage(&rows)
+    })
+    .await
+    .map_err(|e| admin::AdminError::msg(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(report))
+}
+
+#[derive(Debug, Deserialize)]
+struct CorplistAppendBody {
+    ident: String,
+    #[serde(default)]
+    sentence_struct: Option<String>,
+    /// Optional FQS corpus id — when set, also sync settings.kontext on that row.
+    #[serde(default)]
+    corpus_id: Option<String>,
+}
+
+async fn http_admin_corplist_append(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    AxumPath(frontend_id): AxumPath<String>,
+    Json(body): Json<CorplistAppendBody>,
+) -> admin::AdminResult<Json<Value>> {
+    let caller = admin::require_admin(&state.limits, &headers)?;
+    let ident = body.ident.clone();
+    let ss = body.sentence_struct.clone();
+    let fid = frontend_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        services::append_kontext_corplist_corpus(&fid, &ident, ss.as_deref())
+    })
+    .await
+    .map_err(|e| admin::AdminError::msg(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let mut body_out = result.map_err(|e| admin::AdminError::msg(StatusCode::BAD_REQUEST, e))?;
+
+    if let Some(cid) = body
+        .corpus_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        match state.catalog.get(cid) {
+            Ok(mut entry) => {
+                let mut kontext = entry
+                    .settings
+                    .get("kontext")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                if let Some(obj) = kontext.as_object_mut() {
+                    obj.insert("corpname".into(), json!(body.ident));
+                }
+                if let Some(obj) = entry.settings.as_object_mut() {
+                    obj.insert("kontext".into(), kontext);
+                }
+                let conn = open_db(&state.db_path).map_err(to_admin_err)?;
+                upsert_corpus(&conn, &entry).map_err(to_admin_err)?;
+                state.catalog.refresh(true);
+                if let Some(o) = body_out.as_object_mut() {
+                    o.insert("catalog_kontext_synced".into(), json!(true));
+                    o.insert("corpus_id".into(), json!(cid));
+                }
+            }
+            Err(err) => {
+                if let Some(o) = body_out.as_object_mut() {
+                    o.insert(
+                        "catalog_kontext_sync_error".into(),
+                        json!(format!("{err:#}")),
+                    );
+                }
+            }
+        }
+    }
+
+    admin_audit(
+        &state,
+        "admin_corplist_append",
+        &caller,
+        activity::fields(vec![
+            ("frontend_id", json!(frontend_id)),
+            ("ident", json!(body.ident)),
+            ("corpus_id", json!(body.corpus_id)),
+        ]),
+    );
+    Ok(Json(body_out))
+}
+
+#[derive(Debug, Deserialize)]
+struct FcsEnabledBody {
+    enabled: bool,
+}
+
+async fn http_admin_set_fcs_enabled(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<FcsEnabledBody>,
+) -> admin::AdminResult<Json<Value>> {
+    let caller = admin::require_admin(&state.limits, &headers)?;
+    let mut entry = state.catalog.get(&id).map_err(|e| {
+        admin::AdminError::msg(StatusCode::NOT_FOUND, format!("corpus '{id}' not found: {e:#}"))
+    })?;
+    let mut fcs = entry
+        .settings
+        .get("fcs")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if let Some(obj) = fcs.as_object_mut() {
+        obj.insert("enabled".into(), json!(body.enabled));
+    } else {
+        fcs = json!({ "enabled": body.enabled });
+    }
+    if let Some(obj) = entry.settings.as_object_mut() {
+        obj.insert("fcs".into(), fcs);
+    } else {
+        entry.settings = json!({ "fcs": { "enabled": body.enabled } });
+    }
+    let conn = open_db(&state.db_path).map_err(to_admin_err)?;
+    upsert_corpus(&conn, &entry).map_err(to_admin_err)?;
+    state.catalog.refresh(true);
+    admin_audit(
+        &state,
+        "admin_fcs_enabled",
+        &caller,
+        activity::fields(vec![
+            ("corpus_id", json!(id)),
+            ("enabled", json!(body.enabled)),
+        ]),
+    );
+    Ok(Json(json!({
+        "ok": true,
+        "id": id,
+        "enabled": body.enabled,
+    })))
+}
+
 async fn http_admin_frontend_restart(
     State(state): State<HttpAppState>,
     headers: HeaderMap,
@@ -4531,7 +4746,9 @@ async fn http_root_with_state(State(state): State<HttpAppState>) -> Json<Value> 
             json!({"method":"GET|POST", "path":"/admin/api/scan", "description":"Admin: scan disk (allowlisted roots)"}),
             json!({"method":"GET", "path":"/admin/api/backends", "description":"Admin: installed query backends + versions"}),
             json!({"method":"GET", "path":"/admin/api/frontends", "description":"Admin: known frontends + health"}),
-            json!({"method":"GET", "path":"/admin/api/frontends", "description":"Admin: known frontends + health"}),
+            json!({"method":"GET", "path":"/admin/api/coverage", "description":"Admin: frontend coverage gaps (KonText corplist, FCS undecided)"}),
+            json!({"method":"POST", "path":"/admin/api/frontends/{id}/corplist/append", "description":"Admin: append corpus to allowlisted KonText corplist.xml"}),
+            json!({"method":"POST", "path":"/admin/api/corpora/{id}/fcs-enabled", "description":"Admin: set settings.fcs.enabled true/false"}),
             json!({"method":"POST", "path":"/admin/api/frontends/{id}/restart", "description":"Admin: restart configured frontend (fqs.json only)"}),
             json!({"method":"GET", "path":"/admin/api/self", "description":"Admin: this FQS version + update check"}),
             json!({"method":"POST", "path":"/admin/api/self/restart", "description":"Admin: restart FQS (fqs.restart in fqs.json only)"}),
