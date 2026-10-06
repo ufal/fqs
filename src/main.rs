@@ -2637,6 +2637,7 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         .route("/backends", get(http_backends))
         .route("/info", get(http_pando_info))
         .route("/context", get(http_pando_context))
+        .route("/fragment", get(http_pando_fragment))
         .route("/status", get(http_pando_status))
         .route("/run", post(http_pando_run))
         .route("/session", get(http_pando_session_info).post(http_pando_session_create))
@@ -4882,6 +4883,7 @@ async fn http_root_with_state(State(state): State<HttpAppState>) -> Json<Value> 
             json!({"method":"GET", "path":"/backends", "description":"Warm backend / HCM status"}),
             json!({"method":"GET", "path":"/info", "description":"Pando corpus info (?corpus=)"}),
             json!({"method":"GET", "path":"/context", "description":"Pando KWIC context (?corpus=&pos=&left=&right=)"}),
+            json!({"method":"GET", "path":"/fragment", "description":"TEITOK XML fragment from xidx (?corpus=&pos=&end=&context=&context_scope=) for KonText token_connect"}),
             json!({"method":"GET", "path":"/status", "description":"Pando async total job (?corpus=&job=)"}),
             json!({"method":"POST", "path":"/run", "description":"Pando CQL program (JSON: corpus, cql|query, session_id?, …)"}),
             json!({"method":"POST", "path":"/session", "description":"Pando hit-set session (JSON: corpus, session_id?, ttl_s?); /query name / from and /run use it"}),
@@ -5518,6 +5520,12 @@ struct PandoCorpusQuery {
     left: Option<String>,
     right: Option<String>,
     sentence: Option<String>,
+    /// TEITOK xidx window (sentence/region units) for `/fragment`
+    context: Option<String>,
+    /// TEITOK xidx scope structure name for `/fragment` (default `s`)
+    context_scope: Option<String>,
+    /// Inclusive end position for `/fragment` (default: same as `pos`)
+    end: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5619,6 +5627,103 @@ async fn http_pando_context(
     }
     let qs = parts.join("&");
     pando_dispatch_get(&state, &q.corpus, "/context", &qs).await
+}
+
+/// TEITOK-style XML around a corpus span, from the project's xidx (for KonText
+/// token_connect — no round-trip through TEITOK PHP).
+async fn http_pando_fragment(
+    State(state): State<HttpAppState>,
+    AxumQuery(q): AxumQuery<PandoCorpusQuery>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let pos_s = q.pos.as_deref().unwrap_or("").trim();
+    if pos_s.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "pos is required".to_string()));
+    }
+    let start: i64 = pos_s
+        .parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "pos must be an integer".to_string()))?;
+    let end: i64 = match q.end.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(e) => e
+            .parse()
+            .map_err(|_| (StatusCode::BAD_REQUEST, "end must be an integer".to_string()))?,
+        None => start,
+    };
+    if end < start {
+        return Err((StatusCode::BAD_REQUEST, "end must be >= pos".to_string()));
+    }
+    let window: i32 = q
+        .context
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5)
+        .max(0);
+    let scope = q
+        .context_scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("s")
+        .to_string();
+
+    let hcm = state.pando_hcm.clone().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "libflexicorp_pando hot path not available".to_string(),
+        )
+    })?;
+    let corpus = state.catalog.get(&q.corpus).map_err(to_http_err)?;
+    let index_dir = resolve_pando_index_dir(&corpus).map_err(to_http_err)?;
+    let project_root = PathBuf::from(resolve_teitok_project_root(&corpus));
+    let project_url = corpus.project_url.clone();
+    let corpus_id = corpus.id.clone();
+    let open_opts = state.limits.engine_options_for(&corpus.settings);
+
+    let result = tokio::task::spawn_blocking(move || -> Result<Value> {
+        let xidx_tokens = project_root.join("xidx").join("tokens.bin");
+        if !xidx_tokens.is_file() {
+            anyhow::bail!("no TEITOK xidx at {} (expected xidx/tokens.bin)", project_root.display());
+        }
+        let guard = HotGuard::acquire(hcm, &corpus_id, &index_dir, false, Some(&open_opts))?;
+        // doc_id from engine /context (same as KWIC refs)
+        let ctx_qs = format!("pos={start}&left=0&right=0");
+        let (st, ctx) = guard.request("GET", "/context", &ctx_qs, "")?;
+        let doc_id = if st < 400 {
+            ctx.get("doc_id").and_then(Value::as_str).unwrap_or("").to_string()
+        } else {
+            String::new()
+        };
+        let frags = guard.xidx_fragments(&project_root, &[(start, end)], &scope, window)?;
+        let (frag_doc, fragment) = match frags.into_iter().next().flatten() {
+            Some((d, xml)) => (d.unwrap_or_default(), xml),
+            None => anyhow::bail!("no xidx fragment for pos {start}..{end}"),
+        };
+        let cid = if !frag_doc.is_empty() {
+            frag_doc
+        } else {
+            doc_id.clone()
+        };
+        Ok(json!({
+            "ok": true,
+            "corpus": corpus_id,
+            "pos": start,
+            "end": end,
+            "doc_id": cid,
+            "fragment": fragment,
+            "project_url": project_url,
+            "context_scope": scope,
+            "context": window,
+        }))
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("worker join: {e}"),
+        )
+    })?
+    .map_err(to_http_err)?;
+
+    Ok(Json(result))
 }
 
 async fn http_pando_run(

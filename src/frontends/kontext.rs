@@ -365,7 +365,10 @@ fn corplist_corpus_xml(spec: &CorplistCorpusSpec<'_>, indent: &str) -> String {
 }
 
 
-/// pando_corpora.json with an entry for `ident`, or None when it has one already.
+/// pando_corpora.json with an entry for `ident`, or None when unchanged.
+/// When the corpus is already listed, still merges TEITOK link fields
+/// (`teitok_crp_path` / `teitok_crp_server` / `label` / `url` / `backend` / `fqs_corpus`)
+/// so republish can refresh them without deleting the entry.
 fn pando_corpora_with(text: &str, ident: &str, entry: Value) -> Result<Option<String>, String> {
     let mut v: Value = if text.trim().is_empty() {
         json!({ "corpora": {} })
@@ -379,8 +382,30 @@ fn pando_corpora_with(text: &str, ident: &str, entry: Value) -> Result<Option<St
         v.as_object_mut()
     }
     .ok_or("pando_corpora.json: expected an object of corpora")?;
-    if map.keys().any(|k| k.eq_ignore_ascii_case(ident)) {
-        return Ok(None);
+    if let Some((key, existing)) = map
+        .iter_mut()
+        .find(|(k, _)| k.eq_ignore_ascii_case(ident))
+    {
+        let Some(dst) = existing.as_object_mut() else {
+            return Ok(None);
+        };
+        let Some(src) = entry.as_object() else {
+            return Ok(None);
+        };
+        let mut changed = false;
+        for field in ["teitok_crp_path", "teitok_crp_server", "label", "url", "backend", "fqs_corpus"] {
+            if let Some(val) = src.get(field) {
+                if dst.get(field) != Some(val) {
+                    dst.insert(field.to_string(), val.clone());
+                    changed = true;
+                }
+            }
+        }
+        let _ = key;
+        if !changed {
+            return Ok(None);
+        }
+        return Ok(Some(serde_json::to_string_pretty(&v).unwrap_or_default() + "\n"));
     }
     map.insert(ident.to_string(), entry);
     Ok(Some(serde_json::to_string_pretty(&v).unwrap_or_default() + "\n"))
