@@ -5692,6 +5692,15 @@ async fn http_pando_fragment(
         } else {
             String::new()
         };
+        // Positional/structural attr `id` at focus pos (TEITOK tid, e.g. w-115)
+        let tok_id = if st < 400 {
+            ctx.get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        } else {
+            String::new()
+        };
         let frags = guard.xidx_fragments(&project_root, &[(start, end)], &scope, window)?;
         let (frag_doc, fragment) = match frags.into_iter().next().flatten() {
             Some((d, xml)) => (d.unwrap_or_default(), xml),
@@ -5708,6 +5717,7 @@ async fn http_pando_fragment(
             "pos": start,
             "end": end,
             "doc_id": cid,
+            "id": tok_id,
             "fragment": fragment,
             "project_url": project_url,
             "context_scope": scope,
