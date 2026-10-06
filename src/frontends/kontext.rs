@@ -921,13 +921,13 @@ fn kontext_coverage_for_frontend(frontend_id: &str, cfg: &Value, corpora: &[Cata
     }
     let mut files = vec![];
     if let Some(p) = &corplist_path {
-        files.push(json!(["corplist", p.display().to_string()]));
+        files.push(json!(["Corpus list", p.display().to_string()]));
     }
     if let Some(p) = &pando_path {
-        files.push(json!(["Pando", p.display().to_string()]));
+        files.push(json!(["Pando corpora", p.display().to_string()]));
     }
     if let Some(p) = &registry {
-        files.push(json!(["registry", p.display().to_string()]));
+        files.push(json!(["Manatee registry", p.display().to_string()]));
     }
 
     let publishable = have_corplist && corplist_writable && (pando_path.is_none() || pando_writable);
@@ -981,7 +981,10 @@ impl FrontendModule for Kontext {
         let mut cfg = serde_json::Map::new();
         cfg.insert("kind".into(), json!("kontext"));
         if let Some(u) = url {
+            // the catalogue's address is the public one: publishing records it with the
+            // corpus (settings.kontext.public_url), which puts the corpus on the KonText card
             cfg.insert("url".into(), json!(u));
+            cfg.insert("public_url".into(), json!(u));
         }
         Some(Value::Object(cfg))
     }

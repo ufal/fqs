@@ -5126,6 +5126,8 @@ fn browse_corpus_dto(c: &CorpusEntry) -> Value {
         &c.capabilities,
     )
     .into_iter()
+    // only frontends with an address can be linked to
+    .filter(|h| h.url.is_some())
     // a frontend switched off in the corpus settings (kontext.enabled = false, …) is not offered
     .filter(|h| {
         let block = match h.kind.as_str() {

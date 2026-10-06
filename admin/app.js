@@ -1540,7 +1540,7 @@
               html +=
                 '<div class="muted muted-xs-mt">' + esc(h.note) + "</div>";
             }
-            html += corporaDetailsFold(f.corpus_details || [], "Corpora", f.corpus_aliases);
+            html += corporaDetailsFold(f.corpus_details || [], "Corpora", f.corpus_aliases, frontendCorpusLink(f));
             html += "</div>";
           });
         }
@@ -1554,10 +1554,10 @@
             "Corpora (catalog)"
           );
         }
-        // what belongs to this frontend: its processes and the corpora it still lacks
-        // (frontends with a module in FQS)
-        if (k.processes) html += processesHtml(k.processes);
-        const fcov = frontendCoverageHtml(cov, k.id);
+        // what belongs to this frontend: its files and processes (Advanced), and the
+        // corpora it still lacks (frontends with a module in FQS)
+        html += advancedHtml(k.processes, frontendFiles(cov, k.id));
+        const fcov = frontendCoverageHtml(cov, k.id, false);
         if (fcov) {
           html += fcov;
           placed[k.id] = true;
@@ -1628,25 +1628,45 @@
     });
   }
 
-  function processesHtml(procs) {
-    if (!procs || !procs.length) return "";
-    let html =
-      '<details class="corpus-fold"><summary>Processes <span class="muted">(' +
-      procs.length +
-      ")</span></summary>";
-    html +=
-      '<div class="corpus-fold-body"><table class="data-table"><thead><tr><th>PID</th><th>Server</th><th>Command</th></tr></thead><tbody>';
-    procs.forEach((g) => {
+  /** The files a frontend module works with ([label, path] pairs), from the coverage reports. */
+  function frontendFiles(cov, kind) {
+    if (!cov || cov.error) return [];
+    const out = [];
+    (cov.frontends || cov.kontext || [])
+      .filter((r) => (r.kind || "kontext") === kind)
+      .forEach((r) => (r.files || []).forEach((f) => out.push(f)));
+    return out;
+  }
+
+  /** Advanced: the frontend's files (as FQS found or was told them) and its processes. */
+  function advancedHtml(procs, files) {
+    procs = procs || [];
+    files = files || [];
+    if (!procs.length && !files.length) return "";
+    let html = '<details class="corpus-fold"><summary>Advanced</summary><div class="corpus-fold-body">';
+    if (files.length) {
+      html += '<table class="data-table"><thead><tr><th>File</th><th>Path</th></tr></thead><tbody>';
+      files.forEach((f) => {
+        html += "<tr><td>" + esc(f[0]) + "</td><td class='mono'>" + esc(f[1]) + "</td></tr>";
+      });
+      html += "</tbody></table>";
+    }
+    if (procs.length) {
       html +=
-        "<tr><td class='mono'>" +
-        esc(g.pid) +
-        "</td><td class='mono'>" +
-        esc(g.server || "") +
-        "</td><td class='mono muted-xs'>" +
-        esc(g.cmd) +
-        "</td></tr>";
-    });
-    return html + "</tbody></table></div></details>";
+        '<table class="data-table"><thead><tr><th>PID</th><th>Server</th><th>Command</th></tr></thead><tbody>';
+      procs.forEach((g) => {
+        html +=
+          "<tr><td class='mono'>" +
+          esc(g.pid) +
+          "</td><td class='mono'>" +
+          esc(g.server || "") +
+          "</td><td class='mono muted-xs'>" +
+          esc(g.cmd) +
+          "</td></tr>";
+      });
+      html += "</tbody></table>";
+    }
+    return html + "</div></details>";
   }
 
   function stepMark(v) {
@@ -1659,7 +1679,7 @@
    * What a frontend (with a module in FQS) still lacks: per corpus, the module's steps
    * (KonText: corpus list, Pando entry, Manatee registry), and a button to publish it.
    */
-  function frontendCoverageHtml(cov, kind) {
+  function frontendCoverageHtml(cov, kind, withFiles) {
     if (!cov || cov.error) return "";
     const reports = (cov.frontends || cov.kontext || []).filter((r) => (r.kind || "kontext") === kind);
     let html = "";
@@ -1670,7 +1690,8 @@
       const label = k.label || kind;
       if (!missing.length && !hints.length) return;
       html += '<div class="coverage-block">';
-      const files = (k.files || []).map((f) => f[0] + " " + f[1]);
+      // on a frontend's card the files are under Advanced
+      const files = withFiles === false ? [] : (k.files || []).map((f) => f[0] + " " + f[1]);
       if (files.length) {
         html += '<div class="muted mono muted-xs">' + files.map(esc).join(" · ") + "</div>";
       }
@@ -1841,8 +1862,19 @@
     );
   }
 
+  /**
+   * On a frontend's card a corpus links to that frontend (KonText: its query page for the
+   * corpus), not to the corpus's own project; null: the project URL as before.
+   */
+  function frontendCorpusLink(f) {
+    if (!f || f.kind !== "kontext") return null;
+    const base = String(f.public_url || f.url || "").replace(/\/+$/, "");
+    if (!base) return () => "";
+    return (id, alias) => base + "/query?corpname=" + encodeURIComponent(alias || id);
+  }
+
   /** Foldable corpus table; open by default when small, collapsed when many. */
-  function corporaDetailsFold(details, title, aliases) {
+  function corporaDetailsFold(details, title, aliases, linkFor) {
     const rows = details && details.length ? details : [];
     if (!rows.length) {
       return '<p class="muted corpus-none">none in FQS catalog yet</p>';
@@ -1864,7 +1896,7 @@
     rows.forEach((r) => {
       const id = r.id || "";
       const alias = r.alias || aliasMap[id] || "";
-      const url = r.project_url || "";
+      const url = linkFor ? linkFor(id, alias) : r.project_url || "";
       html +=
         "<tr><td><strong>" +
         esc(r.label || id) +

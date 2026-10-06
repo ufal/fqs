@@ -160,7 +160,11 @@ pub fn probe_frontends(catalog_hints: &[FrontendHint]) -> Value {
     // Per-kind corpus bags for non-centralized kinds (e.g. TEITOK).
     let mut kind_corpora: Map<String, Value> = Map::new();
 
-    for hint in catalog_hints {
+    // hints with an address first, so that one without (a KonText corpname only) can join
+    // the instance they make
+    let mut ordered: Vec<&FrontendHint> = catalog_hints.iter().collect();
+    ordered.sort_by_key(|h| h.url.is_none());
+    for hint in ordered {
         if hint.centralized {
             let target_id = resolve_frontend_merge_id(&instances, hint);
             let entry = instances.entry(target_id.clone()).or_insert_with(|| {
@@ -562,17 +566,25 @@ pub fn hints_from_catalog_row(
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        if let Some(u) = url {
-            let alias = k
-                .get("corpname")
-                .or_else(|| k.get("corpus"))
-                .and_then(Value::as_str)
-                .map(str::to_string);
+        let alias = k
+            .get("corpname")
+            .or_else(|| k.get("corpus"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        // a corpus added to a KonText whose address FQS did not know has only a corpname:
+        // it still belongs to that KonText (the admin's KonText card); public corpus lists
+        // leave URL-less hints out
+        if url.is_some() || alias.is_some() {
             out.push(FrontendHint {
-                id: format!("kontext:{}", host_key(u)),
+                id: match url {
+                    Some(u) => format!("kontext:{}", host_key(u)),
+                    None => "kontext".into(),
+                },
                 kind: "kontext".into(),
                 label: "KonText".into(),
-                url: Some(u.trim_end_matches('/').to_string()),
+                url: url.map(|u| u.trim_end_matches('/').to_string()),
                 corpus_id: corpus_id.to_string(),
                 corpus_alias: alias,
                 centralized: true,
@@ -1203,6 +1215,10 @@ fn resolve_frontend_merge_id(by_id: &Map<String, Value>, hint: &FrontendHint) ->
         if matches {
             return (*id).clone();
         }
+    }
+    // no address: the one instance of this kind there is, if there is just one
+    if hint_url.is_empty() && same_kind.len() == 1 {
+        return same_kind[0].0.clone();
     }
     // one configured instance of this kind: the catalogue means that one
     let configured: Vec<&String> = same_kind
@@ -1949,6 +1965,29 @@ pub fn publish_to_frontend(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn kontext_corpus_with_only_a_corpname_joins_the_kontext_card() {
+        let with_url = hints_from_catalog_row("ntrex", None, None,
+            &json!({"kontext": {"corpname": "ntrex", "public_url": "https://lindat.cz/services/test-kontext"}}),
+            "pando", false, None, &json!({}));
+        let no_url = hints_from_catalog_row("migrantstories", None, None,
+            &json!({"kontext": {"corpname": "migrantstories"}}), "pando", false, None, &json!({}));
+        assert_eq!(no_url.len(), 1);
+        assert!(no_url[0].url.is_none());
+        // the URL-less one comes first in the catalogue, and still joins the instance
+        let mut all = no_url.clone();
+        all.extend(with_url);
+        let report = probe_frontends(&all);
+        let text = report.to_string();
+        let kontext = report["kinds"].as_array().unwrap().iter().find(|k| k["id"] == "kontext").unwrap();
+        let instances = kontext["instances"].as_array().unwrap();
+        assert_eq!(instances.len(), 1, "{text}");
+        let corpora: Vec<&str> = instances[0]["corpora"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert_eq!(corpora, vec!["migrantstories", "ntrex"]);
+        // nothing at all: no hint
+        assert!(hints_from_catalog_row("x", None, None, &json!({"kontext": {}}), "pando", false, None, &json!({})).is_empty());
+    }
 
     #[test]
     fn restart_triggers_are_only_what_root_set_up() {
