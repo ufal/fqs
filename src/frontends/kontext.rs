@@ -358,7 +358,7 @@ fn corplist_corpus_xml(spec: &CorplistCorpusSpec<'_>, indent: &str) -> String {
 {child}        </keywords>\n\
 {child}</metadata>\n\
 {child}<token_connect>\n\
-{child}        <provider is_kwic_view=\"true\">TEITOK</provider>\n\
+{child}        <provider is_kwic_view=\"false\">TEITOK</provider>\n\
 {child}</token_connect>\n\
 {indent}</corpus>\n"
     )
@@ -1345,7 +1345,7 @@ mod tests {
         assert!(out.contains("features=\"morphology,syntax\""), "{out}");
         assert!(out.contains("<item>teitok</item>"), "{out}");
         assert!(
-            out.contains("<provider is_kwic_view=\"true\">TEITOK</provider>"),
+            out.contains("<provider is_kwic_view=\"false\">TEITOK</provider>"),
             "{out}"
         );
         assert!(roxmltree::Document::parse(&out).is_ok());
