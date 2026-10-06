@@ -4706,6 +4706,17 @@ async fn http_admin_frontend_publish(
         .map(str::to_string)
         .or_else(|| entry.labels.iter().find_map(|l| l.strip_prefix("lang:").map(str::to_string)));
     let description = entry.settings.get("description").and_then(Value::as_str).map(str::to_string);
+    let project_root = entry.project_root.to_string_lossy();
+    let teitok = services::corpus_is_teitok_listable(
+        entry.interface_preference.as_deref(),
+        &entry.source_kind,
+        entry.supports_xml,
+        Some(project_root.as_ref()),
+        entry.project_url.as_deref(),
+        &entry.settings,
+        &entry.capabilities,
+    ) || entry.source_kind.to_ascii_lowercase().contains("teitok");
+    let project_url = entry.project_url.clone();
     let fid = frontend_id.clone();
     let (cid, label) = (corpus_id.clone(), entry.label.clone());
     let result = tokio::task::spawn_blocking(move || {
@@ -4720,6 +4731,8 @@ async fn http_admin_frontend_publish(
                 index_dir,
                 fqs_url: &fqs_url,
                 options: &options,
+                teitok,
+                project_url: project_url.as_deref(),
             },
         )
     })

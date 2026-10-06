@@ -284,10 +284,20 @@ fn parse_kontext_corplist_idents(text: &str) -> Vec<String> {
 }
 
 
+/// Options for a new `<corpus>` element in corplist.xml.
+struct CorplistCorpusSpec<'a> {
+    ident: &'a str,
+    sentence_struct: &'a str,
+    /// TEITOK link-back: keyword + token_connect provider (XML fragment + document view).
+    teitok: bool,
+    /// `keyboard_lang` when `teitok` (ISO-ish code; default `en`).
+    keyboard_lang: Option<&'a str>,
+}
+
 /// The corplist with one more <corpus>, inserted before the last </corplist> that is
 /// not inside a comment, indented like the corpora already there; checked to be
 /// well-formed XML.
-fn corplist_with_corpus(text: &str, ident: &str, sentence_struct: &str) -> Result<String, String> {
+fn corplist_with_corpus(text: &str, spec: &CorplistCorpusSpec<'_>) -> Result<String, String> {
     roxmltree::Document::parse(text)
         .map_err(|e| format!("corplist.xml is not well-formed XML as it is ({e}); not changing it"))?;
     let comments = xml_comment_ranges(text);
@@ -306,25 +316,52 @@ fn corplist_with_corpus(text: &str, ident: &str, sentence_struct: &str) -> Resul
     let closing_indent: String = text[line_start..idx].chars().take_while(|c| *c == ' ' || *c == '\t').collect();
     let closing_on_own_line = text[line_start..idx].trim().is_empty();
     let indent = format!("{closing_indent}    ");
-    let line = format!(
-        "<corpus ident=\"{}\" sentence_struct=\"{}\"/>",
-        xml_escape_attr(ident),
-        xml_escape_attr(sentence_struct)
-    );
-    let mut out = String::with_capacity(text.len() + line.len() + 16);
+    let block = corplist_corpus_xml(spec, &indent);
+    let mut out = String::with_capacity(text.len() + block.len() + 16);
     if closing_on_own_line {
         out.push_str(&text[..line_start]);
-        out.push_str(&indent);
-        out.push_str(&line);
-        out.push('\n');
+        out.push_str(&block);
+        if !block.ends_with('\n') {
+            out.push('\n');
+        }
         out.push_str(&text[line_start..]);
     } else {
         out.push_str(&text[..idx]);
-        out.push_str(&line);
+        out.push_str(block.trim_start());
         out.push_str(&text[idx..]);
     }
     roxmltree::Document::parse(&out).map_err(|e| format!("adding the corpus would break corplist.xml ({e})"))?;
     Ok(out)
+}
+
+/// XML for one `<corpus>`: self-closing for plain Pando, or TEITOK token_connect block.
+fn corplist_corpus_xml(spec: &CorplistCorpusSpec<'_>, indent: &str) -> String {
+    let ident = xml_escape_attr(spec.ident);
+    let ss = xml_escape_attr(spec.sentence_struct);
+    if !spec.teitok {
+        return format!("{indent}<corpus ident=\"{ident}\" sentence_struct=\"{ss}\"/>\n");
+    }
+    let lang = spec
+        .keyboard_lang
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter(|s| valid_kontext_ident(s) || s.len() <= 8)
+        .unwrap_or("en");
+    let lang = xml_escape_attr(lang);
+    // features + num_tag_pos match existing LINDAT TEITOK corplist entries (taghelper / UI).
+    let child = format!("{indent}    ");
+    format!(
+        "{indent}<corpus ident=\"{ident}\" sentence_struct=\"{ss}\" num_tag_pos=\"16\" keyboard_lang=\"{lang}\" features=\"morphology,syntax\">\n\
+{child}<metadata>\n\
+{child}        <keywords>\n\
+{child}                <item>teitok</item>\n\
+{child}        </keywords>\n\
+{child}</metadata>\n\
+{child}<token_connect>\n\
+{child}        <provider is_kwic_view=\"true\">TEITOK</provider>\n\
+{child}</token_connect>\n\
+{indent}</corpus>\n"
+    )
 }
 
 
@@ -440,6 +477,41 @@ pub struct ShellSpec<'a> {
     pub description: Option<&'a str>,
     pub language: Option<&'a str>,
     pub info: &'a PandoCorpusInfo,
+    /// TEITOK base path for KonText token_connect (`crp.path`), e.g. `/teitok/migrantstories/`.
+    pub crp_path: Option<&'a str>,
+    /// Optional host for `crp.server` (informational; providers_conf often hardcodes server).
+    pub crp_server: Option<&'a str>,
+}
+
+/// From a TEITOK `project_url`, the `(server, path/)` pair for Manatee `STRUCTURE crp`
+/// and KonText's `{crp[path]}index.php?action=context…` provider.
+pub fn teitok_crp_from_project_url(url: &str) -> Option<(String, String)> {
+    let raw = url.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let no_hash = raw.split('#').next().unwrap_or(raw);
+    let no_query = no_hash.split('?').next().unwrap_or(no_hash);
+    let (server, path_part) = if let Some(rest) = no_query.strip_prefix("https://").or_else(|| no_query.strip_prefix("http://")) {
+        let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let host = host.split('@').next_back().unwrap_or(host); // drop userinfo if any
+        let host = host.split(':').next().unwrap_or(host); // drop port for crp.server label
+        (host.to_string(), format!("/{path}"))
+    } else if no_query.starts_with('/') {
+        (String::new(), no_query.to_string())
+    } else {
+        return None;
+    };
+    let mut path = path_part;
+    if let Some(i) = path.to_ascii_lowercase().rfind("/index.php") {
+        path.truncate(i + 1);
+    } else if !path.ends_with('/') {
+        path.push('/');
+    }
+    if path == "/" && server.is_empty() {
+        return None;
+    }
+    Some((server, path))
 }
 
 
@@ -485,6 +557,10 @@ pub fn manatee_registry_text(spec: &ShellSpec<'_>, paths: &ShellPaths) -> String
             o.push_str(&format!("ATTRIBUTE {a}\n"));
         }
     }
+    // TEITOK / KonText token_connect: STRUCTURE crp { path, server } — same as flexicorp Manatee writer.
+    if spec.crp_path.is_some() && !structs.iter().any(|s| s == "crp") {
+        o.push_str("STRUCTURE crp {\n    ATTRIBUTE path\n    ATTRIBUTE server\n}\n");
+    }
     for s in &structs {
         let sattrs: Vec<&String> = info
             .struct_attrs
@@ -507,10 +583,19 @@ pub fn manatee_registry_text(spec: &ShellSpec<'_>, paths: &ShellPaths) -> String
 
 
 /// One document with one sentence of one token, with every column and structure.
-pub fn manatee_shell_vertical(info: &PandoCorpusInfo) -> String {
+pub fn manatee_shell_vertical(spec: &ShellSpec<'_>) -> String {
+    let info = spec.info;
     let attrs = shell_attributes(info);
     let structs = shell_structures(info);
     let mut o = String::new();
+    if let Some(path) = spec.crp_path.map(str::trim).filter(|s| !s.is_empty()) {
+        let server = spec.crp_server.unwrap_or("");
+        o.push_str(&format!(
+            "<crp path=\"{}\" server=\"{}\">\n",
+            xml_escape_attr(path),
+            xml_escape_attr(server)
+        ));
+    }
     for s in &structs {
         let sattrs: Vec<String> = info
             .struct_attrs
@@ -524,6 +609,9 @@ pub fn manatee_shell_vertical(info: &PandoCorpusInfo) -> String {
     o.push('\n');
     for s in structs.iter().rev() {
         o.push_str(&format!("</{s}>\n"));
+    }
+    if spec.crp_path.map(str::trim).filter(|s| !s.is_empty()).is_some() {
+        o.push_str("</crp>\n");
     }
     o
 }
@@ -597,7 +685,7 @@ pub fn create_manatee_shell(cfg: Option<&Value>, registry_dir: &Path, spec: &She
     };
     let spec = &ShellSpec { encoded: true, ..*spec };
     let text = manatee_registry_text(spec, &paths);
-    let vert = manatee_shell_vertical(spec.info);
+    let vert = manatee_shell_vertical(spec);
     let _guard = FILES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let step = || -> Result<Value, String> {
         for d in [Some(registry_dir), paths.data.parent(), paths.vertical.parent()].into_iter().flatten() {
@@ -657,7 +745,7 @@ pub fn create_manatee_shell(cfg: Option<&Value>, registry_dir: &Path, spec: &She
 fn write_unencoded_shell(registry_dir: &Path, paths: &ShellPaths, spec: &ShellSpec<'_>, state: &str) -> Value {
     let spec = &ShellSpec { encoded: false, ..*spec };
     let text = manatee_registry_text(spec, paths);
-    let vert = manatee_shell_vertical(spec.info);
+    let vert = manatee_shell_vertical(spec);
     let _guard = FILES_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let step = || -> Result<Value, String> {
         for d in [Some(registry_dir), Some(paths.data.as_path()), paths.vertical.parent()].into_iter().flatten() {
@@ -720,7 +808,27 @@ fn publish_kontext(cfg: Option<&Value>, req: &PublishRequest<'_>) -> Result<Valu
     let present = parse_kontext_corplist_idents(&text)
         .iter()
         .any(|i| i.eq_ignore_ascii_case(ident));
-    let new_corplist = if present { None } else { Some(corplist_with_corpus(&text, ident, ss)?) };
+    let new_corplist = if present {
+        None
+    } else {
+        let keyboard_lang = req.language.and_then(|l| {
+            let t = l.trim();
+            if t.len() >= 2 && t.as_bytes()[..2].iter().all(u8::is_ascii_alphabetic) {
+                Some(t[..2].to_ascii_lowercase())
+            } else {
+                None
+            }
+        });
+        Some(corplist_with_corpus(
+            &text,
+            &CorplistCorpusSpec {
+                ident,
+                sentence_struct: ss,
+                teitok: req.teitok,
+                keyboard_lang: keyboard_lang.as_deref().or(Some("en")),
+            },
+        )?)
+    };
 
     let mut pando_step = json!({ "status": "not_found",
         "message": "No pando_corpora.json found (set frontends[].pando_corpora in fqs.json): without it KonText cannot send queries for this corpus to Pando." });
@@ -733,6 +841,14 @@ fn publish_kontext(cfg: Option<&Value>, req: &PublishRequest<'_>) -> Result<Valu
                 let mut entry = json!({ "url": fqs_url.trim_end_matches('/'), "backend": "fqs", "fqs_corpus": cid });
                 if !req.label.trim().is_empty() {
                     entry["label"] = json!(req.label.trim());
+                }
+                if req.teitok {
+                    if let Some((server, path)) = req.project_url.and_then(teitok_crp_from_project_url) {
+                        entry["teitok_crp_path"] = json!(path);
+                        if !server.is_empty() {
+                            entry["teitok_crp_server"] = json!(server);
+                        }
+                    }
                 }
                 // no "size": kontext-pando then asks FQS (/info), which stays right after a reindex
                 let ptext = fs::read_to_string(pp).map_err(|e| format!("Cannot read {}: {e}", pp.display()))?;
@@ -762,6 +878,24 @@ fn publish_kontext(cfg: Option<&Value>, req: &PublishRequest<'_>) -> Result<Valu
     // Manatee registry: build the shell from the Pando index when it is missing (or FQS
     // made it for an older index)
     let info = req.index_dir.as_deref().and_then(read_pando_corpus_info);
+    let crp = req
+        .project_url
+        .and_then(teitok_crp_from_project_url)
+        .or_else(|| {
+            // options.teitok_crp_path override (admin / CLI)
+            let path = req.options.get("teitok_crp_path").and_then(Value::as_str)?;
+            let server = req
+                .options
+                .get("teitok_crp_server")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            Some((server, path.to_string()))
+        });
+    let (crp_server, crp_path) = match &crp {
+        Some((s, p)) => (Some(s.as_str()), Some(p.as_str())),
+        None => (None, None),
+    };
     let registry_step = match resolve_manatee_registry(cfg) {
         None => json!({ "status": "unknown",
             "message": "Manatee registry folder not found (set frontends[].registry in fqs.json) — make sure it has a file for this corpus." }),
@@ -777,6 +911,8 @@ fn publish_kontext(cfg: Option<&Value>, req: &PublishRequest<'_>) -> Result<Valu
                     description: req.description,
                     language: req.language,
                     info,
+                    crp_path: if req.teitok { crp_path } else { None },
+                    crp_server: if req.teitok { crp_server } else { None },
                 },
             ),
             _ if registry_has(&dir, ident) => json!({ "status": "ok", "path": dir.join(ident).display().to_string() }),
@@ -1139,12 +1275,59 @@ mod tests {
     #[test]
     fn corplist_insert_keeps_xml_well_formed() {
         let text = "<kontext>\n    <corplist name=\"root\">\n        <corpus ident=\"a\"/>\n    </corplist>\n    <!-- </corplist> -->\n</kontext>\n";
-        let out = corplist_with_corpus(text, "b", "s").unwrap();
+        let out = corplist_with_corpus(
+            text,
+            &CorplistCorpusSpec {
+                ident: "b",
+                sentence_struct: "s",
+                teitok: false,
+                keyboard_lang: None,
+            },
+        )
+        .unwrap();
         assert!(out.contains("        <corpus ident=\"b\" sentence_struct=\"s\"/>\n    </corplist>"), "{out}");
         assert!(roxmltree::Document::parse(&out).is_ok());
         assert_eq!(parse_kontext_corplist_idents(&out), vec!["a", "b"]);
         // a broken corplist is left alone
-        assert!(corplist_with_corpus("<corplist><corpus ident=\"a\"></corplist>", "b", "s").is_err());
+        assert!(corplist_with_corpus(
+            "<corplist><corpus ident=\"a\"></corplist>",
+            &CorplistCorpusSpec {
+                ident: "b",
+                sentence_struct: "s",
+                teitok: false,
+                keyboard_lang: None,
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn corplist_teitok_adds_token_connect() {
+        let text = "<corplist name=\"root\">\n    <corpus ident=\"a\"/>\n</corplist>\n";
+        let out = corplist_with_corpus(
+            text,
+            &CorplistCorpusSpec {
+                ident: "tt_simplecorp_46",
+                sentence_struct: "s",
+                teitok: true,
+                keyboard_lang: Some("en"),
+            },
+        )
+        .unwrap();
+        assert!(out.contains("ident=\"tt_simplecorp_46\""), "{out}");
+        assert!(out.contains("num_tag_pos=\"16\""), "{out}");
+        assert!(out.contains("keyboard_lang=\"en\""), "{out}");
+        assert!(out.contains("features=\"morphology,syntax\""), "{out}");
+        assert!(out.contains("<item>teitok</item>"), "{out}");
+        assert!(
+            out.contains("<provider is_kwic_view=\"true\">TEITOK</provider>"),
+            "{out}"
+        );
+        assert!(roxmltree::Document::parse(&out).is_ok());
+        assert_eq!(
+            parse_kontext_corplist_idents(&out),
+            vec!["a", "tt_simplecorp_46"]
+        );
     }
 
     #[test]
@@ -1212,7 +1395,7 @@ mod tests {
             vertical: PathBuf::from("/var/lib/manatee/vert/ud-demo.vert"),
         };
         let spec = ShellSpec { encoded: true, ident: "ud-demo", corpus_id: "ud-demo", label: "UD demo \"EWT\"",
-            description: None, language: Some("en"), info: &info };
+            description: None, language: Some("en"), info: &info, crp_path: None, crp_server: None };
         let reg = manatee_registry_text(&spec, &paths);
         assert!(reg.contains("NAME \"UD demo \\\"EWT\\\"\"\n"), "{reg}");
         assert!(reg.contains("PATH \"/var/lib/manatee/data/ud-demo/\"\n"));
@@ -1225,8 +1408,31 @@ mod tests {
         assert_eq!(&attrs[..2], &["word", "lemma"]);
         assert!(!reg.contains("STRUCTURE del"));
         assert!(reg.contains("STRUCTURE text {\n    ATTRIBUTE id\n}\n"));
-        let vert = manatee_shell_vertical(&info);
+        let vert = manatee_shell_vertical(&spec);
         assert_eq!(vert, "<text id=\"shell\">\n<s id=\"shell\">\n_\t_\t_\t_\t_\t_\t_\t_\n</s>\n</text>\n");
+
+        let teitok_spec = ShellSpec {
+            crp_path: Some("/teitok/migrantstories/"),
+            crp_server: Some("lindat.mff.cuni.cz"),
+            ..spec
+        };
+        let reg2 = manatee_registry_text(&teitok_spec, &paths);
+        assert!(reg2.contains("STRUCTURE crp {\n    ATTRIBUTE path\n    ATTRIBUTE server\n}\n"), "{reg2}");
+        let vert2 = manatee_shell_vertical(&teitok_spec);
+        assert!(vert2.starts_with("<crp path=\"/teitok/migrantstories/\" server=\"lindat.mff.cuni.cz\">\n"), "{vert2}");
+        assert!(vert2.ends_with("</crp>\n"), "{vert2}");
+    }
+
+    #[test]
+    fn teitok_crp_path_from_project_url() {
+        assert_eq!(
+            teitok_crp_from_project_url("https://lindat.mff.cuni.cz/teitok/migrantstories/index.php"),
+            Some(("lindat.mff.cuni.cz".into(), "/teitok/migrantstories/".into()))
+        );
+        assert_eq!(
+            teitok_crp_from_project_url("http://example.org/services/teitok/foo"),
+            Some(("example.org".into(), "/services/teitok/foo/".into()))
+        );
     }
 
     #[test]
@@ -1243,7 +1449,8 @@ mod tests {
         let cfg = json!({ "encodevert": ev.display().to_string() });
         let mut info = ud_info();
         let spec = |info: &PandoCorpusInfo| create_manatee_shell(Some(&cfg), &reg_dir, &ShellSpec {
-            encoded: true, ident: "ud-demo", corpus_id: "ud-demo", label: "UD demo", description: None, language: None, info });
+            encoded: true, ident: "ud-demo", corpus_id: "ud-demo", label: "UD demo", description: None, language: None, info,
+            crp_path: None, crp_server: None });
         let r = spec(&info);
         assert_eq!(r["status"], "added", "{r}");
         assert!(d.join("data/ud-demo/word.lex").is_file());
@@ -1259,7 +1466,8 @@ mod tests {
         fs::write(reg_dir.join("other"), "NAME \"hand made\"\n").unwrap();
         assert_eq!(registry_state(&reg_dir, "other", Some("x")), "ok");
         let r = create_manatee_shell(Some(&cfg), &reg_dir, &ShellSpec {
-            encoded: true, ident: "other", corpus_id: "other", label: "x", description: None, language: None, info: &info });
+            encoded: true, ident: "other", corpus_id: "other", label: "x", description: None, language: None, info: &info,
+            crp_path: None, crp_server: None });
         assert_eq!(r["status"], "ok");
         assert_eq!(fs::read_to_string(reg_dir.join("other")).unwrap(), "NAME \"hand made\"\n");
         let _ = fs::remove_dir_all(&d);
@@ -1273,7 +1481,7 @@ mod tests {
         let reg_dir = d.join("registry");
         let info = ud_info();
         let spec = ShellSpec { encoded: true, ident: "ud-demo", corpus_id: "ud-demo", label: "UD demo",
-            description: None, language: None, info: &info };
+            description: None, language: None, info: &info, crp_path: None, crp_server: None };
         let r = write_unencoded_shell(&reg_dir, &shell_paths(None, &reg_dir, "ud-demo"), &spec, "missing");
         assert_eq!(r["status"], "added", "{r}");
         assert_eq!(r["encoded"], false);

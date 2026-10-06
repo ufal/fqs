@@ -43,6 +43,11 @@ pub struct PublishRequest<'a> {
     pub fqs_url: &'a str,
     /// module-specific options from the request body (`options`)
     pub options: &'a Value,
+    /// TEITOK-backed corpus: KonText corplist gets token_connect TEITOK + teitok keyword
+    /// so KWIC can show the XML fragment and link to the TEITOK document view.
+    pub teitok: bool,
+    /// Catalogue project URL (TEITOK page base); used for Manatee `crp.path` / token_connect.
+    pub project_url: Option<&'a str>,
 }
 
 /// What a frontend module implements. Reports are JSON so that the admin UI can show any
