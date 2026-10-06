@@ -1528,6 +1528,12 @@
                 "'>Restart</button>";
             }
             html += "</div>";
+            if (!f.restartable && f.kind === "kontext") {
+              html +=
+                '<div class="muted muted-xs-mt">No restart set up: KonText reads its corpus list at start-up, ' +
+                "so corpora added here appear after a restart. install-stack.pl sets up the restart " +
+                "(or add a <code>restart</code> block to this frontend in fqs.json).</div>";
+            }
             if (h.error) {
               html += '<div class="err err-xs">' + esc(h.error) + "</div>";
             } else if (h.note) {

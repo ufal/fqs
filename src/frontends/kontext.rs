@@ -818,7 +818,8 @@ fn publish_kontext(cfg: Option<&Value>, req: &PublishRequest<'_>) -> Result<Valu
         "registry": registry_step,
         "complete": complete,
         "restart_needed": changed,
-        "restartable": cfg.and_then(|c| c.get("restart")).is_some(),
+        "restartable": cfg.and_then(|c| c.get("restart")).is_some()
+            || crate::services::default_restart_block("kontext").is_some(),
         "public_url": public_url,
     }))
 }
@@ -950,7 +951,8 @@ fn kontext_coverage_for_frontend(frontend_id: &str, cfg: &Value, corpora: &[Cata
         "idents": idents,
         "missing": missing,
         "appendable": publishable,
-        "restartable": cfg.get("restart").is_some(),
+        "restartable": cfg.get("restart").is_some()
+            || crate::services::default_restart_block("kontext").is_some(),
     })
 }
 

@@ -173,8 +173,9 @@ A corpus opens in KonText (kontext-pando) when:
    registry carries a `# fqs: corpus=… index_id=…` line: after a reindex the card shows
    it as outdated and **Add to KonText** rebuilds it (and encodes it once `encodevert`
    is found); registries FQS did not write are never touched;
-4. KonText is restarted (offered when `restart` is configured) and users have access
-   to the corpus in KonText's auth — that last step is KonText's own.
+4. KonText is restarted (offered when it can be: a `restart` block in fqs.json, or a
+   restart trigger, below) and users have access to the corpus in KonText's auth — that
+   last step is KonText's own.
 
 FQS must be able to write these files: the systemd unit has `ProtectSystem=strict`, so
 their folders need `ReadWritePaths` (a drop-in), and the service user needs write
@@ -213,6 +214,24 @@ reaches FQS (default: FQS's own address):
 ```
 
 Current KonText runs under Sanic (`kontext.service` on test-kontext); older ones under gunicorn (`"unit": "gunicorn"`). Other restart methods: `hup_pidfile` with `"pidfile": "/run/gunicorn.pid"`, or `argv` with an allowlisted command array.
+
+**Restart triggers.** FQS runs as an unprivileged user with `NoNewPrivileges`, so a
+`systemctl restart` it runs itself is refused. `install/install-stack.pl` therefore sets up,
+as root, one systemd path unit per unit that may be restarted: `fqs-restart-<unit>.path`
+watches `/var/lib/fqs/restart/<unit>` (`FQS_RESTART_DIR` overrides the folder) and starts
+`fqs-restart@<unit>.service`, which runs `systemctl restart <unit>.service`. A `systemctl`
+restart (from fqs.json, or `fqs.restart`) for a unit with such a file writes the file instead and
+waits until the unit is active again (30 s). A KonText that is not in fqs.json (found on this
+machine or named by the catalogue) is restartable when `/var/lib/fqs/restart/kontext` exists,
+and FQS itself when `/var/lib/fqs/restart/fqs` exists. By hand:
+
+```bash
+sudo install -d -m 0755 /var/lib/fqs/restart
+sudo install -m 0644 -o fqs /dev/null /var/lib/fqs/restart/kontext   # the FQS service user
+# /etc/systemd/system/fqs-restart@.service:  [Service] Type=oneshot / ExecStart=/bin/systemctl restart %i.service
+# /etc/systemd/system/fqs-restart-kontext.path: [Path] PathModified=/var/lib/fqs/restart/kontext / Unit=fqs-restart@kontext.service
+sudo systemctl daemon-reload && sudo systemctl enable --now fqs-restart-kontext.path
+```
 
 `fqs corpora upsert-json` on an existing corpus keeps the fields the JSON leaves out,
 and the choices made in the admin (`settings.fcs.enabled`, `settings.kontext`

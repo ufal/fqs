@@ -243,6 +243,12 @@ pub fn probe_frontends(catalog_hints: &[FrontendHint]) -> Value {
                 }))
             };
             o.insert("health".into(), health);
+            if o.get("restart").is_none() {
+                let kind = normalize_frontend_kind(o.get("kind").and_then(Value::as_str).unwrap_or(""));
+                if let Some(r) = default_restart_block(&kind) {
+                    o.insert("restart".into(), r);
+                }
+            }
             let restartable = o.get("restart").and_then(|r| r.as_object()).is_some();
             o.insert("restartable".into(), json!(restartable));
             let kind = o
@@ -1305,22 +1311,129 @@ fn http_probe(url: &str) -> Value {
 
 /// Run a configured restart. Returns JSON result; errors as Err(message).
 pub fn restart_frontend(frontend_id: &str) -> Result<Value, String> {
-    let configured = configured_frontends();
-    let entry = configured
-        .into_iter()
-        .find(|(id, _)| id == frontend_id)
-        .map(|(_, v)| v)
+    let configured = configured_frontends().into_iter().find(|(id, _)| id == frontend_id).map(|(_, v)| v);
+    let kind = match &configured {
+        Some(c) => normalize_frontend_kind(c.get("kind").and_then(Value::as_str).unwrap_or(frontend_id)),
+        None => normalize_frontend_kind(frontend_id.split(':').next().unwrap_or(frontend_id)),
+    };
+    let restart = configured
+        .as_ref()
+        .and_then(|c| c.get("restart"))
+        .cloned()
+        .or_else(|| default_restart_block(&kind))
         .ok_or_else(|| {
             format!(
-                "frontend '{frontend_id}' has no restart config in {} (catalog-only frontends cannot be restarted)",
-                fqs_config_path().display()
+                "frontend '{frontend_id}' cannot be restarted from here: no restart block in {} \
+                 and no restart trigger in {} (install-stack.pl sets one up)",
+                fqs_config_path().display(),
+                restart_trigger_dir().display()
             )
         })?;
-    let restart = entry
-        .get("restart")
-        .and_then(|v| v.as_object())
-        .ok_or_else(|| format!("frontend '{frontend_id}' has no restart block"))?;
-    run_restart_block(restart)
+    let restart = restart.as_object().ok_or_else(|| format!("frontend '{frontend_id}': restart must be an object"))?;
+    run_restart_block(restart, true)
+}
+
+/// Folder with restart triggers. FQS runs as an unprivileged user (and with
+/// NoNewPrivileges), so it may not run `systemctl restart` itself. install-stack.pl
+/// installs, as root, one systemd path unit per unit FQS may restart
+/// (`fqs-restart-<unit>.path`, watching `<dir>/<unit>`); FQS writes that file and systemd
+/// restarts the unit. Which units can be restarted is decided by root, not by a request.
+pub(crate) fn restart_trigger_dir() -> PathBuf {
+    std::env::var("FQS_RESTART_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/fqs/restart"))
+}
+
+fn valid_unit_name(unit: &str) -> bool {
+    !unit.is_empty()
+        && unit
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '@')
+}
+
+/// The trigger file for `unit`, when root set one up.
+pub(crate) fn restart_trigger(unit: &str) -> Option<PathBuf> {
+    let unit = unit.trim();
+    let base = unit.strip_suffix(".service").unwrap_or(unit);
+    if !valid_unit_name(base) || base.starts_with('.') {
+        return None;
+    }
+    let p = restart_trigger_dir().join(base);
+    p.is_file().then_some(p)
+}
+
+/// Restart for a frontend that is not in fqs.json (found on this machine or named by the
+/// catalogue): only when root set up a restart trigger for its unit.
+pub(crate) fn default_restart_block(kind: &str) -> Option<Value> {
+    let unit = match kind {
+        "kontext" => "kontext",
+        _ => return None,
+    };
+    restart_trigger(unit).map(|_| json!({ "method": "systemctl", "unit": unit, "via": "restart trigger" }))
+}
+
+/// `systemctl show` works without privileges: when the unit last became active.
+fn unit_started_at(unit: &str) -> Option<String> {
+    let out = Command::new("systemctl")
+        .args(["show", "-p", "ActiveEnterTimestampMonotonic", "-p", "ActiveState", unit])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let get = |k: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(k).and_then(|r| r.strip_prefix('=')))
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    Some(format!("{}|{}", get("ActiveEnterTimestampMonotonic"), get("ActiveState")))
+}
+
+/// Ask systemd (through the trigger file) to restart `unit`; with `wait`, until the unit
+/// is active again (at most 30 s).
+fn trigger_restart(unit: &str, trigger: &Path, wait: bool) -> Value {
+    let before = unit_started_at(unit);
+    let stamp = format!("{}\n", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0));
+    if let Err(e) = fs::write(trigger, stamp) {
+        return json!({
+            "ok": false, "method": "trigger", "unit": unit, "trigger": trigger.display().to_string(),
+            "error": format!("cannot write the restart trigger {}: {e}", trigger.display()),
+        });
+    }
+    if !wait {
+        return json!({ "ok": true, "method": "trigger", "unit": unit,
+            "trigger": trigger.display().to_string(), "confirmed": false });
+    }
+    let Some(before) = before else {
+        return json!({ "ok": true, "method": "trigger", "unit": unit,
+            "trigger": trigger.display().to_string(), "confirmed": false,
+            "note": "requested; systemctl show is not available to confirm it" });
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+        if let Some(now) = unit_started_at(unit) {
+            if now != before && now.ends_with("|active") {
+                return json!({ "ok": true, "method": "trigger", "unit": unit,
+                    "trigger": trigger.display().to_string(), "confirmed": true });
+            }
+        }
+    }
+    json!({
+        "ok": false, "method": "trigger", "unit": unit, "trigger": trigger.display().to_string(),
+        "error": format!(
+            "restart of {unit} was requested, but it did not come back within 30 s: \
+             check `systemctl status fqs-restart-{unit}.path fqs-restart@{unit}.service {unit}`"
+        ),
+    })
 }
 
 /// Restart this FQS process via the optional `fqs.restart` block in fqs.json.
@@ -1329,20 +1442,29 @@ pub fn restart_fqs() -> Result<Value, String> {
         .get("restart")
         .and_then(|v| v.as_object())
         .cloned()
+        .or_else(|| {
+            restart_trigger("fqs").map(|_| {
+                let mut m = Map::new();
+                m.insert("method".into(), json!("systemctl"));
+                m.insert("unit".into(), json!("fqs"));
+                m
+            })
+        })
         .ok_or_else(|| {
             format!(
                 "no fqs.restart block in {} — configure e.g. {{\"fqs\":{{\"restart\":{{\"method\":\"systemctl\",\"unit\":\"fqs\"}}}}}}",
                 fqs_config_path().display()
             )
         })?;
-    run_restart_block(&restart)
+    // this process is what gets restarted: do not wait for it
+    run_restart_block(&restart, false)
 }
 
 /// Inventory for this FQS binary: version, update check, restartability.
 pub fn probe_fqs_self(server_name: Option<&str>) -> Value {
     let version = env!("CARGO_PKG_VERSION").to_string();
     let cfg = fqs_self_config();
-    let restartable = cfg.get("restart").and_then(|v| v.as_object()).is_some();
+    let restartable = cfg.get("restart").and_then(|v| v.as_object()).is_some() || restart_trigger("fqs").is_some();
     let update = check_fqs_update(&version, &cfg);
     json!({
         "ok": true,
@@ -1357,7 +1479,7 @@ pub fn probe_fqs_self(server_name: Option<&str>) -> Value {
         "restart_policy": if restartable {
             "Restart uses the fqs.restart block in fqs.json (same methods as frontends)."
         } else {
-            "Configure fqs.restart in fqs.json to enable Restart from the admin UI."
+            "Configure fqs.restart in fqs.json, or run install-stack.pl (it sets up a restart trigger), to enable Restart from the admin UI."
         },
         "update": update,
     })
@@ -1484,7 +1606,7 @@ fn semver_is_newer(remote: &str, local: &str) -> Option<bool> {
     Some(r > l)
 }
 
-fn run_restart_block(restart: &serde_json::Map<String, Value>) -> Result<Value, String> {
+fn run_restart_block(restart: &serde_json::Map<String, Value>, wait: bool) -> Result<Value, String> {
     let method = restart
         .get("method")
         .and_then(Value::as_str)
@@ -1512,18 +1634,31 @@ fn run_restart_block(restart: &serde_json::Map<String, Value>) -> Result<Value, 
             if !matches!(action, "restart" | "reload" | "try-reload-or-restart") {
                 return Err("restart.action must be restart|reload|try-reload-or-restart".into());
             }
+            // set up by root: the way an unprivileged FQS can restart the unit
+            if action != "reload" {
+                if let Some(trigger) = restart_trigger(unit) {
+                    return Ok(trigger_restart(unit, &trigger, wait));
+                }
+            }
             let out = Command::new("systemctl")
                 .args([action, unit])
                 .output()
                 .map_err(|e| e.to_string())?;
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            let denied = !out.status.success()
+                && (stderr.contains("authentication") || stderr.contains("Access denied") || stderr.contains("not allowed"));
             Ok(json!({
                 "ok": out.status.success(),
                 "method": "systemctl",
                 "unit": unit,
                 "action": action,
                 "stdout": String::from_utf8_lossy(&out.stdout),
-                "stderr": String::from_utf8_lossy(&out.stderr),
+                "stderr": stderr,
                 "exit_code": out.status.code(),
+                "hint": if denied {
+                    format!("FQS may not restart {unit} itself; install-stack.pl sets up a restart trigger ({}/{})",
+                        restart_trigger_dir().display(), unit.strip_suffix(".service").unwrap_or(unit))
+                } else { String::new() },
             }))
         }
         "kill_hup_pidfile" | "hup_pidfile" => {
@@ -1814,6 +1949,33 @@ pub fn publish_to_frontend(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn restart_triggers_are_only_what_root_set_up() {
+        let dir = std::env::temp_dir().join(format!("fqs-restart-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("FQS_RESTART_DIR", &dir) };
+        // nothing set up: no restart for a discovered KonText
+        assert!(restart_trigger("kontext").is_none());
+        assert!(default_restart_block("kontext").is_none());
+        fs::write(dir.join("kontext"), "").unwrap();
+        assert_eq!(restart_trigger("kontext.service"), Some(dir.join("kontext")));
+        let block = default_restart_block("kontext").unwrap();
+        assert_eq!(block["unit"], "kontext");
+        assert!(default_restart_block("teitok").is_none());
+        // names that are not unit names never reach the file system
+        assert!(restart_trigger("../kontext").is_none());
+        assert!(restart_trigger(".hidden").is_none());
+        // without waiting: the trigger file gets a time stamp
+        let r = trigger_restart("kontext", &dir.join("kontext"), false);
+        assert_eq!(r["ok"], true);
+        assert!(!fs::read_to_string(dir.join("kontext")).unwrap().trim().is_empty());
+        // a restart of a catalogue KonText uses the trigger
+        let r = restart_frontend("kontext:lindat.cz").unwrap();
+        assert_eq!(r["method"], "trigger");
+        unsafe { std::env::remove_var("FQS_RESTART_DIR") };
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn catalog_hint_merges_into_configured_instance_by_public_url() {
