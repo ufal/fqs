@@ -8001,7 +8001,7 @@ fn run_cqp_query(corpus: &CorpusEntry, query_text: &str, start: u32, size: u32) 
     let total = parse_cqp_total(&stdout);
     let lines = stdout
         .lines()
-        .map(str::trim)
+        .map(|l| strip_cqp_prompts(l).trim())
         .filter(|l| !l.is_empty() && !l.ends_with('>'))
         .map(str::to_string)
         .collect::<Vec<_>>();
@@ -8269,9 +8269,33 @@ fn resolve_cqp_registry(corpus: &CorpusEntry) -> (String, Option<PathBuf>) {
     ("<default-cqp-registry>".to_string(), None)
 }
 
+/// Remove leading `CORPUS> ` prompts. Older CQP (e.g. 3.0.0) prints its prompt on stdout
+/// for every scripted command when not run in child mode, so `size` comes out as
+/// `TT-X> TT-X> 1234` and the first KWIC line as `TT-X>   1: …`. Prompt-less output is unchanged.
+fn strip_cqp_prompts(line: &str) -> &str {
+    let mut rest = line.trim_start();
+    loop {
+        let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let token = &rest[..token_end];
+        let is_prompt = token.len() > 1
+            && token.ends_with('>')
+            && !token.starts_with('<')
+            && token[..token.len() - 1]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '[' | ']'));
+        if !is_prompt {
+            return rest;
+        }
+        rest = rest[token_end..].trim_start();
+    }
+}
+
 fn parse_cqp_total(stdout: &str) -> Option<i64> {
     stdout.lines().find_map(|line| {
-        let trimmed = line.trim();
+        let trimmed = strip_cqp_prompts(line).trim();
+        if trimmed.is_empty() {
+            return None;
+        }
         if trimmed.chars().all(|c| c.is_ascii_digit()) {
             trimmed.parse::<i64>().ok()
         } else {
@@ -8522,6 +8546,16 @@ mod upsert_merge_tests {
 
 #[cfg(test)]
 mod catalog_fresh_tests {
+    #[test]
+    fn cqp_prompts_are_stripped_for_old_cqp() {
+        let old = "TT-MAKON> TT-MAKON> TT-MAKON> TT-MAKON> TT-MAKON> 1028815\nTT-MAKON>         1:   <Nás> drží v zajetí a teď\n        4:   Nás drží v <zajetí> a teď záleží na tom\nTT-MAKON> ";
+        assert_eq!(super::parse_cqp_total(old), Some(1028815));
+        assert_eq!(super::strip_cqp_prompts("TT-MAKON>         1:   <Nás> drží"), "1:   <Nás> drží");
+        assert_eq!(super::strip_cqp_prompts("        4:   Nás <zajetí>"), "4:   Nás <zajetí>");
+        assert_eq!(super::parse_cqp_total("1028815\n  1: <a> b\n"), Some(1028815));
+        assert_eq!(super::strip_cqp_prompts("<s> text"), "<s> text");
+    }
+
     use super::*;
 
     #[test]
