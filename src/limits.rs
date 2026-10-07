@@ -285,6 +285,12 @@ impl Limits {
         Caller { role, tier, user, verified }
     }
 
+    /// True when FQS runs with a JWT secret: roles then come only from verified tokens.
+    /// Without one (local dev) the request's role hint is believed, as in [`Limits::caller`].
+    pub fn auth_enabled(&self) -> bool {
+        self.jwt_secret.is_some()
+    }
+
     /// Verified HS256 claims from `Authorization: Bearer` (signature + optional exp).
     /// Used by the admin gate, which applies stricter aud/iat/exp rules on top.
     pub fn verified_bearer_claims(&self, headers: &HeaderMap) -> Option<Map<String, Value>> {

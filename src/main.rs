@@ -2800,6 +2800,14 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
     });
 
     let addr = format!("{}:{}", args.host, args.port);
+    let loopback = matches!(args.host.trim(), "127.0.0.1" | "localhost" | "::1" | "[::1]");
+    if !loopback && args.jwt_secret.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_none() {
+        eprintln!(
+            "[fqs] WARNING: listening on {addr} without --jwt-secret / FQS_SECRET: roles sent in \
+             requests are believed and reindex/worker routes are open. Use a secret, or bind to \
+             127.0.0.1, for anything reachable from other hosts."
+        );
+    }
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("Failed to bind HTTP server at {addr}"))?;
@@ -4359,7 +4367,7 @@ async fn http_admin_reindex_jobs(
     AxumQuery(params): AxumQuery<HttpReindexJobsQuery>,
 ) -> admin::AdminResult<Json<Value>> {
     let _ = admin::require_admin(&state.limits, &headers)?;
-    http_reindex_jobs(State(state), AxumQuery(params))
+    http_reindex_jobs(State(state), headers, AxumQuery(params))
         .await
         .map_err(|(status, msg)| admin::AdminError::msg(status, msg))
 }
@@ -4926,10 +4934,11 @@ async fn http_root_with_state(State(state): State<HttpAppState>) -> Json<Value> 
 
 async fn http_list_corpora(
     State(state): State<HttpAppState>,
+    headers: HeaderMap,
     AxumQuery(params): AxumQuery<HttpCorporaQuery>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let role = normalize_role(params.request_role.as_deref());
+    let role = route_caller(&state, &headers, params.request_role.as_deref()).role;
     let include_noncurrent = params.include_noncurrent.unwrap_or(false);
     let requested_facets =
         services::parse_facet_params(raw.as_deref(), params.facets.as_deref());
@@ -5020,10 +5029,11 @@ async fn http_list_corpora(
 
 async fn http_browse_labels(
     State(state): State<HttpAppState>,
+    headers: HeaderMap,
     AxumQuery(params): AxumQuery<HttpCorporaQuery>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let role = normalize_role(params.request_role.as_deref());
+    let role = route_caller(&state, &headers, params.request_role.as_deref()).role;
     let include_noncurrent = params.include_noncurrent.unwrap_or(false);
     let requested_facets =
         services::parse_facet_params(raw.as_deref(), params.facets.as_deref());
@@ -5185,8 +5195,10 @@ fn browse_corpus_dto(c: &CorpusEntry) -> Value {
 
 async fn http_reindex_jobs(
     State(state): State<HttpAppState>,
+    headers: HeaderMap,
     AxumQuery(params): AxumQuery<HttpReindexJobsQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    require_admin_if_secured(&state, &headers)?;
     let conn = open_db(&state.db_path).map_err(to_http_err)?;
     let limit = clamp_limit(params.limit.unwrap_or(100), 1, 1000);
     let requested_status = params
@@ -5230,8 +5242,10 @@ async fn http_reindex_jobs(
 
 async fn http_reindex_history(
     State(state): State<HttpAppState>,
+    headers: HeaderMap,
     AxumQuery(params): AxumQuery<HttpReindexJobsQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    require_admin_if_secured(&state, &headers)?;
     let conn = open_db(&state.db_path).map_err(to_http_err)?;
     let rows = list_reindex_history(
         &conn,
@@ -5244,9 +5258,10 @@ async fn http_reindex_history(
 
 async fn http_reindex_enqueue(
     State(state): State<HttpAppState>,
+    headers: HeaderMap,
     Json(req): Json<HttpReindexEnqueueRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let role = normalize_role(req.request_role.as_deref());
+    let role = route_caller(&state, &headers, req.request_role.as_deref()).role;
     if role != "admin" {
         return Err((StatusCode::FORBIDDEN, "Reindex enqueue requires admin role".to_string()));
     }
@@ -5283,8 +5298,10 @@ async fn http_reindex_enqueue(
 
 async fn http_reindex_worker_heartbeat(
     State(state): State<HttpAppState>,
+    headers: HeaderMap,
     Json(req): Json<HttpReindexWorkerHeartbeatRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    require_admin_if_secured(&state, &headers)?;
     if req.worker_id.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "worker_id is required".to_string()));
     }
@@ -5298,8 +5315,10 @@ async fn http_reindex_worker_heartbeat(
 
 async fn http_reindex_mark_started(
     State(state): State<HttpAppState>,
+    headers: HeaderMap,
     Json(req): Json<HttpReindexMarkStartedRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    require_admin_if_secured(&state, &headers)?;
     if req.job_id.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "job_id is required".to_string()));
     }
@@ -5310,8 +5329,10 @@ async fn http_reindex_mark_started(
 
 async fn http_reindex_mark_finished(
     State(state): State<HttpAppState>,
+    headers: HeaderMap,
     Json(req): Json<HttpReindexMarkFinishedRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    require_admin_if_secured(&state, &headers)?;
     if req.job_id.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "job_id is required".to_string()));
     }
@@ -5590,15 +5611,19 @@ async fn pando_dispatch_get(
 
 async fn http_pando_info(
     State(state): State<HttpAppState>,
+    headers: HeaderMap,
     AxumQuery(q): AxumQuery<PandoCorpusQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    gate_corpus(&state, &headers, &q.corpus)?;
     pando_dispatch_get(&state, &q.corpus, "/info", "").await
 }
 
 async fn http_pando_status(
     State(state): State<HttpAppState>,
+    headers: HeaderMap,
     AxumQuery(q): AxumQuery<PandoCorpusQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    gate_corpus(&state, &headers, &q.corpus)?;
     let job = q.job.as_deref().unwrap_or("");
     if job.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "job is required".to_string()));
@@ -5609,8 +5634,10 @@ async fn http_pando_status(
 
 async fn http_pando_context(
     State(state): State<HttpAppState>,
+    headers: HeaderMap,
     AxumQuery(q): AxumQuery<PandoCorpusQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    gate_corpus(&state, &headers, &q.corpus)?;
     let pos = q.pos.as_deref().unwrap_or("");
     if pos.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "pos is required".to_string()));
@@ -5633,8 +5660,10 @@ async fn http_pando_context(
 /// token_connect — no round-trip through TEITOK PHP).
 async fn http_pando_fragment(
     State(state): State<HttpAppState>,
+    headers: HeaderMap,
     AxumQuery(q): AxumQuery<PandoCorpusQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    gate_corpus(&state, &headers, &q.corpus)?;
     let pos_s = q.pos.as_deref().unwrap_or("").trim();
     if pos_s.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "pos is required".to_string()));
@@ -5790,6 +5819,8 @@ async fn http_pando_run_inner(
         &header_client_ip(&headers),
     );
     rec.caller(&caller);
+    let corpus = state.catalog.get(&req.corpus).map_err(to_http_err)?;
+    gate_corpus_role(&corpus, &caller.role)?;
     let mut body = json!({ "cql": cql });
     if let Some(obj) = body.as_object_mut() {
         for (k, v) in req.extra {
@@ -5885,8 +5916,10 @@ fn session_qs(sid: &str) -> String {
 
 async fn http_pando_session_create(
     State(state): State<HttpAppState>,
+    headers: HeaderMap,
     Json(req): Json<PandoSessionRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    gate_corpus(&state, &headers, &req.corpus)?;
     let mut body = json!({});
     if let Some(sid) = req.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         if !valid_engine_session_id(sid) {
@@ -5902,8 +5935,10 @@ async fn http_pando_session_create(
 
 async fn http_pando_session_info(
     State(state): State<HttpAppState>,
+    headers: HeaderMap,
     AxumQuery(q): AxumQuery<PandoCorpusQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    gate_corpus(&state, &headers, &q.corpus)?;
     let sid = q.session_id.as_deref().unwrap_or("").trim().to_string();
     if !valid_engine_session_id(&sid) {
         return Err((StatusCode::BAD_REQUEST, "session_id is required".to_string()));
@@ -5913,8 +5948,10 @@ async fn http_pando_session_info(
 
 async fn http_pando_session_close(
     State(state): State<HttpAppState>,
+    headers: HeaderMap,
     Json(req): Json<PandoSessionRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    gate_corpus(&state, &headers, &req.corpus)?;
     let sid = req.session_id.as_deref().unwrap_or("").trim().to_string();
     if !valid_engine_session_id(&sid) {
         return Err((StatusCode::BAD_REQUEST, "session_id is required".to_string()));
@@ -5925,8 +5962,10 @@ async fn http_pando_session_close(
 
 async fn http_pando_sessions(
     State(state): State<HttpAppState>,
+    headers: HeaderMap,
     AxumQuery(q): AxumQuery<PandoCorpusQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    require_admin_if_secured(&state, &headers)?;
     pando_dispatch(&state, &q.corpus, "GET", "/sessions", String::new(), String::new()).await
 }
 
@@ -6396,6 +6435,39 @@ fn is_http_access_allowed(corpus: &CorpusEntry, role: &str) -> bool {
 
 fn is_http_operation_allowed(corpus: &CorpusEntry, op: &str) -> bool {
     corpus.http_allowed_operations.iter().any(|x| x == op)
+}
+
+/// Caller of a public route: the verified JWT role when FQS has a secret; without one
+/// (local dev) the request's `role_hint` is believed, as [`Limits::caller`] does.
+/// Handlers must use this instead of reading `request_role` themselves.
+fn route_caller(state: &HttpAppState, headers: &HeaderMap, role_hint: Option<&str>) -> Caller {
+    state.limits.caller(headers, role_hint, None, None, &header_client_ip(headers))
+}
+
+/// The access rule of `/query`, for every other route that reads corpus content
+/// (`/run`, `/info`, `/context`, `/fragment`, `/status`, `/session*`).
+fn gate_corpus_role(corpus: &CorpusEntry, role: &str) -> Result<(), (StatusCode, String)> {
+    if !is_http_access_allowed(corpus, role) || !is_http_operation_allowed(corpus, "query") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            format!("access to corpus '{}' is not allowed for role '{role}'", corpus.id),
+        ));
+    }
+    Ok(())
+}
+
+fn gate_corpus(state: &HttpAppState, headers: &HeaderMap, corpus_id: &str) -> Result<(), (StatusCode, String)> {
+    let corpus = state.catalog.get(corpus_id).map_err(to_http_err)?;
+    gate_corpus_role(&corpus, &route_caller(state, headers, None).role)
+}
+
+/// Admin-only when FQS runs with a JWT secret (reindex control, worker callbacks,
+/// session listing). Without a secret (local dev) these stay open, as before.
+fn require_admin_if_secured(state: &HttpAppState, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+    if !state.limits.auth_enabled() || route_caller(state, headers, None).role == "admin" {
+        return Ok(());
+    }
+    Err((StatusCode::FORBIDDEN, "requires an admin JWT".to_string()))
 }
 
 fn looks_like_aggregation(query: &str) -> bool {
