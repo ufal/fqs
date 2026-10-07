@@ -1521,7 +1521,7 @@ fn check_fqs_update(local_version: &str, cfg: &Value) -> Value {
     }
 
     let default_url =
-        "https://raw.githubusercontent.com/ufal/flexicorp/main/fqs/Cargo.toml";
+        "https://raw.githubusercontent.com/ufal/fqs/main/Cargo.toml";
     let url = cfg
         .get("update_check_url")
         .and_then(Value::as_str)

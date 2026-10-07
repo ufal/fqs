@@ -1,0 +1,17 @@
+# Build output
+target/
+
+# Local runtime state and secrets — never commit
+*.db
+*.db-*
+.env.local
+*-secret.env
+fqs-http.json
+fqs.local.json
+fqs.local.*.json
+limits.local.json
+
+# Local-by-design folders (see the ecosystem conventions)
+dev/
+tests/
+tmp/

@@ -2,6 +2,8 @@
 name = "fqs"
 version = "0.1.11"
 edition = "2024"
+# Edition 2024 needs Rust 1.85+. Ubuntu 22.04/24.04 ship an older cargo: use rustup.
+rust-version = "1.85"
 
 [dependencies]
 anyhow = "1"

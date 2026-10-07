@@ -3,7 +3,7 @@
 #
 # Usage (from repo or this directory):
 #   sudo ./install.sh
-#   sudo ./install.sh --teitok-venv /var/www/html/teitok/shared/Resources/venv
+#   sudo ./install.sh --teitok-venv /var/www/html/teitok/shared/Resources/venv   # with TEITOK only
 #   sudo ./install.sh --skip-build --web-user www-data
 #
 # See README «Installation» and deploy/fqs.env.example.
@@ -34,7 +34,7 @@ Options:
   --user NAME           Service user (default: fqs)
   --group NAME          Service group (default: fqs)
   --web-user NAME       PHP/TEITOK user added to service group (default: www-data)
-  --teitok-venv DIR     TEITOK/flexicorp venv; sets PYTHON_BIN in fqs.env
+  --teitok-venv DIR     optional (TEITOK only): venv with flexicorp; sets PYTHON_BIN in fqs.env
   --scan-root DIR       Add a scan_roots entry (repeatable)
   --skip-build          Use existing target/release/fqs (do not cargo build)
   --no-systemd          Install files only; do not enable/start unit
@@ -70,7 +70,6 @@ done
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 FQS_ROOT=$SCRIPT_DIR
-# Allow invoking as flexicorp/fqs/install.sh
 if [[ ! -f "$FQS_ROOT/Cargo.toml" ]]; then
 	die "Cargo.toml not found next to install.sh (expected fqs crate root)"
 fi
@@ -191,7 +190,7 @@ if [[ -n "$TEITOK_VENV" ]]; then
 	[[ -x "$PY" ]] || die "teitok venv python not executable: $PY"
 	if ! "$PY" -c 'import flexicorp' 2>/dev/null; then
 		log "warning: $PY cannot import flexicorp — install the package into that venv"
-		log "  $PY -m pip install -e $(cd "$FQS_ROOT/.." && pwd)"
+		log "  $PY -m pip install -e /path/to/flexicorp"
 	fi
 	tmp=$(mktemp)
 	awk -v p="$PY" '

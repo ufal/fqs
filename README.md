@@ -1,18 +1,26 @@
-# FQS (Rust)
+# FQS
 
-This folder contains the Rust implementation of FQS used by Flexicorp/TEITOK workflows.
+FQS is a uniform search server over corpus engines: one HTTP API, a corpus catalogue,
+admission limits (query queue), a CLARIN-FCS 2.0 endpoint and an admin UI. Engines are optional
+runtime plug-ins: **CWB** (`cqp`), **pando** (via `libflexicorp_pando`, or pando's own CLI) and,
+through FCS, **Manatee** (via a KonText JSON API). A CWB-only installation needs nothing but `cqp`.
+
+It works on its own, e.g. as an FCS endpoint for a CLARIN centre's CWB corpora. TEITOK and
+KonText integrate with it (as *frontends*), but neither is required. Only two optional features
+use the TEITOK integration package **flexicorp** (Python): reindexing TEITOK projects, and XML
+fragments for TEITOK corpora served by CWB (`supports_xml`). See `PYTHON_BIN` below.
 
 ## Installation (systemd)
 
-On a Linux server (TEITOK + nginx/Apache), install the binary, catalog dirs, admin UI, and a `fqs.service` unit:
+Building needs **Rust 1.85 or newer** (edition 2024). Distribution packages are often older (Ubuntu 22.04 ships cargo 1.75), so use [rustup](https://rustup.rs) as a normal user (`curl https://sh.rustup.rs -sSf | sh`, then `source ~/.cargo/env`). Build as that user, then install with sudo and `--skip-build`. Build on the target system (or for `x86_64-unknown-linux-musl`): a binary built on a newer distribution may not run on an older glibc.
+
+On a Linux server, install the binary, catalog dirs, admin UI, and a `fqs.service` unit:
 
 ```bash
-cd fqs
 # optional: cargo build --release && pass --skip-build
-sudo ./install.sh \
-  --teitok-venv /var/www/html/teitok/shared/Resources/venv \
-  --web-user www-data \
-  --scan-root /var/www/html/teitok
+sudo ./install.sh --web-user www-data
+# with TEITOK (flexicorp installed in the TEITOK shared venv), additionally:
+#   --teitok-venv /var/www/html/teitok/shared/Resources/venv --scan-root /var/www/html/teitok
 ```
 
 What it does:
@@ -29,7 +37,7 @@ What it does:
 
 The installer creates system user/group `fqs` and adds `--web-user` (default `www-data`) to group `fqs` so TEITOK PHP and `fqs serve` can both write the SQLite catalog. **Restart php-fpm** after install so the new group membership applies.
 
-`PYTHON_BIN` must point at a Python that can `import flexicorp` (normally the TEITOK shared venv). Without it, reindex fails with `No module named flexicorp`. Flexicorp itself is installed separately into that venv:
+`PYTHON_BIN` is **only** needed for the two TEITOK features (reindexing TEITOK projects; CWB corpora registered with `supports_xml`). It must then point at a Python that can `import flexicorp` (normally the TEITOK shared venv); without it those features fail with `No module named flexicorp`. Plain CWB, pando and FCS never use it. Flexicorp itself is installed separately into that venv:
 
 ```bash
 /var/www/html/teitok/shared/Resources/venv/bin/python -m pip install -e /path/to/flexicorp
@@ -243,7 +251,7 @@ Example FQS self-restart / update check in `/etc/fqs/fqs.json`:
 ```json
 {
   "fqs": {
-    "update_check_url": "https://raw.githubusercontent.com/ufal/flexicorp/main/fqs/Cargo.toml",
+    "update_check_url": "https://raw.githubusercontent.com/ufal/fqs/main/Cargo.toml",
     "restart": { "method": "systemctl", "unit": "fqs" }
   }
 }
@@ -488,7 +496,7 @@ Strict full mode (mark missing query probe as failure):
 cargo run -- corpora validate --full --strict-full
 ```
 
-One-shot catalogue enrich (languages; spoken/timealigned/facsimile/video/geo/dialect/deps/parallel/ner/ud features; interfaces — additive; see [FQS-TEITOK-CORPORA-LISTING.md](../dev/FQS-TEITOK-CORPORA-LISTING.md) §1.1b):
+One-shot catalogue enrich (languages; spoken/timealigned/facsimile/video/geo/dialect/deps/parallel/ner/ud features; interfaces — additive; see the TEITOK corpora-listing design notes in the flexicorp repository):
 
 ```bash
 cargo run -- corpora enrich --dry-run
