@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use axum::extract::{Path as AxumPath, Query as AxumQuery, RawQuery, State};
@@ -7976,12 +7976,29 @@ fn run_cqp_query(corpus: &CorpusEntry, query_text: &str, start: u32, size: u32) 
     if let Some(reg) = &registry_arg {
         cmd.arg("-r").arg(reg);
     }
+    // The query goes into a CQP script: one statement only, or a `;` / newline could append
+    // further CQP commands (e.g. `cat … > "file"` writes files as the service user).
+    check_single_cqp_statement(query_text)?;
     let end = start.saturating_add(size.saturating_sub(1));
+    // Structured hits for frontends that need positions, document and token ids (TEITOK's
+    // `tabulate … match text_id, match .. matchend id`): only the attributes the registry
+    // declares, so plain CWB corpora keep working.
+    let (pattrs, sattrs) = cqp_registry_attributes(&registry_dir, &corpus_name);
+    let mut tab_cols = vec!["match".to_string(), "matchend".to_string()];
+    let with_doc = sattrs.contains("text_id");
+    let with_ids = pattrs.contains("id");
+    if with_doc {
+        tab_cols.push("match text_id".to_string());
+    }
+    if with_ids {
+        tab_cols.push("match .. matchend id".to_string());
+    }
     let cqp_script = format!(
-        "set PrettyPrint off;\nset Context 5 words;\nset Paging off;\nMatches = {query};\nsize Matches;\ncat Matches {start} {end};\n",
+        "set PrettyPrint off;\nset Context 5 words;\nset Paging off;\nMatches = {query};\nsize Matches;\ntabulate Matches {start} {end} {cols};\ncat Matches {start} {end};\n",
         query = query_text,
         start = start,
-        end = end
+        end = end,
+        cols = tab_cols.join(", ")
     );
     let (output, used_id) = run_cqp_script_with_id_fallback(&cmd, &corpus_name, &cqp_script)
         .with_context(|| format!("Failed to execute cqp script with corpus '{}'", corpus_name))?;
@@ -7999,10 +8016,38 @@ fn run_cqp_query(corpus: &CorpusEntry, query_text: &str, start: u32, size: u32) 
     }
 
     let total = parse_cqp_total(&stdout);
+    // `tabulate` rows are tab-separated; `cat` KWIC lines are not.
+    let mut hits: Vec<Value> = Vec::new();
+    for row in stdout.lines().map(strip_cqp_prompts).filter(|l| l.contains('\t')) {
+        let cells: Vec<&str> = row.split('\t').map(str::trim).collect();
+        let (Some(ms), Some(me)) = (
+            cells.first().and_then(|c| c.parse::<i64>().ok()),
+            cells.get(1).and_then(|c| c.parse::<i64>().ok()),
+        ) else {
+            continue;
+        };
+        let mut hit = json!({ "match_start": ms, "match_end": me });
+        let mut next = 2;
+        if with_doc {
+            hit["doc_id"] = json!(cells.get(next).copied().unwrap_or(""));
+            next += 1;
+        }
+        if with_ids {
+            let toks: Vec<Value> = cells
+                .get(next)
+                .copied()
+                .unwrap_or("")
+                .split_whitespace()
+                .map(|id| json!({ "id": id }))
+                .collect();
+            hit["tokens"] = json!(toks);
+        }
+        hits.push(hit);
+    }
     let lines = stdout
         .lines()
         .map(|l| strip_cqp_prompts(l).trim())
-        .filter(|l| !l.is_empty() && !l.ends_with('>'))
+        .filter(|l| !l.is_empty() && !l.ends_with('>') && !l.contains('\t'))
         .map(str::to_string)
         .collect::<Vec<_>>();
 
@@ -8021,7 +8066,8 @@ fn run_cqp_query(corpus: &CorpusEntry, query_text: &str, start: u32, size: u32) 
                 "start": start,
                 "requested_size": size,
                 "total": total,
-                "lines": lines
+                "lines": lines,
+                "hits": hits
             }
         },
         "stderr": stderr
@@ -8267,6 +8313,53 @@ fn resolve_cqp_registry(corpus: &CorpusEntry) -> (String, Option<PathBuf>) {
         return (path.display().to_string(), Some(path));
     }
     ("<default-cqp-registry>".to_string(), None)
+}
+
+/// Reject queries that are more than one CQP statement: a `;` or newline outside quotes would
+/// let the query append its own CQP commands to the script FQS sends to `cqp`.
+fn check_single_cqp_statement(query: &str) -> Result<()> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for c in query.chars() {
+        if c == '\n' || c == '\r' {
+            anyhow::bail!("query must be a single line");
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, c) {
+            (_, '\\') => escaped = true,
+            (Some(q), c) if c == q => quote = None,
+            (None, '"') | (None, '\'') => quote = Some(c),
+            (None, ';') => anyhow::bail!("query must be a single CQP expression (no ';' outside quotes)"),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Positional and structural attributes declared in a CWB registry file
+/// (`ATTRIBUTE x` / `STRUCTURE y`); empty sets when the file can't be read.
+fn cqp_registry_attributes(registry_dir: &str, corpus_name: &str) -> (HashSet<String>, HashSet<String>) {
+    let mut pattrs = HashSet::new();
+    let mut sattrs = HashSet::new();
+    let file = Path::new(registry_dir).join(corpus_name.to_lowercase());
+    if let Ok(text) = std::fs::read_to_string(&file) {
+        for line in text.lines() {
+            let mut parts = line.split_whitespace();
+            match (parts.next(), parts.next()) {
+                (Some("ATTRIBUTE"), Some(a)) => {
+                    pattrs.insert(a.to_string());
+                }
+                (Some("STRUCTURE"), Some(st)) => {
+                    sattrs.insert(st.to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+    (pattrs, sattrs)
 }
 
 /// Remove leading `CORPUS> ` prompts. Older CQP (e.g. 3.0.0) prints its prompt on stdout
@@ -8546,6 +8639,15 @@ mod upsert_merge_tests {
 
 #[cfg(test)]
 mod catalog_fresh_tests {
+    #[test]
+    fn single_cqp_statement_check() {
+        assert!(super::check_single_cqp_statement(r#"[word="the"] []{0,3} [upos="NOUN"]"#).is_ok());
+        assert!(super::check_single_cqp_statement(r#"[word=";"]"#).is_ok());
+        assert!(super::check_single_cqp_statement(r#"[word="a\";b"]"#).is_ok());
+        assert!(super::check_single_cqp_statement(r#"[word="the"]; cat Matches > "/tmp/x""#).is_err());
+        assert!(super::check_single_cqp_statement("[word=\"the\"]\nshow cd").is_err());
+    }
+
     #[test]
     fn cqp_prompts_are_stripped_for_old_cqp() {
         let old = "TT-MAKON> TT-MAKON> TT-MAKON> TT-MAKON> TT-MAKON> 1028815\nTT-MAKON>         1:   <Nás> drží v zajetí a teď\n        4:   Nás drží v <zajetí> a teď záleží na tom\nTT-MAKON> ";
