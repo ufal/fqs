@@ -452,6 +452,10 @@ struct HttpQueryRequest {
     shuffle: Option<bool>,
     /// pando: seed for sample / shuffle (the same seed: the same sample / order on every page)
     seed: Option<u32>,
+    /// cqp: positional / structural attributes to report at each hit's first token
+    /// (`hits[].attrs`, as `tabulate … match <name>`); names the registry lacks are ignored
+    #[serde(default)]
+    attributes: Option<Vec<String>>,
     /// Set by FQS (never from the client): the caller's engine tier
     #[serde(skip_deserializing, default)]
     engine_tier: Option<String>,
@@ -2376,7 +2380,7 @@ fn execute_query(
                 let exec = if prefer_flexicorp {
                     run_flexicorp_cqp_query(corpus, query_text, start, size, query_options)?
                 } else {
-                    run_cqp_query(corpus, query_text, start, size)?
+                    run_cqp_query(corpus, query_text, start, size, query_options)?
                 };
                 (
                     effective,
@@ -7951,7 +7955,13 @@ fn run_pando_query(
     })
 }
 
-fn run_cqp_query(corpus: &CorpusEntry, query_text: &str, start: u32, size: u32) -> Result<CqpExecResult> {
+fn run_cqp_query(
+    corpus: &CorpusEntry,
+    query_text: &str,
+    start: u32,
+    size: u32,
+    query_options: Option<&HttpQueryRequest>,
+) -> Result<CqpExecResult> {
     let corpus_name = corpus
         .settings
         .get("corpus_name")
@@ -7992,6 +8002,24 @@ fn run_cqp_query(corpus: &CorpusEntry, query_text: &str, start: u32, size: u32) 
     }
     if with_ids {
         tab_cols.push("match .. matchend id".to_string());
+    }
+    // extra attributes the caller asked for (TEITOK: `u_audio`, its kwicdata): only names
+    // the registry declares go into the script
+    let extra_attrs: Vec<String> = query_options
+        .and_then(|q| q.attributes.as_ref())
+        .map(|names| {
+            let mut seen = HashSet::new();
+            names
+                .iter()
+                .map(|n| n.trim())
+                .filter(|n| pattrs.contains(*n) || sattrs.contains(*n))
+                .filter(|n| seen.insert(n.to_string()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    for name in &extra_attrs {
+        tab_cols.push(format!("match {name}"));
     }
     let cqp_script = format!(
         "set PrettyPrint off;\nset Context 5 words;\nset Paging off;\nMatches = {query};\nsize Matches;\ntabulate Matches {start} {end} {cols};\ncat Matches {start} {end};\n",
@@ -8041,6 +8069,15 @@ fn run_cqp_query(corpus: &CorpusEntry, query_text: &str, start: u32, size: u32) 
                 .map(|id| json!({ "id": id }))
                 .collect();
             hit["tokens"] = json!(toks);
+            next += 1;
+        }
+        if !extra_attrs.is_empty() {
+            let mut attrs = serde_json::Map::new();
+            for name in &extra_attrs {
+                attrs.insert(name.clone(), json!(cells.get(next).copied().unwrap_or("")));
+                next += 1;
+            }
+            hit["attrs"] = Value::Object(attrs);
         }
         hits.push(hit);
     }
