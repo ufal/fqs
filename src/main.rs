@@ -5692,9 +5692,17 @@ async fn http_pando_fragment(
         } else {
             String::new()
         };
-        // Positional/structural attr `id` at focus pos (TEITOK tid, e.g. w-115)
+        // Positional attr `id` at focus pos (may be 1 off vs TEITOK xidx on legacy corpora)
         let tok_id = if st < 400 {
             ctx.get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        } else {
+            String::new()
+        };
+        let match_word = if st < 400 {
+            ctx.get("match")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string()
@@ -5718,6 +5726,7 @@ async fn http_pando_fragment(
             "end": end,
             "doc_id": cid,
             "id": tok_id,
+            "match": match_word,
             "fragment": fragment,
             "project_url": project_url,
             "context_scope": scope,

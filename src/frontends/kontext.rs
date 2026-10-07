@@ -8,6 +8,11 @@
 //!      describe it. FQS builds this "shell" from the Pando index (see below);
 //!   4. KonText was restarted (it reads its corplist at start-up), and users have access
 //!      to it in KonText's auth.
+//!
+//! TEITOK corpora also get `<token_connect><provider is_kwic_view="true">TEITOK</provider>`
+//! (KWIC-detail *tab*, not dictionary panel) and `teitok_crp_path` = project base URL for
+//! "Open in TEITOK". That assumes the KonText install already has FqsTeitokBackend +
+//! lindatTokenConnect (kontext-pando); Add to KonText only wires per-corpus data.
 //! The module writes only files at paths from fqs.json, the environment, or KonText's own
 //! config.xml / install folder — never from the request.
 
@@ -358,10 +363,75 @@ fn corplist_corpus_xml(spec: &CorplistCorpusSpec<'_>, indent: &str) -> String {
 {child}        </keywords>\n\
 {child}</metadata>\n\
 {child}<token_connect>\n\
-{child}        <provider is_kwic_view=\"false\">TEITOK</provider>\n\
+{child}        <provider is_kwic_view=\"true\">TEITOK</provider>\n\
 {child}</token_connect>\n\
 {indent}</corpus>\n"
     )
+}
+
+/// Ensure an existing TEITOK corpus uses KWIC-view token_connect (alternative context
+/// tab), not the dictionary-style panel. Returns updated XML or None if unchanged.
+fn corplist_ensure_teitok_kwic_view(text: &str, ident: &str) -> Result<Option<String>, String> {
+    roxmltree::Document::parse(text)
+        .map_err(|e| format!("corplist.xml is not well-formed XML as it is ({e}); not changing it"))?;
+    let needle_ident = format!("ident=\"{}\"", xml_escape_attr(ident));
+    let Some(corp_at) = text.find(&needle_ident) else {
+        return Ok(None);
+    };
+    // Restrict edits to this corpus element (start tag through its closing </corpus>).
+    let start = text[..corp_at].rfind("<corpus").unwrap_or(corp_at);
+    let after = &text[corp_at..];
+    let end_rel = after
+        .find("</corpus>")
+        .ok_or_else(|| format!("corplist: corpus '{ident}' has no closing </corpus>"))?;
+    let end = corp_at + end_rel + "</corpus>".len();
+    let block = &text[start..end];
+    if !block.contains("TEITOK") {
+        return Ok(None);
+    }
+    let updated_block = block
+        .replace(
+            "is_kwic_view=\"false\">TEITOK</provider>",
+            "is_kwic_view=\"true\">TEITOK</provider>",
+        )
+        .replace(
+            "is_kwic_view='false'>TEITOK</provider>",
+            "is_kwic_view='true'>TEITOK</provider>",
+        );
+    if updated_block == block {
+        return Ok(None);
+    }
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..start]);
+    out.push_str(&updated_block);
+    out.push_str(&text[end..]);
+    roxmltree::Document::parse(&out)
+        .map_err(|e| format!("updating TEITOK token_connect would break corplist.xml ({e})"))?;
+    Ok(Some(out))
+}
+
+/// Full TEITOK project base URL for KonText "Open in TEITOK" (`action=file`), e.g.
+/// `https://lindat.mff.cuni.cz/services/teitok-live/migrantstories`.
+fn teitok_project_base_url(url: &str) -> Option<String> {
+    let raw = url.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (server, path) = teitok_crp_from_project_url(raw)?;
+    let path = path.trim_end_matches('/');
+    if server.is_empty() {
+        return if path.is_empty() {
+            None
+        } else {
+            Some(path.to_string())
+        };
+    }
+    let scheme = if raw.to_ascii_lowercase().starts_with("http://") {
+        "http"
+    } else {
+        "https"
+    };
+    Some(format!("{scheme}://{server}{path}"))
 }
 
 
@@ -834,7 +904,12 @@ fn publish_kontext(cfg: Option<&Value>, req: &PublishRequest<'_>) -> Result<Valu
         .iter()
         .any(|i| i.eq_ignore_ascii_case(ident));
     let new_corplist = if present {
-        None
+        // Republish: flip legacy dictionary-style TEITOK providers to KWIC-view tabs.
+        if req.teitok {
+            corplist_ensure_teitok_kwic_view(&text, ident)?
+        } else {
+            None
+        }
     } else {
         let keyboard_lang = req.language.and_then(|l| {
             let t = l.trim();
@@ -868,8 +943,12 @@ fn publish_kontext(cfg: Option<&Value>, req: &PublishRequest<'_>) -> Result<Valu
                     entry["label"] = json!(req.label.trim());
                 }
                 if req.teitok {
-                    if let Some((server, path)) = req.project_url.and_then(teitok_crp_from_project_url) {
-                        entry["teitok_crp_path"] = json!(path);
+                    // Full project URL for KonText "Open in TEITOK" (action=file&tid=…).
+                    // Path/server alone were for the old action=context template.
+                    if let Some(base) = req.project_url.and_then(teitok_project_base_url) {
+                        entry["teitok_crp_path"] = json!(base);
+                    }
+                    if let Some((server, _)) = req.project_url.and_then(teitok_crp_from_project_url) {
                         if !server.is_empty() {
                             entry["teitok_crp_server"] = json!(server);
                         }
@@ -888,7 +967,8 @@ fn publish_kontext(cfg: Option<&Value>, req: &PublishRequest<'_>) -> Result<Valu
     let mut corplist_step = json!({ "status": "present", "path": path.display().to_string(), "source": source });
     if let Some(t) = new_corplist {
         let w = rewrite_config_file(&path, &t)?;
-        corplist_step = json!({ "status": "added", "path": w["path"], "backup": w["backup"],
+        let status = if present { "updated" } else { "added" };
+        corplist_step = json!({ "status": status, "path": w["path"], "backup": w["backup"],
             "method": w["method"], "owner_kept": w["owner_kept"], "source": source });
     }
     if let (Some(pp), Some(t)) = (&pando_path, new_pando) {
@@ -946,8 +1026,10 @@ fn publish_kontext(cfg: Option<&Value>, req: &PublishRequest<'_>) -> Result<Valu
         },
     };
 
-    let changed = corplist_step["status"] == "added"
-        || pando_step["status"] == "added"
+    let changed = matches!(
+            corplist_step["status"].as_str(),
+            Some("added" | "updated")
+        ) || pando_step["status"] == "added"
         || registry_step["status"] == "added"
         || registry_step["status"] == "updated";
     let complete = pando_step["status"] != "not_found"
@@ -1345,7 +1427,7 @@ mod tests {
         assert!(out.contains("features=\"morphology,syntax\""), "{out}");
         assert!(out.contains("<item>teitok</item>"), "{out}");
         assert!(
-            out.contains("<provider is_kwic_view=\"false\">TEITOK</provider>"),
+            out.contains("<provider is_kwic_view=\"true\">TEITOK</provider>"),
             "{out}"
         );
         assert!(roxmltree::Document::parse(&out).is_ok());
@@ -1458,6 +1540,32 @@ mod tests {
             teitok_crp_from_project_url("http://example.org/services/teitok/foo"),
             Some(("example.org".into(), "/services/teitok/foo/".into()))
         );
+        assert_eq!(
+            teitok_project_base_url(
+                "https://lindat.mff.cuni.cz/services/teitok-live/migrantstories//index.php"
+            ),
+            Some("https://lindat.mff.cuni.cz/services/teitok-live/migrantstories".into())
+        );
+    }
+
+    #[test]
+    fn corplist_republish_flips_teitok_to_kwic_view() {
+        let text = r#"<corplist>
+    <corpus ident="migrantstories" sentence_struct="s">
+        <token_connect>
+            <provider is_kwic_view="false">TEITOK</provider>
+        </token_connect>
+    </corpus>
+</corplist>
+"#;
+        let out = corplist_ensure_teitok_kwic_view(text, "migrantstories")
+            .unwrap()
+            .expect("should rewrite");
+        assert!(out.contains("is_kwic_view=\"true\">TEITOK</provider>"), "{out}");
+        assert!(!out.contains("is_kwic_view=\"false\">TEITOK</provider>"), "{out}");
+        assert!(corplist_ensure_teitok_kwic_view(&out, "migrantstories")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

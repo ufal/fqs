@@ -33,7 +33,7 @@
   {
     "id": "infoveillance_pando",
     "label": "Infoveillance Pando",
-    "project_root": "/Users/mjanssen/programming/easycorp/teitok/infoveillance/pando",
+    "project_root": "/path/to/teitok/infoveillance/pando",
     "project_url": "http://127.0.0.1/teitok/easycorp/infoveillance/index.php",
     "preferred_backend": "pando",
     "visibility": "published",
@@ -152,7 +152,7 @@
   {
     "id": "pmltq_local_test",
     "label": "PML-TQ Local Test Corpus",
-    "project_root": "/Users/mjanssen/programming/easycorp/teitok/infoveillance/tmp",
+    "project_root": "/path/to/teitok/infoveillance/tmp",
     "project_url": "http://127.0.0.1/corpora/pmltq/local-test",
     "preferred_backend": "clickql",
     "visibility": "staging",
