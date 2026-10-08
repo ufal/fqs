@@ -271,8 +271,9 @@ cargo run -- serve --host 127.0.0.1 --port 8787
   - Windows: `%APPDATA%/fqs/logs/fqs.log`
 - If that path is not writable, FQS falls back next to the DB as `fqs-http.log`.
 - Rotation controls:
-  - `--log-max-bytes` (default `10485760`, i.e. 10MB)
-  - `--log-keep-files` (default `7`)
+  - `--log-max-bytes` (default `104857600`, i.e. 100 MB)
+  - `--log-keep-files` (default `10`)
+  - rotated files are gzipped (`fqs.log.1.gz` … `fqs.log.N.gz`, also for the activity log); `--no-log-compress` keeps them plain. Read them with `zcat` / `zgrep`.
   - optional override: `--log-file /path/to/fqs.log`
 - Query calls may include `session_id`; FQS upserts that into SQLite `active_sessions` (`last_seen_at` heartbeat).
 - Session cleanup runs at startup and every 60s while serving (`--session-ttl-minutes`, default `120`).

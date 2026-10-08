@@ -14,7 +14,8 @@
 //!   * `warm_state`  — every `--activity-state-secs`: the warm corpora and the
 //!                     process's memory.
 //! `--activity-events` picks the kinds (`queries`, `warm`; default both).
-//! Rotation follows the request log (`--log-max-bytes`, `--log-keep-files`).
+//! Rotation follows the request log (`--log-max-bytes`, `--log-keep-files`; rotated
+//! files gzipped unless `--no-log-compress`).
 
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -55,13 +56,14 @@ pub struct ActivityLog {
     salt: String,
     max_bytes: u64,
     keep_files: usize,
+    compress: bool,
     file: Mutex<Option<File>>,
 }
 
 impl ActivityLog {
     /// `events`: comma-separated `queries`, `warm` (or `all`).
     pub fn new(path: PathBuf, events: &str, users: UserMode, salt: Option<String>,
-               max_bytes: u64, keep_files: usize) -> Result<Self, String> {
+               max_bytes: u64, keep_files: usize, compress: bool) -> Result<Self, String> {
         let mut queries = false;
         let mut warm = false;
         for e in events.split(',').map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty()) {
@@ -84,7 +86,7 @@ impl ActivityLog {
             .map_err(|e| format!("{}: {e}", path.display()))?;
         // a salt per start unless one is given: hashes are comparable within a run
         let salt = salt.unwrap_or_else(|| format!("{:x}", OffsetDateTime::now_utc().unix_timestamp_nanos()));
-        Ok(Self { path, queries, warm, users, salt, max_bytes, keep_files, file: Mutex::new(Some(f)) })
+        Ok(Self { path, queries, warm, users, salt, max_bytes, keep_files, compress, file: Mutex::new(Some(f)) })
     }
 
     pub fn logs_queries(&self) -> bool {
@@ -355,13 +357,56 @@ impl ActivityLog {
             return;
         }
         *g = None;
-        let p = self.path.display().to_string();
-        let _ = fs::remove_file(format!("{p}.{}", self.keep_files));
-        for i in (1..self.keep_files).rev() {
-            let _ = fs::rename(format!("{p}.{i}"), format!("{p}.{}", i + 1));
-        }
-        let _ = fs::rename(&self.path, format!("{p}.1"));
+        rotate_log_files(&self.path, self.keep_files, self.compress);
         *g = OpenOptions::new().create(true).append(true).open(&self.path).ok();
+    }
+}
+
+/// Rotate `path`: `path.N` → `path.N+1` (the oldest, `path.<keep>`, is dropped), `path` →
+/// `path.1`. With `compress` the rotated file becomes `path.1.gz` (gzip, fast level),
+/// and older ones keep their `.gz`; plain files from an earlier run are shifted as they
+/// are. Done inline, so no later rotation can rename a file while it is being compressed.
+pub fn rotate_log_files(path: &Path, keep_files: usize, compress: bool) {
+    if keep_files == 0 {
+        return;
+    }
+    let p = path.display().to_string();
+    for ext in ["", ".gz"] {
+        let _ = fs::remove_file(format!("{p}.{keep_files}{ext}"));
+    }
+    for i in (1..keep_files).rev() {
+        for ext in ["", ".gz"] {
+            let src = format!("{p}.{i}{ext}");
+            if Path::new(&src).exists() {
+                let _ = fs::rename(&src, format!("{p}.{}{ext}", i + 1));
+            }
+        }
+    }
+    let first = format!("{p}.1");
+    if fs::rename(path, &first).is_err() || !compress {
+        return;
+    }
+    if gzip_file(Path::new(&first), Path::new(&format!("{first}.gz"))).is_ok() {
+        let _ = fs::remove_file(&first);
+    }
+}
+
+/// `src` gzipped into `dst` (written as `dst.tmp`, then renamed); `src` is left in place.
+fn gzip_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use flate2::{write::GzEncoder, Compression};
+    let tmp = PathBuf::from(format!("{}.tmp", dst.display()));
+    let result = (|| {
+        let mut input = File::open(src)?;
+        let mut enc = GzEncoder::new(File::create(&tmp)?, Compression::fast());
+        std::io::copy(&mut input, &mut enc)?;
+        enc.finish()?.sync_all()
+    })();
+    match result {
+        Ok(()) => fs::rename(&tmp, dst),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
     }
 }
 
@@ -419,6 +464,39 @@ mod tests {
     use std::io::Write;
 
     #[test]
+    fn rotation_gzips_and_shifts() {
+        use flate2::read::GzDecoder;
+        let dir = std::env::temp_dir().join(format!("fqs-rot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("fqs.log");
+        let gunzip = |p: &Path| {
+            let mut s = String::new();
+            GzDecoder::new(File::open(p).unwrap()).read_to_string(&mut s).unwrap();
+            s
+        };
+        // a plain rotated file from an earlier (uncompressed) run is shifted as it is
+        fs::write(dir.join("fqs.log.1"), "old plain\n").unwrap();
+        for n in 1..=3 {
+            fs::write(&log, format!("round {n}\n")).unwrap();
+            rotate_log_files(&log, 3, true);
+        }
+        assert!(!log.exists());
+        assert_eq!(gunzip(&dir.join("fqs.log.1.gz")), "round 3\n");
+        assert_eq!(gunzip(&dir.join("fqs.log.2.gz")), "round 2\n");
+        assert_eq!(gunzip(&dir.join("fqs.log.3.gz")), "round 1\n");
+        assert!(!dir.join("fqs.log.4").exists() && !dir.join("fqs.log.4.gz").exists());
+        assert!(!dir.join("fqs.log.3").exists());   // "old plain" was the oldest: dropped
+        assert!(!dir.join("fqs.log.1").exists() && !dir.join("fqs.log.1.gz.tmp").exists());
+        // without compression: plain names, as before
+        fs::write(&log, "plain\n").unwrap();
+        rotate_log_files(&log, 3, false);
+        assert_eq!(fs::read_to_string(dir.join("fqs.log.1")).unwrap(), "plain\n");
+        assert_eq!(gunzip(&dir.join("fqs.log.2.gz")), "round 3\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn admin_overview_skips_warm_state_by_default() {
         let mut p = std::env::temp_dir();
         p.push(format!(
@@ -440,7 +518,7 @@ mod tests {
             )
             .unwrap();
         }
-        let log = ActivityLog::new(p.clone(), "all", UserMode::None, Some("salt".into()), 0, 0)
+        let log = ActivityLog::new(p.clone(), "all", UserMode::None, Some("salt".into()), 0, 0, false)
             .unwrap();
         let report = log.admin_overview(50, "interesting", None, 1024 * 1024);
         let _ = fs::remove_file(&p);

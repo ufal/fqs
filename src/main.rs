@@ -315,11 +315,14 @@ struct ServeArgs {
     #[arg(long)]
     log_file: Option<PathBuf>,
     /// Rotate request log after this many bytes
-    #[arg(long, default_value_t = 10 * 1024 * 1024)]
+    #[arg(long, default_value_t = 100 * 1024 * 1024)]
     log_max_bytes: u64,
-    /// Number of rotated files to keep (fqs.log.1 ... fqs.log.N)
-    #[arg(long, default_value_t = 7)]
+    /// Number of rotated files to keep (fqs.log.1.gz ... fqs.log.N.gz)
+    #[arg(long, default_value_t = 10)]
     log_keep_files: usize,
+    /// Keep rotated logs (request and activity log) uncompressed instead of gzipped
+    #[arg(long, default_value_t = false)]
+    no_log_compress: bool,
     /// Activity log (JSON lines): queries and/or warm-corpus opens, closes and
     /// snapshots, for later analysis. Off unless given. Rotates like --log-file.
     #[arg(long, env = "FQS_ACTIVITY_LOG")]
@@ -536,6 +539,7 @@ struct HttpAppState {
     request_log_path: PathBuf,
     request_log_max_bytes: u64,
     request_log_keep_files: usize,
+    request_log_compress: bool,
     /// Warm Pando handles via libflexicorp_pando (None if the library is missing).
     pando_hcm: Option<Arc<HotCorpusManager>>,
     /// In-memory corpus catalog (avoids open_db + SELECT on every query).
@@ -1990,7 +1994,7 @@ fn prepare_request_log_path(db_path: &PathBuf, configured: Option<PathBuf>) -> (
     (chosen, warning)
 }
 
-fn rotate_request_log_if_needed(path: &PathBuf, max_bytes: u64, keep_files: usize) -> Result<()> {
+fn rotate_request_log_if_needed(path: &PathBuf, max_bytes: u64, keep_files: usize, compress: bool) -> Result<()> {
     if max_bytes == 0 || keep_files == 0 {
         return Ok(());
     }
@@ -2001,19 +2005,7 @@ fn rotate_request_log_if_needed(path: &PathBuf, max_bytes: u64, keep_files: usiz
     if meta.len() < max_bytes {
         return Ok(());
     }
-    let oldest = PathBuf::from(format!("{}.{}", path.display(), keep_files));
-    let _ = fs::remove_file(&oldest);
-    for i in (1..keep_files).rev() {
-        let src = PathBuf::from(format!("{}.{}", path.display(), i));
-        let dst = PathBuf::from(format!("{}.{}", path.display(), i + 1));
-        if src.exists() {
-            let _ = fs::rename(src, dst);
-        }
-    }
-    let first = PathBuf::from(format!("{}.1", path.display()));
-    if path.exists() {
-        let _ = fs::rename(path, first);
-    }
+    activity::rotate_log_files(path, keep_files, compress);
     Ok(())
 }
 
@@ -2043,6 +2035,7 @@ fn append_request_log_line(state: &HttpAppState, line: &str) {
         &state.request_log_path,
         state.request_log_max_bytes,
         state.request_log_keep_files,
+        state.request_log_compress,
     );
     let ts = OffsetDateTime::now_utc()
         .format(&Rfc3339)
@@ -2464,7 +2457,8 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         Some(path) => {
             let users = UserMode::parse(&args.activity_log_users).map_err(anyhow::Error::msg)?;
             let log = ActivityLog::new(path.clone(), &args.activity_events, users,
-                                       args.activity_salt.clone(), args.log_max_bytes, args.log_keep_files)
+                                       args.activity_salt.clone(), args.log_max_bytes, args.log_keep_files,
+                                       !args.no_log_compress)
                 .map_err(|e| anyhow::anyhow!("--activity-log: {e}"))?;
             eprintln!("[fqs] activity log: {} ({})", path.display(), log.status_json());
             Some(Arc::new(log))
@@ -2579,6 +2573,7 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         request_log_path: request_log_path.clone(),
         request_log_max_bytes: args.log_max_bytes,
         request_log_keep_files: args.log_keep_files,
+        request_log_compress: !args.no_log_compress,
         pando_hcm,
         catalog: catalog.clone(),
         limits: limits.clone(),
@@ -5184,6 +5179,9 @@ fn browse_corpus_dto(c: &CorpusEntry) -> Value {
         "label": c.label,
         "family_key": c.family_key,
         "family_label": c.family_label,
+        "version_tag": c.version_tag,
+        // false: an older version of its family (listed only with include_noncurrent)
+        "is_current": c.is_current,
         "project_url": c.project_url,
         "preferred_backend": c.preferred_backend,
         "source_kind": c.source_kind,
@@ -7353,9 +7351,14 @@ fn corpus_exists(conn: &Connection, id: &str) -> Result<bool> {
 }
 
 fn delete_corpus(conn: &Connection, id: &str) -> Result<usize> {
+    let family = get_corpus(conn, id).ok().and_then(|c| c.family_key.map(|f| (f, c.environment)));
     let n = conn
         .execute("DELETE FROM corpora WHERE id = ?1", params![id])
         .context("Failed to delete corpus row")?;
+    // the newest remaining version of its family becomes the current one
+    if let Some((family, environment)) = family {
+        update_family_current(conn, &family, &environment)?;
+    }
     Ok(n)
 }
 
@@ -7446,7 +7449,80 @@ ON CONFLICT(id) DO UPDATE SET
         ],
     )
     .map_err(|e| sqlite_write_err("Failed to upsert corpus", e))?;
+    if let Some(family) = entry.family_key.as_deref() {
+        for (id, newest) in update_family_current(conn, family, &entry.environment)? {
+            eprintln!("[fqs] family '{family}': '{id}' is no longer the current version ('{newest}' is); still registered and searchable, listed only on request");
+        }
+    }
     Ok(())
+}
+
+/// Compare version tags piece by piece: digit runs as numbers, other text as text
+/// (`2.19` > `2.18` > `2.9`, `2026-10` > `2026-9`).
+fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    fn pieces(s: &str) -> Vec<(bool, String)> {
+        let mut out: Vec<(bool, String)> = Vec::new();
+        for ch in s.chars() {
+            let digit = ch.is_ascii_digit();
+            match out.last_mut() {
+                Some((d, buf)) if *d == digit => buf.push(ch),
+                _ => out.push((digit, ch.to_string())),
+            }
+        }
+        out
+    }
+    let (pa, pb) = (pieces(a), pieces(b));
+    for (x, y) in pa.iter().zip(pb.iter()) {
+        let ord = if x.0 && y.0 {
+            let (xt, yt) = (x.1.trim_start_matches('0'), y.1.trim_start_matches('0'));
+            xt.len().cmp(&yt.len()).then_with(|| xt.cmp(yt))
+        } else {
+            x.1.cmp(&y.1)
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    pa.len().cmp(&pb.len())
+}
+
+/// Within one family and environment, the entries with the highest `version_tag` are the
+/// current ones; older versions stay registered and searchable but are no longer current
+/// (left out of default listings). Entries without a version tag are left as they are.
+/// Returns the entries that stopped being current, each with the id of a newest one.
+fn update_family_current(conn: &Connection, family: &str, environment: &str) -> Result<Vec<(String, String)>> {
+    if family.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT id, version_tag, is_current FROM corpora WHERE family_key = ?1 AND environment = ?2 \
+         AND version_tag IS NOT NULL AND TRIM(version_tag) != ''",
+    )?;
+    let rows: Vec<(String, String, bool)> = stmt
+        .query_map(params![family, environment], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? == 1))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let Some(newest) = rows.iter().map(|r| r.1.trim()).max_by(|a, b| compare_versions(a, b)) else {
+        return Ok(Vec::new());
+    };
+    let newest = newest.to_string();
+    let newest_id = rows.iter().find(|r| r.1.trim() == newest).map(|r| r.0.clone()).unwrap_or_default();
+    let mut demoted = Vec::new();
+    for (id, version, current) in &rows {
+        let should = compare_versions(version.trim(), &newest) == std::cmp::Ordering::Equal;
+        if should != *current {
+            conn.execute(
+                "UPDATE corpora SET is_current = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                params![id, if should { 1 } else { 0 }],
+            )
+            .map_err(|e| sqlite_write_err("Failed to update current version", e))?;
+            if !should {
+                demoted.push((id.clone(), newest_id.clone()));
+            }
+        }
+    }
+    Ok(demoted)
 }
 
 fn mark_corpus_superseded(conn: &Connection, id: &str) -> Result<()> {
@@ -8696,6 +8772,47 @@ mod catalog_fresh_tests {
     }
 
     use super::*;
+
+    #[test]
+    fn newest_version_of_a_family_is_current() {
+        use std::cmp::Ordering::*;
+        assert_eq!(compare_versions("2.19", "2.18"), Greater);
+        assert_eq!(compare_versions("2.9", "2.18"), Less);
+        assert_eq!(compare_versions("2.0", "2.0"), Equal);
+        assert_eq!(compare_versions("2026-10", "2026-9"), Greater);
+        assert_eq!(compare_versions("1.0", "1.0b"), Less);
+
+        let d = std::env::temp_dir().join(format!("fqs-fam-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let conn = open_db(&d.join("fqs.db")).unwrap();
+        let add = |id: &str, version: Option<&str>, env: &str| {
+            let mut v = json!({"id": id, "label": id, "project_root": "/p", "preferred_backend": "cqp",
+                               "family_key": "ud", "environment": env});
+            if let Some(t) = version { v["version_tag"] = json!(t); }
+            let e: CorpusEntry = serde_json::from_value(v).unwrap();
+            upsert_corpus(&conn, &e).unwrap();
+        };
+        let current = |id: &str| get_corpus(&conn, id).unwrap().is_current;
+        add("ud-2.18-cqp", Some("2.18"), "live");
+        add("ud-2.18-pando", Some("2.18"), "live");
+        add("ud-notag", None, "live");
+        assert!(current("ud-2.18-cqp") && current("ud-2.18-pando"));
+        add("ud-2.19-cqp", Some("2.19"), "live");
+        // 2.18 stays registered, no longer current; untagged and other environments untouched
+        assert!(current("ud-2.19-cqp"));
+        assert!(!current("ud-2.18-cqp") && !current("ud-2.18-pando"));
+        assert!(current("ud-notag"));
+        add("ud-2.20-test", Some("2.20"), "test");
+        assert!(current("ud-2.19-cqp") && current("ud-2.20-test"));
+        // an older version registered later does not take over
+        add("ud-2.9-cqp", Some("2.9"), "live");
+        assert!(!current("ud-2.9-cqp") && current("ud-2.19-cqp"));
+        // deleting the newest makes the next one current again
+        delete_corpus(&conn, "ud-2.19-cqp").unwrap();
+        assert!(current("ud-2.18-cqp") && current("ud-2.18-pando") && !current("ud-2.9-cqp"));
+        let _ = fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn a_row_written_a_moment_ago_is_found() {

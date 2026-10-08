@@ -328,6 +328,7 @@ dependencies = [
  "axum",
  "base64",
  "clap",
+ "flate2",
  "hmac",
  "libloading",
  "roxmltree",

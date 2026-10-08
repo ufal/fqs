@@ -19,4 +19,5 @@ hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
 ureq = { version = "2", features = ["json"] }
+flate2 = "1"
 roxmltree = "0.20"
