@@ -50,7 +50,7 @@ use pando_lib::PandoLib;
 #[command(
     name = "fqs",
     about = "FlexiCorp Query Server prototype CLI",
-    version
+    version = env!("FQS_VERSION_LONG")
 )]
 struct Cli {
     #[command(subcommand)]
@@ -3645,6 +3645,8 @@ async fn http_health(State(state): State<HttpAppState>) -> Json<Value> {
         "ok": true,
         "service": "fqs",
         "version": env!("CARGO_PKG_VERSION"),
+        // the commit this binary was built from (the version only changes on releases)
+        "build": env!("FQS_BUILD"),
         "server_name": state.server_name,
     }))
 }
@@ -3655,6 +3657,7 @@ fn detailed_health_body(state: &HttpAppState) -> Value {
         "service": "fqs",
         "mode": "http",
         "version": env!("CARGO_PKG_VERSION"),
+        "build": env!("FQS_BUILD"),
         "server_name": state.server_name,
         "db_path": state.db_path.to_string_lossy(),
         "db_source": db_source(),
@@ -3704,7 +3707,7 @@ fn build_settings_snapshot(
         "title": "Identity",
         "mutable": false,
         "items": [
-            setting_item("version", json!(env!("CARGO_PKG_VERSION")), "build", "rebuild / redeploy FQS"),
+            setting_item("version", json!(env!("FQS_VERSION_LONG")), "build", "rebuild / redeploy FQS"),
             setting_item(
                 "server_name",
                 json!(args.server_name),
