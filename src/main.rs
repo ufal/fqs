@@ -33,6 +33,7 @@ mod enrich;
 mod fcs;
 mod hot_corpus;
 mod limits;
+mod manatee_lib;
 mod pando_lib;
 mod scan;
 mod services;
@@ -2303,6 +2304,13 @@ fn query_language_effective_for_backend(backend: &str, requested_language: &str)
                 if t.is_empty() { "(empty)" } else { t }
             ),
         },
+        "manatee" => match lower.as_str() {
+            "" | "auto" | "manatee-cql" => Ok("manatee-cql".to_string()),
+            _ => anyhow::bail!(
+                "Query language '{}' is not supported for backend 'manatee' (use 'manatee-cql' or 'auto')",
+                if t.is_empty() { "(empty)" } else { t }
+            ),
+        },
         "cqp" => match lower.as_str() {
             "" | "auto" => Ok("cwb-cql".to_string()),
             "cwb-cql" => Ok("cwb-cql".to_string()),
@@ -2359,7 +2367,9 @@ fn execute_query(
             backend
         );
     }
-    if backend != "pando" && backend != "cqp" {
+    // manatee: natively when libfqs_manatee is loaded (FQS_MANATEE_LIB; manatee_lib.rs)
+    let manatee_native = backend == "manatee" && manatee_lib::global().is_some();
+    if backend != "pando" && backend != "cqp" && !manatee_native {
         anyhow::bail!(
             "Resolved backend '{}' is not implemented in fqs query execution. Use backend=pando|cqp, or set preferred_backend / settings.query_backend.",
             backend
@@ -2403,7 +2413,19 @@ fn execute_query(
                     exec.exit_code,
                 )
             }
-            _ => unreachable!("backend was checked to be pando or cqp"),
+            "manatee" => {
+                let effective = query_language_effective_for_backend("manatee", &requested_language)?;
+                let exec = run_manatee_query(corpus, query_text, start, size, query_options)?;
+                (
+                    effective,
+                    exec.kind,
+                    exec.binary,
+                    exec.target,
+                    exec.payload,
+                    exec.exit_code,
+                )
+            }
+            _ => unreachable!("backend was checked to be pando, cqp or (native) manatee"),
         };
     let elapsed_ms = started.elapsed().as_millis();
 
@@ -2572,6 +2594,7 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
     }
 
     let reindex_worker = !(args.no_reindex_worker || env_truthy("FQS_NO_REINDEX_WORKER"));
+    let _ = manatee_lib::global();   // load native Manatee (FQS_MANATEE_LIB) now, not on the first query
     let settings_snapshot = Arc::new(build_settings_snapshot(
         &args,
         &db_path,
@@ -5608,6 +5631,9 @@ async fn http_warm(
                 .to_string();
             resolve_cqp_registry(&corpus).1.and_then(|reg| warm::cwb_data_dir(&reg, &name)).map(|d| (d, warm::CWB_PRIORITY))
         }
+        "manatee" if manatee_lib::global().is_some() => manatee_lib::registry_file(&corpus.settings, &corpus.id)
+            .and_then(|reg| manatee_lib::data_dir(&reg))
+            .map(|d| (d, manatee_lib::MANATEE_PRIORITY)),
         _ => None,
     };
     let Some((dir, priority)) = target else {
@@ -8300,6 +8326,69 @@ fn run_cqp_query(
         binary: cqp_bin,
         target: registry_dir,
         exit_code,
+        payload,
+    })
+}
+
+/// A Manatee corpus natively (libfqs_manatee; manatee_lib.rs), answered in the shape of the CWB
+/// route (`done.result`: total, hits with match_start/match_end and their context, kwic lines), so
+/// flexicorp, FCS and the rest read it as they read CWB results.
+fn run_manatee_query(
+    corpus: &CorpusEntry,
+    query_text: &str,
+    start: u32,
+    size: u32,
+    query_options: Option<&HttpQueryRequest>,
+) -> Result<CqpExecResult> {
+    let lib = manatee_lib::global().ok_or_else(|| anyhow::anyhow!("native Manatee is not available (FQS_MANATEE_LIB)"))?;
+    let registry = manatee_lib::registry_file(&corpus.settings, &corpus.id).ok_or_else(|| {
+        anyhow::anyhow!("no Manatee registry for '{}' (settings.manatee_registry, or MANATEE_REGISTRY)", corpus.id)
+    })?;
+    let window = query_options.and_then(|q| q.window).unwrap_or(5).max(0) as u32;
+    let t0 = Instant::now();
+    let res = lib.query(&corpus.id, &registry, query_text, start as u64, size as u64, window, None)?;
+    let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0;
+    let total = res.get("total").and_then(Value::as_u64).unwrap_or(0);
+    let mut hits = Vec::new();
+    let mut lines = Vec::new();
+    for h in res.get("hits").and_then(Value::as_array).cloned().unwrap_or_default() {
+        let pos = h.get("pos").and_then(Value::as_i64).unwrap_or(0);
+        let end = h.get("end").and_then(Value::as_i64).unwrap_or(pos + 1);
+        let (left, kwic, right) = (
+            h.get("left").and_then(Value::as_str).unwrap_or(""),
+            h.get("kwic").and_then(Value::as_str).unwrap_or(""),
+            h.get("right").and_then(Value::as_str).unwrap_or(""),
+        );
+        lines.push(format!("{pos}: {left} <{kwic}> {right}"));
+        hits.push(json!({ "match_start": pos, "match_end": end - 1, "left": left, "kwic": kwic, "right": right }));
+    }
+    let payload = json!({
+        "success": true,
+        "done": {
+            "backend": "manatee",
+            "operation": "query",
+            "errors": [],
+            "warnings": [],
+            "result": {
+                "query": query_text,
+                "query_lang": "manatee-cql",
+                "corpus_id_used": corpus.id,
+                "result_type": "kwic_text",
+                "start": start,
+                "requested_size": size,
+                "total": total,
+                "total_exact": true,
+                "elapsed_ms": elapsed_ms,
+                "lines": lines,
+                "hits": hits
+            }
+        }
+    });
+    Ok(CqpExecResult {
+        kind: "fqs-manatee-lib".to_string(),
+        binary: lib.path.display().to_string(),
+        target: registry.display().to_string(),
+        exit_code: 0,
         payload,
     })
 }

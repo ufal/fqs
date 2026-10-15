@@ -15,3 +15,8 @@ limits.local.json
 dev/
 tests/
 tmp/
+
+# native Manatee build output (manatee/build.sh)
+manatee/libfqs_manatee.dylib
+manatee/libfqs_manatee.so
+manatee/.build-static.log
