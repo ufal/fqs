@@ -353,6 +353,11 @@ struct ServeArgs {
     /// Idle TTL seconds before an unused warm Pando handle is closed
     #[arg(long, default_value_t = 1800)]
     pando_idle_ttl_secs: u64,
+    /// Run no reindex worker: this FQS executes no reindex jobs and refuses to queue them (a
+    /// query server over read-only data; jobs go to the FQS that can write the corpora). Also
+    /// FQS_NO_REINDEX_WORKER=1.
+    #[arg(long, default_value_t = false)]
+    no_reindex_worker: bool,
     /// Disable libflexicorp_pando hot path (force cold CLI)
     #[arg(long, default_value_t = false)]
     pando_cli_only: bool,
@@ -559,6 +564,8 @@ struct HttpAppState {
     settings_snapshot: Arc<Value>,
     /// `POST /warm`: corpora read into the file cache ahead of their first query (warm.rs).
     warmer: Arc<warm::Warmer>,
+    /// False with `--no-reindex-worker`: no jobs run here, and none are queued.
+    reindex_worker: bool,
 }
 
 /// Hot-path corpus lookup: all rows in memory, from SQLite.
@@ -1713,6 +1720,15 @@ fn backend_allowed_by_settings(corpus: &CorpusEntry, backend: &str) -> bool {
 
 /// Catalogue `preferred_backend` hint: `auto` resolves from `settings.query_backend` or index paths.
 /// One FQS row describes one corpus (version); TEITOK/flexicorp typically passes `backend` on each query.
+/// An environment switch is on: 1, true, yes or on (any case).
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name).map(|v| truthy(&v)).unwrap_or(false)
+}
+
+fn truthy(v: &str) -> bool {
+    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
 fn resolve_effective_backend(corpus: &CorpusEntry) -> Result<String> {
     match corpus.preferred_backend.as_str() {
         "auto" => {
@@ -2555,6 +2571,7 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         );
     }
 
+    let reindex_worker = !(args.no_reindex_worker || env_truthy("FQS_NO_REINDEX_WORKER"));
     let settings_snapshot = Arc::new(build_settings_snapshot(
         &args,
         &db_path,
@@ -2589,6 +2606,7 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
             .and_then(|s| admin::normalize_admin_base_href(Some(s))),
         settings_snapshot,
         warmer: Arc::new(warm::Warmer::from_env()),
+        reindex_worker,
     };
     if let Some(dir) = &admin_dir {
         if let Some((ah, ap)) = &admin_bind {
@@ -2713,95 +2731,100 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         .layer(middleware::from_fn_with_state(state.clone(), http_log_middleware))
         .with_state(state.clone());
 
-    let worker_id = format!("fqs-serve-{}", std::process::id());
-    let worker_caps = vec![
-        "auto".to_string(),
-        "manatee".to_string(),
-        "pando".to_string(),
-        "cqp".to_string(),
-        "clickql".to_string(),
-        "clickhouse".to_string(),
-        "blacklab".to_string(),
-        "pmltq".to_string(),
-    ];
-    let dispatch_db_path = db_path.clone();
-    let execute_db_path = db_path.clone();
-    let dispatch_worker_id = worker_id.clone();
-    let dispatch_worker_caps = worker_caps.clone();
-    let execute_worker_id = worker_id.clone();
-    let active_jobs: Arc<Mutex<std::collections::HashSet<String>>> =
-        Arc::new(Mutex::new(std::collections::HashSet::new()));
-    tokio::spawn(async move {
-        loop {
-            if let Ok(conn) = open_db(&dispatch_db_path) {
-                if let Err(err) = upsert_reindex_worker_heartbeat(
-                    &conn,
-                    &dispatch_worker_id,
-                    1,
-                    None,
-                    &dispatch_worker_caps,
-                ) {
-                    eprintln!(
-                        "[fqs][reindex] heartbeat failed for worker {}: {}",
-                        dispatch_worker_id, err
-                    );
-                }
-                let active_snapshot = if let Ok(set) = active_jobs.lock() {
-                    set.clone()
-                } else {
-                    std::collections::HashSet::new()
-                };
-                match reconcile_orphaned_running_jobs(&conn, &dispatch_worker_id, &active_snapshot) {
-                    Ok(done) if !done.is_empty() => {
+    if !reindex_worker {
+        eprintln!("[fqs] no reindex worker (--no-reindex-worker): reindex jobs are refused here");
+    }
+    if reindex_worker {
+        let worker_id = format!("fqs-serve-{}", std::process::id());
+        let worker_caps = vec![
+            "auto".to_string(),
+            "manatee".to_string(),
+            "pando".to_string(),
+            "cqp".to_string(),
+            "clickql".to_string(),
+            "clickhouse".to_string(),
+            "blacklab".to_string(),
+            "pmltq".to_string(),
+        ];
+        let dispatch_db_path = db_path.clone();
+        let execute_db_path = db_path.clone();
+        let dispatch_worker_id = worker_id.clone();
+        let dispatch_worker_caps = worker_caps.clone();
+        let execute_worker_id = worker_id.clone();
+        let active_jobs: Arc<Mutex<std::collections::HashSet<String>>> =
+            Arc::new(Mutex::new(std::collections::HashSet::new()));
+        tokio::spawn(async move {
+            loop {
+                if let Ok(conn) = open_db(&dispatch_db_path) {
+                    if let Err(err) = upsert_reindex_worker_heartbeat(
+                        &conn,
+                        &dispatch_worker_id,
+                        1,
+                        None,
+                        &dispatch_worker_caps,
+                    ) {
                         eprintln!(
-                            "[fqs][reindex] reconciled {} orphaned running jobs: {}",
-                            done.len(),
-                            done.join(", ")
+                            "[fqs][reindex] heartbeat failed for worker {}: {}",
+                            dispatch_worker_id, err
                         );
                     }
-                    Ok(_) => {}
+                    let active_snapshot = if let Ok(set) = active_jobs.lock() {
+                        set.clone()
+                    } else {
+                        std::collections::HashSet::new()
+                    };
+                    match reconcile_orphaned_running_jobs(&conn, &dispatch_worker_id, &active_snapshot) {
+                        Ok(done) if !done.is_empty() => {
+                            eprintln!(
+                                "[fqs][reindex] reconciled {} orphaned running jobs: {}",
+                                done.len(),
+                                done.join(", ")
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            eprintln!("[fqs][reindex] reconcile tick failed: {}", err);
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "[fqs][reindex] could not open db for heartbeat/dispatch: {}",
+                        dispatch_db_path.display()
+                    );
+                }
+                let assigned = match dispatch_reindex_once_path(&dispatch_db_path, 1) {
+                    Ok(rows) => rows,
                     Err(err) => {
-                        eprintln!("[fqs][reindex] reconcile tick failed: {}", err);
+                        eprintln!("[fqs][reindex] dispatch tick failed: {}", err);
+                        Vec::new()
                     }
+                };
+                for job in assigned {
+                    let jid = job.job_id.clone();
+                    let mut should_start = false;
+                    if let Ok(mut set) = active_jobs.lock() {
+                        if !set.contains(&jid) {
+                            set.insert(jid.clone());
+                            should_start = true;
+                        }
+                    }
+                    if !should_start {
+                        continue;
+                    }
+                    let dbp = execute_db_path.clone();
+                    let wid = execute_worker_id.clone();
+                    let active_jobs_done = Arc::clone(&active_jobs);
+                    tokio::task::spawn_blocking(move || {
+                        let _ = execute_reindex_job_for_worker(&dbp, &jid, &wid);
+                        if let Ok(mut set) = active_jobs_done.lock() {
+                            set.remove(&jid);
+                        }
+                    });
                 }
-            } else {
-                eprintln!(
-                    "[fqs][reindex] could not open db for heartbeat/dispatch: {}",
-                    dispatch_db_path.display()
-                );
+                sleep(Duration::from_secs(3)).await;
             }
-            let assigned = match dispatch_reindex_once_path(&dispatch_db_path, 1) {
-                Ok(rows) => rows,
-                Err(err) => {
-                    eprintln!("[fqs][reindex] dispatch tick failed: {}", err);
-                    Vec::new()
-                }
-            };
-            for job in assigned {
-                let jid = job.job_id.clone();
-                let mut should_start = false;
-                if let Ok(mut set) = active_jobs.lock() {
-                    if !set.contains(&jid) {
-                        set.insert(jid.clone());
-                        should_start = true;
-                    }
-                }
-                if !should_start {
-                    continue;
-                }
-                let dbp = execute_db_path.clone();
-                let wid = execute_worker_id.clone();
-                let active_jobs_done = Arc::clone(&active_jobs);
-                tokio::task::spawn_blocking(move || {
-                    let _ = execute_reindex_job_for_worker(&dbp, &jid, &wid);
-                    if let Ok(mut set) = active_jobs_done.lock() {
-                        set.remove(&jid);
-                    }
-                });
-            }
-            sleep(Duration::from_secs(3)).await;
-        }
-    });
+        });
+    }
 
     let addr = format!("{}:{}", args.host, args.port);
     let loopback = matches!(args.host.trim(), "127.0.0.1" | "localhost" | "::1" | "[::1]");
@@ -3724,6 +3747,12 @@ fn build_settings_snapshot(
                 json!(args.test),
                 "--test",
                 "omit --test for production (restart)"
+            ),
+            setting_item(
+                "reindex_worker",
+                json!(!(args.no_reindex_worker || env_truthy("FQS_NO_REINDEX_WORKER"))),
+                "--no-reindex-worker / FQS_NO_REINDEX_WORKER",
+                "fqs serve --no-reindex-worker  (restart; for a query server over read-only data)"
             ),
         ],
     }));
@@ -5275,6 +5304,12 @@ async fn http_reindex_enqueue(
     let role = route_caller(&state, &headers, req.request_role.as_deref()).role;
     if role != "admin" {
         return Err((StatusCode::FORBIDDEN, "Reindex enqueue requires admin role".to_string()));
+    }
+    if !state.reindex_worker {
+        return Err((
+            StatusCode::CONFLICT,
+            "this FQS runs no reindex jobs (--no-reindex-worker): send them to the FQS that can write the corpus".to_string(),
+        ));
     }
     let conn = open_db(&state.db_path).map_err(to_http_err)?;
     let _ = state.catalog.get(&req.corpus).map_err(to_http_err)?;
@@ -8777,6 +8812,19 @@ fn parse_entries_from_json(payload: &str) -> Result<Vec<CorpusEntry>> {
             Ok(vec![entry])
         }
         _ => anyhow::bail!("JSON input must be an object or an array of objects"),
+    }
+}
+
+#[cfg(test)]
+mod truthy_tests {
+    #[test]
+    fn switch_values() {
+        for v in ["1", "true", "TRUE", " yes ", "on"] {
+            assert!(super::truthy(v), "{v}");
+        }
+        for v in ["", "0", "false", "no", "off", "2"] {
+            assert!(!super::truthy(v), "{v}");
+        }
     }
 }
 

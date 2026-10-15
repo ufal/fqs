@@ -77,6 +77,10 @@ Current capabilities:
   - HTTP routes `GET/POST /reindex/jobs`, `GET /reindex/history`,
     `POST /reindex/workers/heartbeat`, `POST /reindex/jobs/mark-started`,
     `POST /reindex/jobs/mark-finished`
+  - every `fqs serve` runs a reindex worker for its own queue (jobs run on its machine and write
+    into the corpus folders); `--no-reindex-worker` (or `FQS_NO_REINDEX_WORKER=1`) turns it off
+    and makes `POST /reindex/jobs` answer 409: for a query server over read-only data, with the
+    jobs going to an FQS that can write the corpora
 
 A lightweight test HTTP mode is included (`--test`). Query execution is currently implemented for `pando` and `cqp`.
 

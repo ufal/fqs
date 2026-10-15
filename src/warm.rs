@@ -83,6 +83,7 @@ impl Warmer {
         let _ = self.running.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(1)));
     }
 
+    #[cfg(test)]
     pub fn running(&self) -> usize {
         self.running.load(Ordering::SeqCst)
     }
