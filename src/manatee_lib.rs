@@ -1,7 +1,7 @@
 //! Native Manatee: libfqs_manatee (manatee/fqs_manatee.cc, a C interface over manatee-open), loaded
-//! at runtime from `FQS_MANATEE_LIB` as libflexicorp_pando is (dev/MANATEE-NATIVE.md). No Python, no
-//! KonText. Corpora stay open once used; one lock per corpus (whether a Manatee corpus serves parallel
-//! queries is not established). Without the library, Manatee corpora are not queryable, as before.
+//! from `FQS_MANATEE_LIB` (dev/MANATEE-NATIVE.md). No Python, no KonText. Loaded only in the Manatee
+//! worker processes (manatee_worker.rs), never in FQS itself: a crash in Manatee (a corpus read
+//! wrongly) ends a worker, not FQS (manatee_pool.rs). Corpora stay open once used.
 //!
 //! The catalogue: `preferred_backend: manatee`, `settings.manatee_registry` (the registry file, or
 //! the registry folder with the corpus id as the file name), else `MANATEE_REGISTRY` + the id.
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_longlong, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 type OpenFn = unsafe extern "C" fn(*const c_char, *mut *mut c_char) -> *mut c_void;
 type CloseFn = unsafe extern "C" fn(*mut c_void);
@@ -21,6 +21,7 @@ type QueryFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_longlong, c_lo
 type FreqFn = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, c_longlong, *mut *mut c_char) -> *mut c_char;
 type FreeFn = unsafe extern "C" fn(*mut c_char);
 type VersionFn = unsafe extern "C" fn() -> *const c_char;
+type CheckFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_char) -> *mut c_char;
 
 /// An open corpus (a `Corpus *` inside the library).
 struct Handle(*mut c_void);
@@ -34,9 +35,9 @@ pub struct ManateeLib {
     open: OpenFn,
     close: CloseFn,
     query: QueryFn,
-    #[allow(dead_code)]
     freq: FreqFn,
     free: FreeFn,
+    check: Option<CheckFn>,
     corpora: Mutex<HashMap<String, Arc<Mutex<Handle>>>>,
 }
 
@@ -50,25 +51,6 @@ impl Drop for ManateeLib {
             }
         }
     }
-}
-
-/// The library, loaded once from FQS_MANATEE_LIB (None when unset or not loadable; the reason is logged).
-pub fn global() -> Option<Arc<ManateeLib>> {
-    static LIB: OnceLock<Option<Arc<ManateeLib>>> = OnceLock::new();
-    LIB.get_or_init(|| {
-        let path = std::env::var("FQS_MANATEE_LIB").ok().filter(|p| !p.trim().is_empty())?;
-        match ManateeLib::load(Path::new(path.trim())) {
-            Ok(lib) => {
-                eprintln!("[fqs] loaded {} ({})", lib.version, lib.path.display());
-                Some(Arc::new(lib))
-            }
-            Err(e) => {
-                eprintln!("[fqs] FQS_MANATEE_LIB: {e:#}");
-                None
-            }
-        }
-    })
-    .clone()
 }
 
 /// The result of the library: its JSON, or its error message.
@@ -110,7 +92,8 @@ impl ManateeLib {
             let query = *lib.get::<QueryFn>(b"fqsm_query\0")?;
             let freq = *lib.get::<FreqFn>(b"fqsm_freq\0")?;
             let free = *lib.get::<FreeFn>(b"fqsm_free\0")?;
-            Ok(ManateeLib { _lib: lib, path: path.to_path_buf(), version, open, close, query, freq, free, corpora: Mutex::new(HashMap::new()) })
+            let check = lib.get::<CheckFn>(b"fqsm_check\0").ok().map(|f| *f);   // from fqs-manatee 0.2
+            Ok(ManateeLib { _lib: lib, path: path.to_path_buf(), version, open, close, query, freq, free, check, corpora: Mutex::new(HashMap::new()) })
         }
     }
 
@@ -135,6 +118,21 @@ impl ManateeLib {
         Ok(h)
     }
 
+    /// {"ok", "checked"} or {"ok": false, "problem"}: is the corpus readable as its registry
+    /// describes it (the token text agrees with the index)? Without fqsm_check (an older library): ok.
+    pub fn check(&self, id: &str, registry: &Path) -> Result<Value> {
+        let Some(check) = self.check else {
+            return Ok(serde_json::json!({ "ok": true, "checked": 0 }));
+        };
+        let h = self.handle(id, registry)?;
+        let h = h.lock().map_err(|_| anyhow!("manatee corpus lock poisoned"))?;
+        let mut err: *mut c_char = std::ptr::null_mut();
+        unsafe {
+            let out = check(h.0, &mut err);
+            take(self.free, out, err)
+        }
+    }
+
     /// {"total", "hits": [{"pos", "end", "left", "kwic", "right"}]}: hits [start, start+size) with
     /// `window` tokens of context of `attr` (default: the corpus's default attribute).
     pub fn query(&self, id: &str, registry: &Path, cql: &str, start: u64, size: u64, window: u32, attr: Option<&str>) -> Result<Value> {
@@ -150,8 +148,6 @@ impl ManateeLib {
     }
 
     /// {"rows": [{"value", "count"}], "groups"}: frequencies by a Manatee criterion ("word 0", …).
-    /// Not used by FQS yet: for frequency programs (`/run`), the next step.
-    #[allow(dead_code)]
     pub fn freq(&self, id: &str, registry: &Path, cql: &str, crit: &str, limit: u64) -> Result<Value> {
         let h = self.handle(id, registry)?;
         let h = h.lock().map_err(|_| anyhow!("manatee corpus lock poisoned"))?;

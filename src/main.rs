@@ -34,6 +34,8 @@ mod fcs;
 mod hot_corpus;
 mod limits;
 mod manatee_lib;
+mod manatee_pool;
+mod manatee_worker;
 mod pando_lib;
 mod scan;
 mod services;
@@ -77,6 +79,9 @@ enum Command {
     AdminToken(AdminTokenArgs),
     /// Frontend modules (KonText, …): what they need
     Frontends(FrontendsArgs),
+    /// A native Manatee worker process (started by `fqs serve`; manatee_pool.rs)
+    #[command(hide = true)]
+    ManateeWorker,
 }
 
 #[derive(Args, Debug)]
@@ -1265,6 +1270,7 @@ async fn main() -> Result<()> {
         Command::Status(args) => handle_status(args)?,
         Command::Reindex(args) => handle_reindex(args)?,
         Command::AdminToken(args) => handle_admin_token(args)?,
+        Command::ManateeWorker => manatee_worker::serve()?,
         Command::Frontends(args) => match args.action {
             FrontendsAction::Paths => {
                 println!("{}", serde_json::to_string_pretty(&services::frontend_write_paths())?);
@@ -2368,7 +2374,7 @@ fn execute_query(
         );
     }
     // manatee: natively when libfqs_manatee is loaded (FQS_MANATEE_LIB; manatee_lib.rs)
-    let manatee_native = backend == "manatee" && manatee_lib::global().is_some();
+    let manatee_native = backend == "manatee" && manatee_pool::global().is_some();
     if backend != "pando" && backend != "cqp" && !manatee_native {
         anyhow::bail!(
             "Resolved backend '{}' is not implemented in fqs query execution. Use backend=pando|cqp, or set preferred_backend / settings.query_backend.",
@@ -2594,7 +2600,7 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
     }
 
     let reindex_worker = !(args.no_reindex_worker || env_truthy("FQS_NO_REINDEX_WORKER"));
-    let _ = manatee_lib::global();   // load native Manatee (FQS_MANATEE_LIB) now, not on the first query
+    let _ = manatee_pool::global();   // start the native Manatee workers (FQS_MANATEE_LIB) now, not on the first query
     let settings_snapshot = Arc::new(build_settings_snapshot(
         &args,
         &db_path,
@@ -5631,7 +5637,7 @@ async fn http_warm(
                 .to_string();
             resolve_cqp_registry(&corpus).1.and_then(|reg| warm::cwb_data_dir(&reg, &name)).map(|d| (d, warm::CWB_PRIORITY))
         }
-        "manatee" if manatee_lib::global().is_some() => manatee_lib::registry_file(&corpus.settings, &corpus.id)
+        "manatee" if manatee_pool::global().is_some() => manatee_lib::registry_file(&corpus.settings, &corpus.id)
             .and_then(|reg| manatee_lib::data_dir(&reg))
             .map(|d| (d, manatee_lib::MANATEE_PRIORITY)),
         _ => None,
@@ -8330,7 +8336,7 @@ fn run_cqp_query(
     })
 }
 
-/// A Manatee corpus natively (libfqs_manatee; manatee_lib.rs), answered in the shape of the CWB
+/// A Manatee corpus natively (libfqs_manatee in a worker process; manatee_pool.rs), answered in the shape of the CWB
 /// route (`done.result`: total, hits with match_start/match_end and their context, kwic lines), so
 /// flexicorp, FCS and the rest read it as they read CWB results.
 fn run_manatee_query(
@@ -8340,13 +8346,16 @@ fn run_manatee_query(
     size: u32,
     query_options: Option<&HttpQueryRequest>,
 ) -> Result<CqpExecResult> {
-    let lib = manatee_lib::global().ok_or_else(|| anyhow::anyhow!("native Manatee is not available (FQS_MANATEE_LIB)"))?;
+    let pool = manatee_pool::global().ok_or_else(|| anyhow::anyhow!("native Manatee is not available (FQS_MANATEE_LIB)"))?;
     let registry = manatee_lib::registry_file(&corpus.settings, &corpus.id).ok_or_else(|| {
         anyhow::anyhow!("no Manatee registry for '{}' (settings.manatee_registry, or MANATEE_REGISTRY)", corpus.id)
     })?;
     let window = query_options.and_then(|q| q.window).unwrap_or(5).max(0) as u32;
     let t0 = Instant::now();
-    let res = lib.query(&corpus.id, &registry, query_text, start as u64, size as u64, window, None)?;
+    let res = pool.call(
+        &corpus.id,
+        json!({ "op": "query", "registry": registry, "cql": query_text, "start": start, "size": size, "window": window }),
+    )?;
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0;
     let total = res.get("total").and_then(Value::as_u64).unwrap_or(0);
     let mut hits = Vec::new();
@@ -8385,8 +8394,8 @@ fn run_manatee_query(
         }
     });
     Ok(CqpExecResult {
-        kind: "fqs-manatee-lib".to_string(),
-        binary: lib.path.display().to_string(),
+        kind: "fqs-manatee-worker".to_string(),
+        binary: pool.lib_path.clone(),
         target: registry.display().to_string(),
         exit_code: 0,
         payload,

@@ -73,7 +73,7 @@ RangeStream *eval(Corpus *c, const char *cql) {
 
 extern "C" {
 
-const char *fqsm_version() { return "fqs-manatee 0.1"; }
+const char *fqsm_version() { return "fqs-manatee 0.2"; }
 
 // Open a corpus: a registry file path (or a name in MANATEE_REGISTRY). NULL and *err on failure.
 void *fqsm_open(const char *registry, char **err) {
@@ -167,6 +167,65 @@ char *fqsm_freq(void *h, const char *cql, const char *crit, long long limit, cha
         set_err(err, e.what());
     } catch (...) {
         set_err(err, "unknown error in the frequencies");
+    }
+    return nullptr;
+}
+
+// Is the corpus readable as its registry describes it? For every positional attribute, a few words of
+// the lexicon: where the index (id2poss) says a word occurs, the token text (pos2id) must read back the
+// same word; and the last position must read. A registry that names the wrong layout (the files
+// written as FD_FGD, the registry without TYPE "FD_FGD") fails here instead of answering wrong text
+// or crashing on context. {"ok": true, "checked": N} or {"ok": false, "problem": "..."}.
+char *fqsm_check(void *h, char **err) {
+    try {
+        Corpus *c = static_cast<Corpus *>(h);
+        std::string attrs = c->get_conf("ATTRLIST");
+        const Position last = c->size() - 1;
+        int checked = 0;
+        size_t from = 0;
+        while (from <= attrs.size()) {
+            size_t comma = attrs.find(',', from);
+            std::string name = attrs.substr(from, comma == std::string::npos ? std::string::npos : comma - from);
+            from = comma == std::string::npos ? attrs.size() + 1 : comma + 1;
+            if (name.empty()) continue;
+            PosAttr *pa = c->get_attr(name);
+            const int range = pa->id_range();
+            if (range <= 0) continue;
+            const int ids[] = {0, range / 3, range / 2, (2 * range) / 3, range - 1};
+            for (int id : ids) {
+                FastStream *fs = pa->id2poss(id);
+                if (!fs) continue;
+                const Position p = fs->peek();
+                const bool has = p < fs->final();
+                delete fs;
+                if (!has) continue;
+                const int back = pa->pos2id(p);
+                if (back != id) {
+                    std::string got = (back >= 0 && back < range) ? pa->id2str(back) : "an id out of range";
+                    return dup("{\"ok\":false,\"problem\":" + [&] {
+                        std::string s;
+                        json_str(s, ("attribute " + name + ": the index has \"" + pa->id2str(id) + "\" at position " +
+                                     std::to_string(p) + ", the token text reads \"" + got +
+                                     "\" (does the registry name the attribute TYPE the corpus was compiled with?)").c_str());
+                        return s;
+                    }() + "}");
+                }
+                ++checked;
+            }
+            if (last >= 0) {
+                const int id = pa->pos2id(last);
+                if (id < 0 || id >= range) {
+                    std::string s;
+                    json_str(s, ("attribute " + name + ": the last position does not read (id " + std::to_string(id) + ")").c_str());
+                    return dup("{\"ok\":false,\"problem\":" + s + "}");
+                }
+            }
+        }
+        return dup("{\"ok\":true,\"checked\":" + std::to_string(checked) + "}");
+    } catch (std::exception &e) {
+        set_err(err, e.what());
+    } catch (...) {
+        set_err(err, "unknown error checking the corpus");
     }
     return nullptr;
 }

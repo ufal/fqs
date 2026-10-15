@@ -10,7 +10,8 @@ Checks: GET /health; GET /corpora; per corpus a one-hit query twice (cold and wa
 the file cache, NFS and the warm-up are about; the engine's own time, so a tunnel's latency does not
 hide it, and the round trip) and POST /warm; the FCS endpoint (explain and a search). One row per
 corpus: engine, ok, times, hits (≥ while the engine is still counting), the error if any. Manatee
-corpora are listed, not queried: KonText runs them. Exit status 1 when anything failed.
+corpora are queried when the FQS has native Manatee (FQS_MANATEE_LIB), else noted as KonText's.
+Exit status 1 when anything failed.
 
 --secret-file: a file with FQS_SECRET=… to sign as --role (default admin with a secret, else visitor,
 unsigned). The secret is read, never printed.
