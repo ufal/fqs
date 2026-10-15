@@ -23,19 +23,24 @@ esac
 CXX=${CXX:-c++}
 flags="-std=gnu++11 -O2 -fPIC -shared -DHAVE_CONFIG_H"
 src_inc() { echo "-I$1 -I$1/finlib -I$1/corp -I$1/concord -I$1/query -I$1/hat-trie/src"; }
+has_lib() { for f in "$1"/libmanatee.so* "$1"/libmanatee*.dylib; do [ -e "$f" ] && return 0; done; return 1; }   # a shared libmanatee in folder $1
 
 if [ -n "${MANATEE_PREFIX:-}" ]; then
 	P=$(cd "$MANATEE_PREFIX" && pwd)
 	hdr="$P/include/manatee"
-	[ -f "$hdr/corpus.hh" ] || { echo "no Manatee headers in $hdr" >&2; exit 1; }
-	ls "$P"/lib/libmanatee.so* "$P"/lib/libmanatee*.dylib >/dev/null 2>&1 || { echo "no libmanatee in $P/lib" >&2; exit 1; }
-	inc="-I$hdr"
-	if [ ! -f "$hdr/config.hh" ]; then
-		[ -n "${MANATEE_SRC:-}" ] && [ -f "$MANATEE_SRC/config.hh" ] || {
-			echo "config.hh was not installed in $hdr: set MANATEE_SRC to a manatee-open source tree of the same version, ./configure'd here" >&2
+	has_lib "$P/lib" || { echo "no libmanatee in $P/lib" >&2; exit 1; }
+	if [ -n "${MANATEE_SRC:-}" ]; then
+		# the headers (and config.hh) of a source tree of the same version, configured here: an
+		# installation often has only part of the headers and never config.hh
+		S=$(cd "$MANATEE_SRC" && pwd)
+		[ -f "$S/config.hh" ] || { echo "missing $S/config.hh: run ./configure in $S (with the options Manatee was built with)" >&2; exit 1; }
+		inc=$(src_inc "$S")
+	else
+		[ -f "$hdr/corpus.hh" ] && [ -f "$hdr/config.hh" ] || {
+			echo "the headers in $hdr are incomplete (corpus.hh, config.hh): set MANATEE_SRC to a manatee-open source tree of the same version, ./configure'd here" >&2
 			exit 1
 		}
-		inc="-I$(cd "$MANATEE_SRC" && pwd) $inc"
+		inc="-I$hdr"
 	fi
 	$CXX $flags $inc "$here/fqs_manatee.cc" -L"$P/lib" -lmanatee -Wl,-rpath,"$P/lib" $sys -o "$out"
 	echo "built $out (against the installed $P/lib/libmanatee)"
@@ -54,6 +59,6 @@ if [ -f "$M/src/.libs/libmanatee.a" ] && [ -f "$M/src/.libs/libbuiltinmanatee.a"
 fi
 echo "static link not possible here (see manatee/.build-static.log); linking the tree's shared libmanatee" >&2
 lib="$M/src/.libs"
-ls "$lib"/libmanatee.so* "$lib"/libmanatee*.dylib >/dev/null 2>&1 || { echo "no shared libmanatee in $lib either" >&2; exit 1; }
+has_lib "$lib" || { echo "no shared libmanatee in $lib either" >&2; exit 1; }
 $CXX $flags $inc "$here/fqs_manatee.cc" -L"$lib" -lmanatee -Wl,-rpath,"$lib" $sys -o "$out"
 echo "built $out (against $lib/libmanatee, rpath recorded)"
