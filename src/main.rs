@@ -8350,9 +8350,14 @@ fn run_flexicorp_cqp_query(
             cmd.arg("--corpus").arg(corpus_name);
         }
 
-        let output = cmd
-            .output()
-            .with_context(|| format!("Failed to execute flexicorp query using '{python_bin}'"))?;
+        // a candidate that cannot be started (missing venv, no permission) → try the next one
+        let output = match cmd.output() {
+            Ok(o) => o,
+            Err(e) => {
+                last_err = format!("{python_bin}: cannot be started ({e})");
+                continue;
+            }
+        };
         let exit_code = output.status.code().unwrap_or(-1);
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();

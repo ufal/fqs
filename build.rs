@@ -13,8 +13,11 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 fn main() {
-    let commit = git(&["describe", "--always", "--dirty", "--abbrev=7"]);
-    let date = git(&["log", "-1", "--format=%cs"]);
+    // a build from a copy without .git (the stack installer copies the checkout): the
+    // installer passes what git would say, as FQS_BUILD_COMMIT / FQS_BUILD_DATE
+    let env = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
+    let commit = git(&["describe", "--always", "--dirty", "--abbrev=7"]).or_else(|| env("FQS_BUILD_COMMIT"));
+    let date = git(&["log", "-1", "--format=%cs"]).or_else(|| env("FQS_BUILD_DATE"));
     let stamp = match (commit, date) {
         (Some(c), Some(d)) => format!("{c}, {d}"),
         (Some(c), None) => c,
@@ -29,4 +32,6 @@ fn main() {
     for p in [".git/HEAD", ".git/index", ".git/refs"] {
         println!("cargo:rerun-if-changed={p}");
     }
+    println!("cargo:rerun-if-env-changed=FQS_BUILD_COMMIT");
+    println!("cargo:rerun-if-env-changed=FQS_BUILD_DATE");
 }

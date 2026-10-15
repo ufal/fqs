@@ -31,7 +31,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 thread_local! {
     /// Set by `acquire` on this thread: Some(ms) when it opened the corpus.
@@ -75,6 +75,33 @@ struct WarmEntry {
     opened_at: Instant,
     /// Requests served since it was opened.
     requests: u64,
+    /// The index files it was opened from (`index_stamp`), compared now and then on acquire.
+    stamp: Vec<(PathBuf, Option<SystemTime>)>,
+    stamp_checked: Instant,
+}
+
+/// How often a warm corpus checks whether its index or overlays changed on disk.
+const STAMP_CHECK_EVERY: Duration = Duration::from_secs(2);
+
+/// What a warm handle depends on: the index's corpus.info (pando-index writes it last, so a
+/// reindex changes it) and every user overlay in `<index>/overlays/<layer>/` (custom layers
+/// rebuilt by a TEITOK page). A different stamp means: reopen, so the engine sees the new files.
+fn index_stamp(index_dir: &Path) -> Vec<(PathBuf, Option<SystemTime>)> {
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let main = index_dir.join("corpus.info");
+    let mut out = vec![(main.clone(), mtime(&main))];
+    if let Ok(rd) = std::fs::read_dir(index_dir.join("overlays")) {
+        let mut ov: Vec<(PathBuf, Option<SystemTime>)> = rd
+            .flatten()
+            .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))   // being built
+            .map(|e| e.path().join("corpus.info"))
+            .filter(|p| p.is_file())
+            .map(|p| { let t = mtime(&p); (p, t) })
+            .collect();
+        ov.sort();
+        out.extend(ov);
+    }
+    out
 }
 
 // SAFETY: ServerApi handles are concurrent-safe for queries; we only move ctx
@@ -213,14 +240,29 @@ impl HotCorpusManager {
                    open_options: Option<&str>) -> Result<()> {
         let mut g = self.inner.lock().expect("hcm lock");
         if let Some(e) = g.get_mut(corpus_id) {
-            e.last_used = Instant::now();
-            e.refs += 1;
-            e.requests += 1;
-            return Ok(());
+            // A handle in use keeps serving; an unused one whose files changed is reopened below.
+            let stale = e.refs == 0
+                && e.stamp_checked.elapsed() >= STAMP_CHECK_EVERY
+                && {
+                    e.stamp_checked = Instant::now();
+                    index_stamp(&e.index_dir) != e.stamp
+                }
+                && self.lib.busy(e.ctx) == 0;
+            if !stale {
+                e.last_used = Instant::now();
+                e.refs += 1;
+                e.requests += 1;
+                return Ok(());
+            }
+            if let Some(e) = g.remove(corpus_id) {
+                self.lib.close(e.ctx);
+                self.log_close(&e, "index_changed", None, g.len());
+            }
         }
         // Make room only for a genuinely new corpus (never inline in release()).
         self.make_room_locked(&mut g, corpus_id);
         let opts = open_options.or(self.cfg.open_options.as_deref());
+        let stamp = index_stamp(index_dir);
         let t0 = Instant::now();
         let ctx = match self.lib.open_with(index_dir, preload, opts) {
             Ok(c) => c,
@@ -246,6 +288,8 @@ impl HotCorpusManager {
                 refs: 1,
                 opened_at: now,
                 requests: 1,
+                stamp,
+                stamp_checked: now,
             },
         );
         self.log_warm("warm_open", vec![
@@ -570,4 +614,27 @@ pub fn pando_query_body(
         }
     }
     body.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_stamp_sees_new_overlay_and_reindex() {
+        let dir = std::env::temp_dir().join(format!("fqs-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("overlays/ann")).unwrap();
+        std::fs::write(dir.join("corpus.info"), "size=10\n").unwrap();
+        let first = index_stamp(&dir);
+        assert_eq!(first.len(), 1, "an overlay folder without corpus.info is still being built");
+        std::fs::write(dir.join("overlays/ann/corpus.info"), "size=10\n").unwrap();
+        let second = index_stamp(&dir);
+        assert_ne!(first, second);
+        assert_eq!(second, index_stamp(&dir));
+        let later = SystemTime::now() + Duration::from_secs(5);
+        std::fs::File::options().write(true).open(dir.join("corpus.info")).unwrap().set_modified(later).unwrap();
+        assert_ne!(second, index_stamp(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
