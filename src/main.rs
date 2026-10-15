@@ -36,6 +36,7 @@ mod limits;
 mod pando_lib;
 mod scan;
 mod services;
+mod warm;
 mod frontends;
 
 use hot_corpus::{
@@ -556,6 +557,8 @@ struct HttpAppState {
     admin_base_href: Option<String>,
     /// Report-only snapshot of process settings (CLI / env / fqs.json). No secrets.
     settings_snapshot: Arc<Value>,
+    /// `POST /warm`: corpora read into the file cache ahead of their first query (warm.rs).
+    warmer: Arc<warm::Warmer>,
 }
 
 /// Hot-path corpus lookup: all rows in memory, from SQLite.
@@ -2585,6 +2588,7 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
             .as_deref()
             .and_then(|s| admin::normalize_admin_base_href(Some(s))),
         settings_snapshot,
+        warmer: Arc::new(warm::Warmer::from_env()),
     };
     if let Some(dir) = &admin_dir {
         if let Some((ah, ap)) = &admin_bind {
@@ -2633,6 +2637,7 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         .route("/reindex/jobs/mark-started", post(http_reindex_mark_started))
         .route("/reindex/jobs/mark-finished", post(http_reindex_mark_finished))
         .route("/query", post(http_query))
+        .route("/warm", post(http_warm))
         .route("/backends", get(http_backends))
         .route("/info", get(http_pando_info))
         .route("/context", get(http_pando_context))
@@ -4895,6 +4900,7 @@ async fn http_root_with_state(State(state): State<HttpAppState>) -> Json<Value> 
             json!({"method":"GET", "path":"/context", "description":"Pando KWIC context (?corpus=&pos=&left=&right=)"}),
             json!({"method":"GET", "path":"/fragment", "description":"TEITOK XML fragment from xidx (?corpus=&pos=&end=&context=&context_scope=) for KonText token_connect"}),
             json!({"method":"GET", "path":"/status", "description":"Pando async total job (?corpus=&job=)"}),
+            json!({"method":"POST", "path":"/warm", "description":"Read a corpus's main index files into the file cache ahead of its first query ({corpus}); a frontend calls it when its search page for the corpus opens"}),
             json!({"method":"POST", "path":"/run", "description":"Pando CQL program (JSON: corpus, cql|query, session_id?, …)"}),
             json!({"method":"POST", "path":"/session", "description":"Pando hit-set session (JSON: corpus, session_id?, ttl_s?); /query name / from and /run use it"}),
             json!({"method":"GET", "path":"/session", "description":"Pando session's hit sets (?corpus=&session_id=)"}),
@@ -5535,6 +5541,71 @@ async fn http_query_inner(
         None,
     );
     Ok(Json(response))
+}
+
+#[derive(Debug, Deserialize)]
+struct WarmRequest {
+    corpus: String,
+}
+
+/// `POST /warm {"corpus": id}`: a frontend says the corpus is about to be queried (TEITOK's
+/// search page opening; KonText's choice of a corpus). Its main index files are read into the
+/// file cache in the background (warm.rs; a pando corpus is also opened into the warm pool), so
+/// the first query does not pay the cold reads. Answers at once: accepted, recent (warmed within
+/// the cooldown), busy (too many running) or skipped (an engine FQS does not read itself).
+async fn http_warm(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    Json(req): Json<WarmRequest>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    gate_corpus(&state, &headers, &req.corpus)?;
+    let corpus = state.catalog.get(&req.corpus).map_err(to_http_err)?;
+    let backend = resolve_effective_backend(&corpus).unwrap_or_default();
+    let target: Option<(PathBuf, &'static [&'static str])> = match backend.as_str() {
+        "pando" => resolve_pando_index_dir(&corpus).ok().map(|d| (d, warm::PANDO_PRIORITY)),
+        "cqp" => {
+            let name = corpus
+                .settings
+                .get("corpus_name")
+                .and_then(|v| v.as_str())
+                .or_else(|| corpus.settings.get("cqp_corpus").and_then(|v| v.as_str()))
+                .unwrap_or(&corpus.id)
+                .to_string();
+            resolve_cqp_registry(&corpus).1.and_then(|reg| warm::cwb_data_dir(&reg, &name)).map(|d| (d, warm::CWB_PRIORITY))
+        }
+        _ => None,
+    };
+    let Some((dir, priority)) = target else {
+        return Ok(Json(json!({ "ok": true, "corpus": corpus.id, "status": "skipped", "backend": backend })));
+    };
+    let outcome = state.warmer.try_start(&corpus.id);
+    if outcome == warm::Outcome::Accepted {
+        let warmer = state.warmer.clone();
+        let hcm = state.pando_hcm.clone();
+        let activity = state.activity.clone();
+        let open_opts = state.limits.engine_options_for(&corpus.settings);
+        let id = corpus.id.clone();
+        let is_pando = backend == "pando";
+        tokio::task::spawn_blocking(move || {
+            let t0 = Instant::now();
+            if is_pando {
+                if let Some(hcm) = hcm {
+                    let _ = HotGuard::acquire(hcm, &id, &dir, false, Some(&open_opts));
+                }
+            }
+            let (files, bytes) = warm::read_into_cache(&dir, priority, warmer.max_bytes);
+            warmer.finish();
+            if let Some(a) = activity {
+                a.event("warm", activity::fields(vec![
+                    ("corpus", json!(id)),
+                    ("files", json!(files)),
+                    ("bytes", json!(bytes)),
+                    ("elapsed_ms", json!(t0.elapsed().as_millis() as u64)),
+                ]));
+            }
+        });
+    }
+    Ok(Json(json!({ "ok": true, "corpus": corpus.id, "status": outcome.as_str(), "backend": backend })))
 }
 
 #[derive(Debug, Deserialize)]
