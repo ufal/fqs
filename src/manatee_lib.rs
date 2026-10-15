@@ -90,7 +90,17 @@ unsafe fn take(free: FreeFn, out: *mut c_char, err: *mut c_char) -> Result<Value
 
 impl ManateeLib {
     pub fn load(path: &Path) -> Result<Self> {
+        // Every symbol resolved now (RTLD_NOW), not on first use: a library that misses one (an
+        // incomplete libmanatee.so lacks fsa3's fsa_init) is refused here, at start-up, instead of
+        // the process exiting on the first query ("symbol lookup error").
         // SAFETY: the C interface of manatee/fqs_manatee.cc
+        #[cfg(unix)]
+        let lib: Library = unsafe {
+            libloading::os::unix::Library::open(Some(path), libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_LOCAL)
+        }
+        .map(Library::from)
+        .with_context(|| format!("failed to load {} (all its symbols must resolve)", path.display()))?;
+        #[cfg(not(unix))]
         let lib = unsafe { Library::new(path) }.with_context(|| format!("failed to load {}", path.display()))?;
         unsafe {
             let version: Symbol<VersionFn> = lib.get(b"fqsm_version\0")?;

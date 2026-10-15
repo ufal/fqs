@@ -1,17 +1,18 @@
 #!/bin/sh
-# Build libfqs_manatee (native Manatee for FQS; dev/MANATEE-NATIVE.md). Build it against the Manatee
-# KonText uses (same version, same library). Two ways:
+# Build libfqs_manatee (native Manatee for FQS; dev/MANATEE-NATIVE.md) against the manatee-open
+# version KonText uses:
 #
-#   MANATEE_PREFIX=/usr/local sh manatee/build.sh
-#       an installed manatee-open: headers in <prefix>/include/manatee, linked against the installed
-#       <prefix>/lib/libmanatee (rpath recorded). If config.hh was not installed with the headers,
-#       also set MANATEE_SRC to a manatee-open source tree of the same version, ./configure'd on this
-#       machine (configure generates config.hh; no make needed).
+#   MANATEE_SRC=/path/to/manatee-open sh manatee/build.sh        (recommended)
+#       a source tree, configured with the options KonText's Manatee was built with and built
+#       (./configure --with-pcre2 --disable-python && make; --disable-python avoids SWIG).
+#       Manatee's internal library libbuiltinmanatee.a (everything: finlib, corp, concord, query,
+#       fsa3, hat-trie, the built-in dynamic attribute functions; position-independent) goes into
+#       the library, which then needs no Manatee at runtime.
 #
-#   MANATEE_SRC=/path/to/manatee-open-2.225.8 sh manatee/build.sh
-#       a built source tree (configure && make): first statically (libmanatee.a and
-#       libbuiltinmanatee.a into the library, nothing needed at runtime); where static archives are
-#       not position-independent (Linux libtool builds), against the tree's shared libmanatee (rpath).
+#   MANATEE_PREFIX=/usr/local MANATEE_SRC=/path/to/configured/tree sh manatee/build.sh
+#       linked against an installed libmanatee instead. Careful: an installed libmanatee.so can be
+#       incomplete (it uses fsa3's fsa_init without containing it; KonText's Python module supplies
+#       it): FQS then refuses the library at start-up. Prefer the first way.
 #
 # → manatee/libfqs_manatee.{dylib,so}; point FQS at it with FQS_MANATEE_LIB.
 set -eu
@@ -24,41 +25,31 @@ CXX=${CXX:-c++}
 flags="-std=gnu++11 -O2 -fPIC -shared -DHAVE_CONFIG_H"
 src_inc() { echo "-I$1 -I$1/finlib -I$1/corp -I$1/concord -I$1/query -I$1/hat-trie/src"; }
 has_lib() { for f in "$1"/libmanatee.so* "$1"/libmanatee*.dylib; do [ -e "$f" ] && return 0; done; return 1; }   # a shared libmanatee in folder $1
+# the regex library Manatee was configured with (config.hh: USE_PCRE2 / USE_PCRE)
+pcre() { if grep -q "^#define USE_PCRE2 " "$1/config.hh"; then echo "-lpcre2-8"; elif grep -q "^#define USE_PCRE " "$1/config.hh"; then echo "-lpcre"; fi; }
+
+: "${MANATEE_SRC:?set MANATEE_SRC to a manatee-open source tree (configured; built unless MANATEE_PREFIX is set)}"
+S=$(cd "$MANATEE_SRC" && pwd)
+[ -f "$S/config.hh" ] || { echo "missing $S/config.hh: run ./configure in $S (with the options Manatee was built with)" >&2; exit 1; }
+inc=$(src_inc "$S")
+regex=$(pcre "$S")
 
 if [ -n "${MANATEE_PREFIX:-}" ]; then
 	P=$(cd "$MANATEE_PREFIX" && pwd)
-	hdr="$P/include/manatee"
 	has_lib "$P/lib" || { echo "no libmanatee in $P/lib" >&2; exit 1; }
-	if [ -n "${MANATEE_SRC:-}" ]; then
-		# the headers (and config.hh) of a source tree of the same version, configured here: an
-		# installation often has only part of the headers and never config.hh
-		S=$(cd "$MANATEE_SRC" && pwd)
-		[ -f "$S/config.hh" ] || { echo "missing $S/config.hh: run ./configure in $S (with the options Manatee was built with)" >&2; exit 1; }
-		inc=$(src_inc "$S")
-	else
-		[ -f "$hdr/corpus.hh" ] && [ -f "$hdr/config.hh" ] || {
-			echo "the headers in $hdr are incomplete (corpus.hh, config.hh): set MANATEE_SRC to a manatee-open source tree of the same version, ./configure'd here" >&2
-			exit 1
-		}
-		inc="-I$hdr"
-	fi
-	$CXX $flags $inc "$here/fqs_manatee.cc" -L"$P/lib" -lmanatee -Wl,-rpath,"$P/lib" $sys -o "$out"
-	echo "built $out (against the installed $P/lib/libmanatee)"
+	$CXX $flags $inc "$here/fqs_manatee.cc" -L"$P/lib" -lmanatee -Wl,-rpath,"$P/lib" $regex $sys -o "$out"
+	echo "built $out (against the installed $P/lib/libmanatee; if FQS refuses it at start-up, use the source tree)"
 	exit 0
 fi
 
-: "${MANATEE_SRC:?set MANATEE_PREFIX (an installed Manatee) or MANATEE_SRC (a built source tree)}"
-M=$(cd "$MANATEE_SRC" && pwd)
-[ -f "$M/config.hh" ] || { echo "missing $M/config.hh: build manatee-open first (configure && make)" >&2; exit 1; }
-inc=$(src_inc "$M")
-if [ -f "$M/src/.libs/libmanatee.a" ] && [ -f "$M/src/.libs/libbuiltinmanatee.a" ] &&
-	$CXX $flags $inc "$here/fqs_manatee.cc" "$M/src/.libs/libmanatee.a" "$M/src/.libs/libbuiltinmanatee.a" $sys -o "$out" 2>"$here/.build-static.log"; then
+lib="$S/src/.libs"
+[ -f "$lib/libbuiltinmanatee.a" ] || { echo "missing $lib/libbuiltinmanatee.a: run make in $S" >&2; exit 1; }
+if $CXX $flags $inc "$here/fqs_manatee.cc" "$lib/libbuiltinmanatee.a" $regex $sys -o "$out" 2>"$here/.build-static.log"; then
 	rm -f "$here/.build-static.log"
-	echo "built $out (Manatee linked in statically)"
+	echo "built $out (Manatee linked in: $lib/libbuiltinmanatee.a)"
 	exit 0
 fi
-echo "static link not possible here (see manatee/.build-static.log); linking the tree's shared libmanatee" >&2
-lib="$M/src/.libs"
+echo "linking libbuiltinmanatee.a failed (see manatee/.build-static.log); trying the tree's shared libmanatee" >&2
 has_lib "$lib" || { echo "no shared libmanatee in $lib either" >&2; exit 1; }
-$CXX $flags $inc "$here/fqs_manatee.cc" -L"$lib" -lmanatee -Wl,-rpath,"$lib" $sys -o "$out"
+$CXX $flags $inc "$here/fqs_manatee.cc" -L"$lib" -lmanatee -Wl,-rpath,"$lib" $regex $sys -o "$out"
 echo "built $out (against $lib/libmanatee, rpath recorded)"
