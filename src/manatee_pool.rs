@@ -171,6 +171,9 @@ impl Pool {
             bail!("{}", hello.get("error").and_then(Value::as_str).unwrap_or("the Manatee worker could not load the library"));
         }
         let version = hello.pointer("/result/version").and_then(Value::as_str).unwrap_or("fqs-manatee").to_string();
+        if hello.pointer("/result/check").and_then(Value::as_bool) != Some(true) {
+            eprintln!("[fqs] warning: {version} has no corpus check (fqsm_check): rebuild the library (manatee/build.sh, or install-stack.pl --manatee-src DIR)");
+        }
         let mut workers = vec![Mutex::new(Some(first))];
         workers.extend((1..n.max(1)).map(|_| Mutex::new(None)));   // the others start on first use
         Ok(Pool {

@@ -120,6 +120,11 @@ impl ManateeLib {
 
     /// {"ok", "checked"} or {"ok": false, "problem"}: is the corpus readable as its registry
     /// describes it (the token text agrees with the index)? Without fqsm_check (an older library): ok.
+    /// Whether the library has the corpus check (fqs-manatee 0.2 and later).
+    pub fn has_check(&self) -> bool {
+        self.check.is_some()
+    }
+
     pub fn check(&self, id: &str, registry: &Path) -> Result<Value> {
         let Some(check) = self.check else {
             return Ok(serde_json::json!({ "ok": true, "checked": 0 }));

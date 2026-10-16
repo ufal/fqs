@@ -69,7 +69,7 @@ fn n(req: &Value, key: &str, default: u64) -> u64 {
 fn handle(lib: &ManateeLib, req: &Value, checked: &mut HashMap<String, std::result::Result<(), String>>) -> std::result::Result<Value, Failure> {
     let op = s(req, "op");
     if op == "hello" {
-        return Ok(json!({ "version": lib.version, "path": lib.path.display().to_string() }));
+        return Ok(json!({ "version": lib.version, "path": lib.path.display().to_string(), "check": lib.has_check() }));
     }
     let corpus = s(req, "corpus");
     let registry = PathBuf::from(s(req, "registry"));
