@@ -6358,9 +6358,8 @@ fn fcs_engine(
                 if let (Some(pool), Some(registry)) = (manatee_pool::global(), manatee_lib::registry_file(&corpus.settings, &corpus.id)) {
                     let id = corpus.id.clone();
                     let transport: fcs::engine::ManateeTransport = Box::new(move |mut req: Value| {
-                        req["op"] = json!("kwic");
                         req["registry"] = json!(registry);
-                        pool.call(&id, req).map_err(|e| fcs_manatee_error(&format!("{e:#}")))
+                        pool.kwic(&id, req).map_err(|e| fcs_manatee_error(&format!("{e:#}")))
                     });
                     return Ok(Box::new(fcs::engine::ManateeEngine { transport }));
                 }
@@ -8385,9 +8384,9 @@ fn run_manatee_query(
         .map(fcs::engine::manatee_struct_attr)
         .or_else(|| manatee_lib::fullref(&registry));
     let t0 = Instant::now();
-    let res = pool.call(
+    let res = pool.kwic(
         &corpus.id,
-        json!({ "op": "kwic", "registry": registry, "cql": query_text, "start": start, "size": size, "window": window, "doc_attr": doc_attr }),
+        json!({ "registry": registry, "cql": query_text, "start": start, "size": size, "window": window, "doc_attr": doc_attr }),
     )?;
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0;
     let total = res.get("total").and_then(Value::as_u64).unwrap_or(0);

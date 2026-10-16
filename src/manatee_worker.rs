@@ -3,7 +3,8 @@
 //! stdout, so that a crash in Manatee ends this process and not FQS.
 //!
 //! Requests: {"op": "hello"} | {"op": "query", "corpus", "registry", "cql", "start", "size",
-//! "window", "attr"?, "skip_check"?} | {"op": "kwic", …as query, "attrs": [..], "doc_attr"?} |
+//! "window", "attr"?, "skip_check"?} | {"op": "kwic", …as query, "attrs": [..], "doc_attr"?,
+//! "count"? (false: walk only to the end of the page)} |
 //! {"op": "freq", "corpus", "registry", "cql", "crit", "limit"}.
 //! Answers: {"ok": true, "result"} or {"ok": false, "error", "check"?}, each line starting with
 //! [`MARK`]: the library may write to stdout itself, and such lines are not answers.
@@ -107,7 +108,8 @@ fn handle(lib: &ManateeLib, req: &Value, checked: &mut HashMap<String, std::resu
                 _ => vec![],
             };
             let doc = req.get("doc_attr").and_then(Value::as_str).filter(|d| !d.is_empty());
-            Ok(lib.kwic(corpus, &registry, s(req, "cql"), n(req, "start", 0), n(req, "size", 20), n(req, "window", 5) as u32, &attrs, doc)?)
+            let count = req.get("count").and_then(Value::as_bool).unwrap_or(true);
+            Ok(lib.kwic(corpus, &registry, s(req, "cql"), n(req, "start", 0), n(req, "size", 20), n(req, "window", 5) as u32, &attrs, doc, count)?)
         }
         "freq" => Ok(lib.freq(corpus, &registry, s(req, "cql"), s(req, "crit"), n(req, "limit", 0))?),
         other => Err(anyhow!("unknown op '{other}'").into()),

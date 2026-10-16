@@ -7,6 +7,11 @@
 //! FQS_MANATEE_LIB: the library (without it, no native Manatee, as before);
 //! FQS_MANATEE_WORKERS: the number of workers (default 2; also how many Manatee queries run at once);
 //! FQS_MANATEE_TIMEOUT_SECS: the longest a query may run (default 300).
+//!
+//! Totals: a query's total, once counted, is kept for [`TOTAL_TTL`] (per corpus, registry and query
+//! text; at most [`TOTALS_MAX`]). Another page of the same query, or KonText's second request
+//! (submit, then the page), then walks the result only to the end of the page instead of counting
+//! every hit again. Whole results are not kept (33M hits are ~0.5 GB of positions).
 
 use crate::manatee_worker::MARK;
 use anyhow::{anyhow, bail, Context, Result};
@@ -18,6 +23,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+/// How long a counted total is reused, and how many are kept.
+pub const TOTAL_TTL: Duration = Duration::from_secs(600);
+pub const TOTALS_MAX: usize = 2000;
 
 /// Two crashes on a corpus within this time: the corpus is not queried for this long.
 const QUARANTINE: Duration = Duration::from_secs(600);
@@ -39,6 +48,8 @@ pub struct Pool {
     checked: Mutex<HashSet<String>>,
     /// corpus → (crashes, since)
     crashes: Mutex<HashMap<String, (u32, Instant)>>,
+    /// (corpus, registry, query) → (total, counted at)
+    totals: Mutex<HashMap<(String, String, String), (u64, Instant)>>,
 }
 
 /// The pool, started once (None without FQS_MANATEE_LIB, or when a worker cannot load the library:
@@ -184,6 +195,7 @@ impl Pool {
             timeout,
             checked: Mutex::new(HashSet::new()),
             crashes: Mutex::new(HashMap::new()),
+            totals: Mutex::new(HashMap::new()),
         })
     }
 
@@ -218,6 +230,45 @@ impl Pool {
             *e = (0, Instant::now());
         }
         e.0 += 1;
+    }
+
+    /// A `kwic` request ({"registry", "cql", "start", "size", …}) with the total remembered: when the
+    /// query's total is known (counted within TOTAL_TTL), the worker walks only to the end of the
+    /// page and the answer gets the known total ("total_reused": true); else it counts, and the
+    /// total is kept.
+    pub fn kwic(&self, corpus: &str, mut req: Value) -> Result<Value> {
+        let key = (
+            corpus.to_string(),
+            req.get("registry").and_then(Value::as_str).unwrap_or("").to_string(),
+            req.get("cql").and_then(Value::as_str).unwrap_or("").trim().to_string(),
+        );
+        let known = {
+            let map = self.totals.lock().unwrap_or_else(|p| p.into_inner());
+            map.get(&key).filter(|(_, at)| at.elapsed() < TOTAL_TTL).map(|(t, _)| *t)
+        };
+        req["op"] = json!("kwic");
+        req["count"] = json!(known.is_none());
+        let mut res = self.call(corpus, req)?;
+        match known {
+            Some(total) => {
+                res["total"] = json!(total);
+                res["total_reused"] = json!(true);
+            }
+            None if res.get("counted").and_then(Value::as_bool) != Some(false) => {
+                if let Some(total) = res.get("total").and_then(Value::as_u64) {
+                    let mut map = self.totals.lock().unwrap_or_else(|p| p.into_inner());
+                    if map.len() >= TOTALS_MAX {
+                        map.retain(|_, (_, at)| at.elapsed() < TOTAL_TTL);
+                        if map.len() >= TOTALS_MAX {
+                            map.clear();
+                        }
+                    }
+                    map.insert(key, (total, Instant::now()));
+                }
+            }
+            None => {}
+        }
+        Ok(res)
     }
 
     /// One request for `corpus` ({"op": "query" | "freq", "registry", …}): the worker's result, or an

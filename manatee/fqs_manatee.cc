@@ -71,15 +71,17 @@ RangeStream *eval(Corpus *c, const char *cql) {
 }
 
 // Walk a query's result: `fn(beg, end)` for hits [start, start+size); the total (exact: every hit
-// is walked).
+// is walked), or with `count_all` false the hits up to the end of the page only (then the total is
+// exact only when it is below start+size: the result ended inside the page).
 template <class Fn>
-long long walk(Corpus *c, const char *cql, long long start, long long size, Fn fn) {
+long long walk(Corpus *c, const char *cql, long long start, long long size, Fn fn, bool count_all = true) {
     RangeStream *rs = eval(c, cql);
     long long total = 0;
     try {
         while (!rs->end()) {
             if (total >= start && total < start + size) fn(rs->peek_beg(), rs->peek_end());
             ++total;
+            if (!count_all && total >= start + size) break;
             rs->next();
         }
     } catch (...) {
@@ -94,7 +96,7 @@ long long walk(Corpus *c, const char *cql, long long start, long long size, Fn f
 
 extern "C" {
 
-const char *fqsm_version() { return "fqs-manatee 0.3"; }
+const char *fqsm_version() { return "fqs-manatee 0.4"; }
 
 // Open a corpus: a registry file path (or a name in MANATEE_REGISTRY). NULL and *err on failure.
 void *fqsm_open(const char *registry, char **err) {
@@ -159,8 +161,19 @@ char *fqsm_query(void *h, const char *cql, long long start, long long size, int 
 // separated positional attributes; empty: the default attribute), `window` tokens of context on each
 // side, and `doc` the value of the structure attribute `doc_attr` ("doc.id"; empty: none) at the hit.
 // For FCS (layers, the document) and pando-shaped answers.
+char *fqsm_kwic_page(void *h, const char *cql, long long start, long long size, int window, const char *attrs,
+                     const char *doc_attr, int count_all, char **err);
+
 char *fqsm_kwic(void *h, const char *cql, long long start, long long size, int window, const char *attrs,
                 const char *doc_attr, char **err) {
+    return fqsm_kwic_page(h, cql, start, size, window, attrs, doc_attr, 1, err);
+}
+
+// fqsm_kwic, but with `count_all` 0 the result is walked only up to the end of the page: for a
+// query whose total FQS already knows (another page, KonText's second request). "total" is then
+// the hits seen, "counted": false.
+char *fqsm_kwic_page(void *h, const char *cql, long long start, long long size, int window, const char *attrs,
+                     const char *doc_attr, int count_all, char **err) {
     try {
         Corpus *c = static_cast<Corpus *>(h);
         std::vector<std::string> names;
@@ -219,13 +232,14 @@ char *fqsm_kwic(void *h, const char *cql, long long start, long long size, int w
             hits += ",\"right\":";
             tokens(hits, e, re);
             hits += '}';
-        });
+        }, count_all != 0);
         std::string an;
         for (size_t i = 0; i < names.size(); ++i) {
             if (i) an += ',';
             json_str(an, names[i].c_str());
         }
-        return dup("{\"total\":" + std::to_string(total) + ",\"attrs\":[" + an + "],\"hits\":[" + hits + "]}");
+        return dup("{\"total\":" + std::to_string(total) + ",\"counted\":" + (count_all ? "true" : "false") +
+                   ",\"attrs\":[" + an + "],\"hits\":[" + hits + "]}");
     } catch (std::exception &e) {
         set_err(err, e.what());
     } catch (...) {

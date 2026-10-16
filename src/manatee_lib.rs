@@ -23,6 +23,7 @@ type FreeFn = unsafe extern "C" fn(*mut c_char);
 type VersionFn = unsafe extern "C" fn() -> *const c_char;
 type CheckFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_char) -> *mut c_char;
 type KwicFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_longlong, c_longlong, c_int, *const c_char, *const c_char, *mut *mut c_char) -> *mut c_char;
+type KwicPageFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_longlong, c_longlong, c_int, *const c_char, *const c_char, c_int, *mut *mut c_char) -> *mut c_char;
 
 /// An open corpus (a `Corpus *` inside the library).
 struct Handle(*mut c_void);
@@ -40,6 +41,7 @@ pub struct ManateeLib {
     free: FreeFn,
     check: Option<CheckFn>,
     kwic: Option<KwicFn>,
+    kwic_page: Option<KwicPageFn>,
     corpora: Mutex<HashMap<String, Arc<Mutex<Handle>>>>,
 }
 
@@ -96,7 +98,8 @@ impl ManateeLib {
             let free = *lib.get::<FreeFn>(b"fqsm_free\0")?;
             let check = lib.get::<CheckFn>(b"fqsm_check\0").ok().map(|f| *f);   // from fqs-manatee 0.2
             let kwic = lib.get::<KwicFn>(b"fqsm_kwic\0").ok().map(|f| *f);   // from fqs-manatee 0.3
-            Ok(ManateeLib { _lib: lib, path: path.to_path_buf(), version, open, close, query, freq, free, check, kwic, corpora: Mutex::new(HashMap::new()) })
+            let kwic_page = lib.get::<KwicPageFn>(b"fqsm_kwic_page\0").ok().map(|f| *f);   // from 0.4
+            Ok(ManateeLib { _lib: lib, path: path.to_path_buf(), version, open, close, query, freq, free, check, kwic, kwic_page, corpora: Mutex::new(HashMap::new()) })
         }
     }
 
@@ -155,10 +158,12 @@ impl ManateeLib {
         }
     }
 
-    /// {"total", "attrs", "hits": [{"pos", "end", "doc"?, "left", "kwic", "right"}]}: per token the
-    /// values of `attrs` (empty: the default attribute), `doc_attr` ("doc.id") at the hit.
+    /// {"total", "counted", "attrs", "hits": [{"pos", "end", "doc"?, "left", "kwic", "right"}]}: per
+    /// token the values of `attrs` (empty: the default attribute), `doc_attr` ("doc.id") at the hit.
+    /// `count_all` false: the result is walked only to the end of the page ("counted": false; a
+    /// library before 0.4 always counts).
     #[allow(clippy::too_many_arguments)]
-    pub fn kwic(&self, id: &str, registry: &Path, cql: &str, start: u64, size: u64, window: u32, attrs: &[String], doc_attr: Option<&str>) -> Result<Value> {
+    pub fn kwic(&self, id: &str, registry: &Path, cql: &str, start: u64, size: u64, window: u32, attrs: &[String], doc_attr: Option<&str>, count_all: bool) -> Result<Value> {
         let kwic = self.kwic.ok_or_else(|| anyhow!("{} has no fqsm_kwic: rebuild the library (fqs-manatee 0.3 or later)", self.version))?;
         let h = self.handle(id, registry)?;
         let h = h.lock().map_err(|_| anyhow!("manatee corpus lock poisoned"))?;
@@ -167,7 +172,10 @@ impl ManateeLib {
         let d = CString::new(doc_attr.unwrap_or(""))?;
         let mut err: *mut c_char = std::ptr::null_mut();
         unsafe {
-            let out = kwic(h.0, q.as_ptr(), start as c_longlong, size as c_longlong, window as c_int, a.as_ptr(), d.as_ptr(), &mut err);
+            let out = match self.kwic_page {
+                Some(page) => page(h.0, q.as_ptr(), start as c_longlong, size as c_longlong, window as c_int, a.as_ptr(), d.as_ptr(), count_all as c_int, &mut err),
+                None => kwic(h.0, q.as_ptr(), start as c_longlong, size as c_longlong, window as c_int, a.as_ptr(), d.as_ptr(), &mut err),
+            };
             take(self.free, out, err)
         }
     }
