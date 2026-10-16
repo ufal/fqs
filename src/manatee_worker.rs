@@ -3,7 +3,8 @@
 //! stdout, so that a crash in Manatee ends this process and not FQS.
 //!
 //! Requests: {"op": "hello"} | {"op": "query", "corpus", "registry", "cql", "start", "size",
-//! "window", "attr"?, "skip_check"?} | {"op": "freq", "corpus", "registry", "cql", "crit", "limit"}.
+//! "window", "attr"?, "skip_check"?} | {"op": "kwic", …as query, "attrs": [..], "doc_attr"?} |
+//! {"op": "freq", "corpus", "registry", "cql", "crit", "limit"}.
 //! Answers: {"ok": true, "result"} or {"ok": false, "error", "check"?}, each line starting with
 //! [`MARK`]: the library may write to stdout itself, and such lines are not answers.
 //!
@@ -98,6 +99,15 @@ fn handle(lib: &ManateeLib, req: &Value, checked: &mut HashMap<String, std::resu
         "query" => {
             let attr = req.get("attr").and_then(Value::as_str).filter(|a| !a.is_empty());
             Ok(lib.query(corpus, &registry, s(req, "cql"), n(req, "start", 0), n(req, "size", 20), n(req, "window", 5) as u32, attr)?)
+        }
+        "kwic" => {
+            let attrs: Vec<String> = match req.get("attrs") {
+                Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+                Some(Value::String(a)) => a.split(',').map(str::trim).filter(|x| !x.is_empty()).map(str::to_string).collect(),
+                _ => vec![],
+            };
+            let doc = req.get("doc_attr").and_then(Value::as_str).filter(|d| !d.is_empty());
+            Ok(lib.kwic(corpus, &registry, s(req, "cql"), n(req, "start", 0), n(req, "size", 20), n(req, "window", 5) as u32, &attrs, doc)?)
         }
         "freq" => Ok(lib.freq(corpus, &registry, s(req, "cql"), s(req, "crit"), n(req, "limit", 0))?),
         other => Err(anyhow!("unknown op '{other}'").into()),

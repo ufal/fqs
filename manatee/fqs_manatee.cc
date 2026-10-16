@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -69,11 +70,31 @@ RangeStream *eval(Corpus *c, const char *cql) {
     return c->filter_query(eval_cqpquery(q.c_str(), c));
 }
 
+// Walk a query's result: `fn(beg, end)` for hits [start, start+size); the total (exact: every hit
+// is walked).
+template <class Fn>
+long long walk(Corpus *c, const char *cql, long long start, long long size, Fn fn) {
+    RangeStream *rs = eval(c, cql);
+    long long total = 0;
+    try {
+        while (!rs->end()) {
+            if (total >= start && total < start + size) fn(rs->peek_beg(), rs->peek_end());
+            ++total;
+            rs->next();
+        }
+    } catch (...) {
+        delete rs;
+        throw;
+    }
+    delete rs;
+    return total;
+}
+
 }  // namespace
 
 extern "C" {
 
-const char *fqsm_version() { return "fqs-manatee 0.2"; }
+const char *fqsm_version() { return "fqs-manatee 0.3"; }
 
 // Open a corpus: a registry file path (or a name in MANATEE_REGISTRY). NULL and *err on failure.
 void *fqsm_open(const char *registry, char **err) {
@@ -102,6 +123,7 @@ long long fqsm_size(void *h) {
     }
 }
 
+
 // Run a query: {"total": N, "hits": [{"pos", "end", "left", "kwic", "right"}]} for hits
 // [start, start+size), with `window` tokens of context of attribute `attr` (default the default
 // attribute). The total is exact (the whole result is walked).
@@ -110,28 +132,100 @@ char *fqsm_query(void *h, const char *cql, long long start, long long size, int 
         Corpus *c = static_cast<Corpus *>(h);
         PosAttr *pa = (attr && *attr) ? c->get_attr(attr) : c->get_default_attr();
         const Position csize = c->size();
-        RangeStream *rs = eval(c, cql);
         std::string hits;
-        long long total = 0;
-        while (!rs->end()) {
-            if (total >= start && total < start + size) {
-                const Position b = rs->peek_beg(), e = rs->peek_end();
-                const Position lb = b > window ? b - window : 0;
-                const Position re = e + window < csize ? e + window : csize;
-                if (!hits.empty()) hits += ',';
-                hits += "{\"pos\":" + std::to_string(b) + ",\"end\":" + std::to_string(e) + ",\"left\":";
-                json_str(hits, span(pa, lb, b).c_str());
-                hits += ",\"kwic\":";
-                json_str(hits, span(pa, b, e).c_str());
-                hits += ",\"right\":";
-                json_str(hits, span(pa, e, re).c_str());
-                hits += '}';
-            }
-            ++total;
-            rs->next();
-        }
-        delete rs;
+        long long total = walk(c, cql, start, size, [&](Position b, Position e) {
+            const Position lb = b > window ? b - window : 0;
+            const Position re = e + window < csize ? e + window : csize;
+            if (!hits.empty()) hits += ',';
+            hits += "{\"pos\":" + std::to_string(b) + ",\"end\":" + std::to_string(e) + ",\"left\":";
+            json_str(hits, span(pa, lb, b).c_str());
+            hits += ",\"kwic\":";
+            json_str(hits, span(pa, b, e).c_str());
+            hits += ",\"right\":";
+            json_str(hits, span(pa, e, re).c_str());
+            hits += '}';
+        });
         return dup("{\"total\":" + std::to_string(total) + ",\"hits\":[" + hits + "]}");
+    } catch (std::exception &e) {
+        set_err(err, e.what());
+    } catch (...) {
+        set_err(err, "unknown error in the query");
+    }
+    return nullptr;
+}
+
+// Run a query with tokens: {"total": N, "attrs": [...], "hits": [{"pos", "end", "doc", "left":
+// [[v1, v2, …], …], "kwic": [...], "right": [...]}]}: per token the values of `attrs` (comma-
+// separated positional attributes; empty: the default attribute), `window` tokens of context on each
+// side, and `doc` the value of the structure attribute `doc_attr` ("doc.id"; empty: none) at the hit.
+// For FCS (layers, the document) and pando-shaped answers.
+char *fqsm_kwic(void *h, const char *cql, long long start, long long size, int window, const char *attrs,
+                const char *doc_attr, char **err) {
+    try {
+        Corpus *c = static_cast<Corpus *>(h);
+        std::vector<std::string> names;
+        std::vector<PosAttr *> pas;
+        std::string list = attrs ? attrs : "";
+        for (size_t from = 0; from <= list.size();) {
+            size_t comma = list.find(',', from);
+            std::string n = list.substr(from, comma == std::string::npos ? std::string::npos : comma - from);
+            from = comma == std::string::npos ? list.size() + 1 : comma + 1;
+            if (n.empty()) continue;
+            names.push_back(n);
+            pas.push_back(c->get_attr(n));
+        }
+        if (pas.empty()) {
+            names.push_back(c->get_conf("DEFAULTATTR"));
+            pas.push_back(c->get_default_attr());
+        }
+        Structure *doc_st = nullptr;
+        PosAttr *doc_pa = nullptr;
+        if (doc_attr && *doc_attr) {
+            std::string d = doc_attr;
+            size_t dot = d.find('.');
+            if (dot == std::string::npos) throw std::runtime_error("doc_attr must be structure.attribute: " + d);
+            doc_st = c->get_struct(d.substr(0, dot));
+            doc_pa = doc_st->get_attr(d.substr(dot + 1));
+        }
+        const Position csize = c->size();
+        auto tokens = [&](std::string &out, Position from, Position to) {
+            out += '[';
+            for (Position p = from; p < to; ++p) {
+                if (p > from) out += ',';
+                out += '[';
+                for (size_t i = 0; i < pas.size(); ++i) {
+                    if (i) out += ',';
+                    json_str(out, pas[i]->pos2str(p));
+                }
+                out += ']';
+            }
+            out += ']';
+        };
+        std::string hits;
+        long long total = walk(c, cql, start, size, [&](Position b, Position e) {
+            const Position lb = b > window ? b - window : 0;
+            const Position re = e + window < csize ? e + window : csize;
+            if (!hits.empty()) hits += ',';
+            hits += "{\"pos\":" + std::to_string(b) + ",\"end\":" + std::to_string(e);
+            if (doc_pa) {
+                const NumOfPos n = doc_st->rng->num_at_pos(b);
+                hits += ",\"doc\":";
+                if (n >= 0) json_str(hits, doc_pa->pos2str(n)); else hits += "null";
+            }
+            hits += ",\"left\":";
+            tokens(hits, lb, b);
+            hits += ",\"kwic\":";
+            tokens(hits, b, e);
+            hits += ",\"right\":";
+            tokens(hits, e, re);
+            hits += '}';
+        });
+        std::string an;
+        for (size_t i = 0; i < names.size(); ++i) {
+            if (i) an += ',';
+            json_str(an, names[i].c_str());
+        }
+        return dup("{\"total\":" + std::to_string(total) + ",\"attrs\":[" + an + "],\"hits\":[" + hits + "]}");
     } catch (std::exception &e) {
         set_err(err, e.what());
     } catch (...) {

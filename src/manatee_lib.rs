@@ -22,6 +22,7 @@ type FreqFn = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, c_
 type FreeFn = unsafe extern "C" fn(*mut c_char);
 type VersionFn = unsafe extern "C" fn() -> *const c_char;
 type CheckFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_char) -> *mut c_char;
+type KwicFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_longlong, c_longlong, c_int, *const c_char, *const c_char, *mut *mut c_char) -> *mut c_char;
 
 /// An open corpus (a `Corpus *` inside the library).
 struct Handle(*mut c_void);
@@ -38,6 +39,7 @@ pub struct ManateeLib {
     freq: FreqFn,
     free: FreeFn,
     check: Option<CheckFn>,
+    kwic: Option<KwicFn>,
     corpora: Mutex<HashMap<String, Arc<Mutex<Handle>>>>,
 }
 
@@ -93,7 +95,8 @@ impl ManateeLib {
             let freq = *lib.get::<FreqFn>(b"fqsm_freq\0")?;
             let free = *lib.get::<FreeFn>(b"fqsm_free\0")?;
             let check = lib.get::<CheckFn>(b"fqsm_check\0").ok().map(|f| *f);   // from fqs-manatee 0.2
-            Ok(ManateeLib { _lib: lib, path: path.to_path_buf(), version, open, close, query, freq, free, check, corpora: Mutex::new(HashMap::new()) })
+            let kwic = lib.get::<KwicFn>(b"fqsm_kwic\0").ok().map(|f| *f);   // from fqs-manatee 0.3
+            Ok(ManateeLib { _lib: lib, path: path.to_path_buf(), version, open, close, query, freq, free, check, kwic, corpora: Mutex::new(HashMap::new()) })
         }
     }
 
@@ -152,6 +155,23 @@ impl ManateeLib {
         }
     }
 
+    /// {"total", "attrs", "hits": [{"pos", "end", "doc"?, "left", "kwic", "right"}]}: per token the
+    /// values of `attrs` (empty: the default attribute), `doc_attr` ("doc.id") at the hit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kwic(&self, id: &str, registry: &Path, cql: &str, start: u64, size: u64, window: u32, attrs: &[String], doc_attr: Option<&str>) -> Result<Value> {
+        let kwic = self.kwic.ok_or_else(|| anyhow!("{} has no fqsm_kwic: rebuild the library (fqs-manatee 0.3 or later)", self.version))?;
+        let h = self.handle(id, registry)?;
+        let h = h.lock().map_err(|_| anyhow!("manatee corpus lock poisoned"))?;
+        let q = CString::new(cql)?;
+        let a = CString::new(attrs.join(","))?;
+        let d = CString::new(doc_attr.unwrap_or(""))?;
+        let mut err: *mut c_char = std::ptr::null_mut();
+        unsafe {
+            let out = kwic(h.0, q.as_ptr(), start as c_longlong, size as c_longlong, window as c_int, a.as_ptr(), d.as_ptr(), &mut err);
+            take(self.free, out, err)
+        }
+    }
+
     /// {"rows": [{"value", "count"}], "groups"}: frequencies by a Manatee criterion ("word 0", …).
     pub fn freq(&self, id: &str, registry: &Path, cql: &str, crit: &str, limit: u64) -> Result<Value> {
         let h = self.handle(id, registry)?;
@@ -198,6 +218,20 @@ pub fn data_dir(registry_file: &Path) -> Option<PathBuf> {
     })
 }
 
+/// The structure attribute naming a hit's document: the first of the registry's `FULLREF`
+/// ("doc.id", the reference KonText shows), if any.
+pub fn fullref(registry_file: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(registry_file).ok()?;
+    text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("FULLREF")?;
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let first = rest.trim().trim_matches('"').split(',').next()?.trim().to_string();
+        (first.contains('.')).then_some(first)
+    })
+}
+
 /// The attributes the warm-up reads first in a Manatee data folder.
 pub const MANATEE_PRIORITY: &[&str] = &["word.", "lemma.", "lc."];
 
@@ -222,6 +256,9 @@ mod tests {
         assert_eq!(registry_file(&folder, "missing"), None);
         assert_eq!(data_dir(&d.join("susanne")), Some(PathBuf::from("/data/manatee/susanne")));
         assert_eq!(data_dir(&d.join("bare")), Some(PathBuf::from("/data/bare/")), "PATHNAME is not PATH");
+        std::fs::write(d.join("refs"), "PATH /x\nFULLREF \"doc.id,doc.title\"\n").unwrap();
+        assert_eq!(fullref(&d.join("refs")), Some("doc.id".to_string()));
+        assert_eq!(fullref(&d.join("susanne")), None);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

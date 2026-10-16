@@ -3,6 +3,8 @@
 //! * `PandoEngine` — pando's `/query` JSON, over any transport: FQS's warm
 //!   in-process corpus, or a plain `pando-server` over HTTP.
 //! * `CwbEngine` — runs `cqp` directly (`size` + `tabulate`), no other tooling.
+//! * `ManateeEngine` — Manatee natively (FQS's Manatee workers, `fqsm_kwic`):
+//!   tokens with their layers and the document, without KonText.
 //! * `KontextEngine` — Manatee through a KonText (or NoSketch-style) HTTP
 //!   concordance with `format=json`; old (Lines with `attr` items) and new
 //!   (`posattrs`) KonText outputs are both read.
@@ -406,6 +408,88 @@ fn parse_cqp_output(stdout: &str, stderr: &str, layers: Vec<Layer>, with_doc: bo
     Ok(Page { total, exact: true, hits })
 }
 
+// ── Manatee natively ───────────────────────────────────────────────────
+
+/// One `kwic` request ({"cql", "start", "size", "window", "attrs", "doc_attr"}) → the worker's answer
+/// ({"total", "attrs", "hits": [{"pos", "end", "doc"?, "left"/"kwic"/"right": [[v, …], …]}]}).
+pub type ManateeTransport = Box<dyn Fn(Value) -> Result<Value, EngineError> + Send>;
+
+pub struct ManateeEngine {
+    pub transport: ManateeTransport,
+}
+
+/// A structure attribute in Manatee's notation: `doc.id` (also accepted: CWB-style `doc_id`).
+pub fn manatee_struct_attr(a: &str) -> String {
+    if a.contains('.') { a.to_string() } else { a.replacen('_', ".", 1) }
+}
+
+/// The attributes to ask for: the layers' (text first), then the token id attribute.
+fn manatee_attrs(a: &SearchArgs<'_>) -> Vec<String> {
+    let mut attrs: Vec<String> = Vec::new();
+    for (_, attr) in a.layers {
+        if !attrs.contains(attr) {
+            attrs.push(attr.clone());
+        }
+    }
+    if attrs.is_empty() {
+        attrs.push("word".into());
+    }
+    if let Some(t) = a.tokid_attr {
+        if !attrs.iter().any(|x| x == t) {
+            attrs.push(t.to_string());
+        }
+    }
+    attrs
+}
+
+fn manatee_hit(h: &Value, attrs: &[String], a: &SearchArgs<'_>) -> Hit {
+    let col = |name: &str| attrs.iter().position(|x| x == name);
+    let text_col = a.layers.iter().find(|(l, _)| *l == Layer::Text).and_then(|(_, v)| col(v)).unwrap_or(0);
+    let layer_cols: Vec<(Layer, usize)> = a.layers.iter().filter(|(l, _)| *l != Layer::Text).filter_map(|(l, v)| col(v).map(|c| (*l, c))).collect();
+    let val = |t: &Value, c: usize| t.get(c).and_then(Value::as_str).unwrap_or("").to_string();
+    let tokens = |key: &str, with_layers: bool| -> Vec<Token> {
+        h.get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|t| Token {
+                text: val(t, text_col),
+                layers: if with_layers { layer_cols.iter().map(|(l, c)| (*l, val(t, *c))).collect() } else { vec![] },
+            })
+            .collect()
+    };
+    let start = h.get("pos").and_then(Value::as_u64);
+    let end = h.get("end").and_then(Value::as_u64).map(|e| e.saturating_sub(1));   // Manatee: exclusive
+    let tokid = a.tokid_attr.and_then(col).and_then(|c| h.get("kwic").and_then(|k| k.get(0)).map(|t| val(t, c)));
+    Hit {
+        left: tokens("left", false),
+        kwic: tokens("kwic", true),
+        right: tokens("right", false),
+        start,
+        end,
+        doc: h.get("doc").and_then(Value::as_str).map(str::to_string),
+        tokid,
+    }
+}
+
+impl Engine for ManateeEngine {
+    fn search(&self, a: &SearchArgs<'_>) -> Result<Page, EngineError> {
+        let q = a.queries.first().ok_or_else(|| EngineError::System("no query".into()))?;
+        let attrs = manatee_attrs(a);
+        let v = (self.transport)(json!({
+            "cql": q,
+            "start": a.offset,
+            "size": a.limit,
+            "window": a.context,
+            "attrs": attrs,
+            "doc_attr": a.doc_attr.map(manatee_struct_attr),
+        }))?;
+        let total = v.get("total").and_then(Value::as_u64).unwrap_or(0);
+        let hits = v.get("hits").and_then(Value::as_array).into_iter().flatten().map(|h| manatee_hit(h, &attrs, a)).collect();
+        Ok(Page { total, exact: true, hits })
+    }
+}
+
 // ── KonText / Manatee ──────────────────────────────────────────────────
 
 pub struct KontextEngine {
@@ -609,6 +693,34 @@ mod tests {
         let h = kontext_lines(&new, &[Layer::Lemma, Layer::Pos]);
         assert_eq!(h[0].kwic[0].layers[1], (Layer::Pos, "NOUN".into()));
         assert_eq!(kontext_error(&json!({"messages": [["error", "bad query"]]})).as_deref(), Some("bad query"));
+    }
+
+    #[test]
+    fn manatee_json() {
+        let layers = vec![(Layer::Text, "word".to_string()), (Layer::Lemma, "lemma".into()), (Layer::Pos, "tag".into())];
+        let queries = vec!["[lemma=\"house\"]".to_string()];
+        let a = SearchArgs { queries: &queries, offset: 0, limit: 10, context: 2, layers: &layers, doc_attr: Some("doc_id"), tokid_attr: None };
+        let attrs = manatee_attrs(&a);
+        assert_eq!(attrs, vec!["word", "lemma", "tag"]);
+        assert_eq!(manatee_struct_attr("doc_id"), "doc.id");
+        assert_eq!(manatee_struct_attr("text.id"), "text.id");
+        let h = json!({"pos": 10, "end": 12, "doc": "A01",
+            "left": [["in", "in", "II"], ["the", "the", "AT"]],
+            "kwic": [["old", "old", "JJ"], ["house", "house", "NN1"]],
+            "right": [["of", "of", "IO"]]});
+        let hit = manatee_hit(&h, &attrs, &a);
+        assert_eq!((hit.start, hit.end), (Some(10), Some(11)));
+        assert_eq!(hit.doc.as_deref(), Some("A01"));
+        assert_eq!(hit.left.iter().map(|t| t.text.as_str()).collect::<Vec<_>>(), vec!["in", "the"]);
+        assert_eq!(hit.kwic[1], Token { text: "house".into(), layers: vec![(Layer::Lemma, "house".into()), (Layer::Pos, "NN1".into())] });
+        assert!(hit.left[0].layers.is_empty());
+        let t = ManateeEngine { transport: Box::new(move |req: Value| {
+            assert_eq!(req["attrs"], json!(["word", "lemma", "tag"]));
+            assert_eq!(req["doc_attr"], json!("doc.id"));
+            Ok(json!({"total": 1, "attrs": ["word", "lemma", "tag"], "hits": [h.clone()]}))
+        }) };
+        let p = t.search(&a).unwrap();
+        assert_eq!((p.total, p.exact, p.hits.len()), (1, true, 1));
     }
 
     #[test]

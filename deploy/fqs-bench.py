@@ -78,8 +78,10 @@ def run(fqs, cid, engine, query, timeout, again=False):
     job = job_of(p) if engine == "pando" else None
     if job and not job.get("finished"):
         t_end = time.time() + timeout
+        pause = 0.002   # short at first (most counts finish within milliseconds), then up to 50 ms
         while time.time() < t_end:
-            time.sleep(0.05)
+            time.sleep(pause)
+            pause = min(pause * 2, 0.05)
             qs = urllib.parse.urlencode({"corpus": cid, "job": job["id"]})
             st, s, _ = fqs.call("GET", "/status?" + qs, corpus=cid, timeout=30)
             j = job_of(s) or (s if isinstance(s, dict) and "finished" in s else None)

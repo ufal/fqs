@@ -6279,6 +6279,18 @@ fn fcs_pando_binary(corpus: &CorpusEntry) -> String {
         .unwrap_or_else(|| "pando".to_string())
 }
 
+/// A native Manatee error as an FCS engine error: the worker's own conditions (a stopped worker, a
+/// time-out, a corpus that does not read as its registry describes, a paused corpus) are system
+/// errors; anything else is Manatee rejecting the query.
+fn fcs_manatee_error(msg: &str) -> fcs::EngineError {
+    const SYSTEM: &[&str] = &["Manatee stopped", "took longer than", "ended a Manatee worker", "does not read as its registry", "worker", "no fqsm_kwic", "not available"];
+    if SYSTEM.iter().any(|m| msg.contains(m)) {
+        fcs::EngineError::System(msg.to_string())
+    } else {
+        fcs::EngineError::Query(msg.to_string())
+    }
+}
+
 /// An engine for one resource, built inside the blocking worker.
 fn fcs_engine(
     corpus: &CorpusEntry,
@@ -6339,6 +6351,20 @@ fn fcs_engine(
             }))
         }
         Dialect::Manatee => {
+            // natively (FQS's Manatee workers) when native Manatee is on and the corpus has a
+            // registry, unless settings.fcs.via = "kontext"; else through KonText as before
+            let via_kontext = fcs_config(corpus).get("via").and_then(Value::as_str) == Some("kontext");
+            if !via_kontext {
+                if let (Some(pool), Some(registry)) = (manatee_pool::global(), manatee_lib::registry_file(&corpus.settings, &corpus.id)) {
+                    let id = corpus.id.clone();
+                    let transport: fcs::engine::ManateeTransport = Box::new(move |mut req: Value| {
+                        req["op"] = json!("kwic");
+                        req["registry"] = json!(registry);
+                        pool.call(&id, req).map_err(|e| fcs_manatee_error(&format!("{e:#}")))
+                    });
+                    return Ok(Box::new(fcs::engine::ManateeEngine { transport }));
+                }
+            }
             let (url, corpname) = fcs_kontext_settings(corpus);
             let url = url.ok_or("settings.kontext.url is not set")?;
             let k = corpus.settings.get("kontext");
@@ -8351,25 +8377,46 @@ fn run_manatee_query(
         anyhow::anyhow!("no Manatee registry for '{}' (settings.manatee_registry, or MANATEE_REGISTRY)", corpus.id)
     })?;
     let window = query_options.and_then(|q| q.window).unwrap_or(5).max(0) as u32;
+    // the document per hit: the corpus's FCS doc_attr, else the registry's FULLREF ("doc.id")
+    let doc_attr = corpus
+        .settings
+        .pointer("/fcs/doc_attr")
+        .and_then(Value::as_str)
+        .map(fcs::engine::manatee_struct_attr)
+        .or_else(|| manatee_lib::fullref(&registry));
     let t0 = Instant::now();
     let res = pool.call(
         &corpus.id,
-        json!({ "op": "query", "registry": registry, "cql": query_text, "start": start, "size": size, "window": window }),
+        json!({ "op": "kwic", "registry": registry, "cql": query_text, "start": start, "size": size, "window": window, "doc_attr": doc_attr }),
     )?;
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0;
     let total = res.get("total").and_then(Value::as_u64).unwrap_or(0);
+    let words = |h: &Value, k: &str| -> String {
+        h.get(k)
+            .and_then(Value::as_array)
+            .map(|ts| ts.iter().filter_map(|t| t.get(0).and_then(Value::as_str)).collect::<Vec<_>>().join(" "))
+            .unwrap_or_default()
+    };
     let mut hits = Vec::new();
     let mut lines = Vec::new();
     for h in res.get("hits").and_then(Value::as_array).cloned().unwrap_or_default() {
         let pos = h.get("pos").and_then(Value::as_i64).unwrap_or(0);
         let end = h.get("end").and_then(Value::as_i64).unwrap_or(pos + 1);
-        let (left, kwic, right) = (
-            h.get("left").and_then(Value::as_str).unwrap_or(""),
-            h.get("kwic").and_then(Value::as_str).unwrap_or(""),
-            h.get("right").and_then(Value::as_str).unwrap_or(""),
-        );
+        let (left, kwic, right) = (words(&h, "left"), words(&h, "kwic"), words(&h, "right"));
         lines.push(format!("{pos}: {left} <{kwic}> {right}"));
-        hits.push(json!({ "match_start": pos, "match_end": end - 1, "left": left, "kwic": kwic, "right": right }));
+        // the CWB route's fields (flexicorp) and pando's (context, doc_id, tokens: KonText's pando
+        // route), so either reads a Manatee answer as its own
+        let tokens: Vec<Value> = h
+            .get("kwic")
+            .and_then(Value::as_array)
+            .map(|ts| ts.iter().enumerate().map(|(i, t)| json!({ "pos": pos + i as i64, "word": t.get(0).and_then(Value::as_str).unwrap_or("") })).collect())
+            .unwrap_or_default();
+        hits.push(json!({
+            "match_start": pos, "match_end": end - 1, "left": left, "kwic": kwic, "right": right,
+            "context": { "left": left, "match": kwic, "right": right },
+            "doc_id": h.get("doc").cloned().unwrap_or(Value::Null),
+            "tokens": tokens
+        }));
     }
     let payload = json!({
         "success": true,
@@ -8388,6 +8435,7 @@ fn run_manatee_query(
                 "total": total,
                 "total_exact": true,
                 "elapsed_ms": elapsed_ms,
+                "page": { "start": start, "size": size, "returned": hits.len(), "total": total, "total_exact": true },
                 "lines": lines,
                 "hits": hits
             }
