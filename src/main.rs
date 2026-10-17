@@ -34,6 +34,7 @@ mod fcs;
 mod hot_corpus;
 mod limits;
 mod manatee_lib;
+mod query_lang;
 mod manatee_pool;
 mod manatee_worker;
 mod pando_lib;
@@ -2295,39 +2296,6 @@ async fn http_log_middleware(
     response
 }
 
-/// Canonical query-language id for the given backend, or an error if the dialect does not match
-/// the executor (e.g. `manatee-cql` with `pando`). Translation between dialects belongs to callers
-/// or to flexicorp-pando / Manatee, not FQS.
-fn query_language_effective_for_backend(backend: &str, requested_language: &str) -> Result<String> {
-    let t = requested_language.trim();
-    let lower = t.to_ascii_lowercase();
-    match backend {
-        "pando" => match lower.as_str() {
-            "" | "auto" => Ok("pando-cql".to_string()),
-            "pando-cql" => Ok("pando-cql".to_string()),
-            _ => anyhow::bail!(
-                "Query language '{}' is not supported for backend 'pando' (use 'pando-cql' or 'auto')",
-                if t.is_empty() { "(empty)" } else { t }
-            ),
-        },
-        "manatee" => match lower.as_str() {
-            "" | "auto" | "manatee-cql" => Ok("manatee-cql".to_string()),
-            _ => anyhow::bail!(
-                "Query language '{}' is not supported for backend 'manatee' (use 'manatee-cql' or 'auto')",
-                if t.is_empty() { "(empty)" } else { t }
-            ),
-        },
-        "cqp" => match lower.as_str() {
-            "" | "auto" => Ok("cwb-cql".to_string()),
-            "cwb-cql" => Ok("cwb-cql".to_string()),
-            _ => anyhow::bail!(
-                "Query language '{}' is not supported for backend 'cqp' (use 'cwb-cql' or 'auto')",
-                if t.is_empty() { "(empty)" } else { t }
-            ),
-        },
-        _ => anyhow::bail!("Unknown backend for query language validation: {}", backend),
-    }
-}
 
 fn extract_effective_query_operation(payload: &Value) -> Option<String> {
     let candidates = [
@@ -2361,7 +2329,11 @@ fn execute_query(
     pando_hcm: Option<Arc<HotCorpusManager>>,
 ) -> Result<Value> {
     let started = Instant::now();
-    let requested_language = language.to_string();
+    // a query that names its language as its first word (`PMLTQ a-node [...]`, query_lang.rs)
+    let (requested_language, query_text) = match query_lang::split_prefix(query_text) {
+        Some((lang, rest)) => (lang.to_string(), rest),
+        None => (language.to_string(), query_text),
+    };
     let backend = if let Some(b) = backend_override {
         b.trim().to_string()
     } else {
@@ -2384,9 +2356,12 @@ fn execute_query(
     let (effective_language, exec_kind, exec_binary, exec_target, payload, exit_code) =
         match backend.as_str() {
             "pando" => {
-                let effective = query_language_effective_for_backend("pando", &requested_language)?;
+                // the corpus's languages for pando (query_lang.rs): pando-cql, cwb-cql, pmltq, tiger;
+                // other than pando's own, pando translates (its "dialect")
+                let effective = query_lang::effective(corpus, "pando", &requested_language)?.to_string();
                 let pando_query = normalize_pando_query(query_text);
-                let exec = run_pando_query(corpus, &pando_query, start, size, query_options, pando_hcm.as_ref())?;
+                let dialect = if effective == "pando-cql" { "" } else { effective.as_str() };
+                let exec = run_pando_query(corpus, &pando_query, start, size, query_options, pando_hcm.as_ref(), dialect)?;
                 (
                     effective,
                     exec.kind,
@@ -2397,7 +2372,7 @@ fn execute_query(
                 )
             }
             "cqp" => {
-                let effective = query_language_effective_for_backend("cqp", &requested_language)?;
+                let effective = query_lang::effective(corpus, "cqp", &requested_language)?.to_string();
                 let prefer_flexicorp = corpus.supports_xml
                     || corpus
                         .settings
@@ -2420,7 +2395,7 @@ fn execute_query(
                 )
             }
             "manatee" => {
-                let effective = query_language_effective_for_backend("manatee", &requested_language)?;
+                let effective = query_lang::effective(corpus, "manatee", &requested_language)?.to_string();
                 let exec = run_manatee_query(corpus, query_text, start, size, query_options)?;
                 (
                     effective,
@@ -5072,7 +5047,7 @@ async fn http_list_corpora(
         })
         .collect();
 
-    let rows: Value = if browse {
+    let mut rows: Value = if browse {
         Value::Array(
             filtered
                 .iter()
@@ -5082,6 +5057,14 @@ async fn http_list_corpora(
     } else {
         serde_json::to_value(&filtered).unwrap_or(Value::Array(vec![]))
     };
+    // each corpus's query languages (query_lang.rs: by engine and annotation), for front ends to offer
+    if let Value::Array(items) = &mut rows {
+        for (row, c) in items.iter_mut().zip(filtered.iter()) {
+            if let Some(o) = row.as_object_mut() {
+                o.insert("query_languages".into(), json!(query_lang::corpus_languages(c)));
+            }
+        }
+    }
 
     Ok(Json(json!({
         "ok": true,
@@ -5964,12 +5947,27 @@ async fn http_pando_run_inner(
     rec.caller(&caller);
     let corpus = state.catalog.get(&req.corpus).map_err(to_http_err)?;
     gate_corpus_role(&corpus, &caller.role)?;
+    // the program's language (`language`, or pando's own `dialect`): one the corpus accepts for pando
+    // (query_lang.rs), passed on as pando's dialect
+    let mut requested_language = str_field("language").or_else(|| str_field("dialect")).unwrap_or_default();
+    // or as the program's first word (`PMLTQ a-node [...]; freq by lemma`)
+    let cql = match query_lang::split_prefix(&cql) {
+        Some((lang, rest)) => {
+            requested_language = lang.to_string();
+            rest.to_string()
+        }
+        None => cql,
+    };
+    let effective = query_lang::effective(&corpus, "pando", &requested_language).map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
     let mut body = json!({ "cql": cql });
     if let Some(obj) = body.as_object_mut() {
         for (k, v) in req.extra {
-            if !matches!(k.as_str(), "corpus" | "request_role" | "user" | "tier") {
+            if !matches!(k.as_str(), "corpus" | "request_role" | "user" | "tier" | "language" | "dialect") {
                 obj.insert(k, v);
             }
+        }
+        if effective != "pando-cql" {
+            obj.insert("dialect".into(), json!(effective));
         }
     }
     set_engine_tier(&mut body, &caller, &state.limits);
@@ -8032,6 +8030,7 @@ fn run_pando_query(
     size: u32,
     query_options: Option<&HttpQueryRequest>,
     pando_hcm: Option<&Arc<HotCorpusManager>>,
+    dialect: &str,
 ) -> Result<PandoExecResult> {
     let index_dir = resolve_pando_index_dir(corpus)?;
     let window = query_options.and_then(|q| q.window);
@@ -8055,6 +8054,10 @@ fn run_pando_query(
             query_options.and_then(|q| q.engine_open_options.as_deref()),
         )?;
         let mut extra = serde_json::Map::new();
+        // the query's language when not pando's own (query_lang.rs): pando translates it
+        if !dialect.is_empty() {
+            extra.insert("dialect".into(), json!(dialect));
+        }
         if let Some(q) = query_options {
             if let Some(t) = &q.engine_tier {
                 extra.insert("tier".into(), json!(t));
@@ -8128,7 +8131,10 @@ fn run_pando_query(
         });
     }
 
-    // Cold CLI fallback (Path A / library missing)
+    // Cold CLI fallback (Path A / library missing): pando's own query language only
+    if !dialect.is_empty() {
+        anyhow::bail!("query language '{dialect}' needs FQS's pando library (FLEXICORP_PANDO_LIB); without it only pando-cql works");
+    }
     let binaries = resolve_flexicorp_pando_bins(corpus);
     let mut output = None;
     let mut binary = String::new();

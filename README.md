@@ -309,6 +309,18 @@ Endpoints:
 - `POST /query` with JSON body:
   - `{"corpus":"...","query":"...","language":"auto","start":0,"size":25,"request_role":"visitor","backend":"pando"}`
   - optional **`backend`**: `pando` or `cqp` — TEITOK/flexicorp should set from project config; catalogue `preferred_backend` may be `auto`
+  - **`language`**: the query's language, one the corpus accepts with that engine (`src/query_lang.rs`):
+    pando `pando-cql` (default), `cwb-cql`, and with dependency annotation `pmltq`, with constituency
+    annotation `tiger` (pando translates them; it needs FQS's pando library); CWB `cwb-cql`; Manatee
+    `manatee-cql`. Aliases: `cqp`, `pml-tq`, `tigersearch`, `native`. Another language: 400 with the
+    list the corpus accepts. A corpus can narrow its list with `settings.query_languages`. The same
+    `language` on `POST /run` (programs). `GET /corpora` gives each corpus's `query_languages` (the
+    default first), so a front end offers exactly those (e.g. a query-language choice next to KonText's
+    "advanced" query). A query can also name its language as its first word, in capitals: `PMLTQ`,
+    `PML-TQ`, `CWB`, `CQP`, `TIGER`, `PANDO`, `MANATEE` (`PMLTQ a-node [ deprel = "nsubj" ]`). The word
+    is taken off and replaces `language`, so a front end without a language choice (KonText's CQL field)
+    can send PML-TQ or CWB CQL as it is. On `/run` the rest of the program can follow in pando CQL
+    (`PMLTQ a-node [ lemma = "be" ]; freq by upos`).
 
 In `--test` mode, `/query` adds a `policy` block:
 - `would_block`: whether normal locked mode would reject

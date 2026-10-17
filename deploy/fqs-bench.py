@@ -8,8 +8,10 @@ for different engines: pando, native Manatee, CWB), as a user of FQS sees them:
 
 `kontext:NAME` is corpus NAME through KonText's own interface (query_submit, then view and
 get_conc_cache_status), timed from here: what a KonText user waits for, Manatee via KonText. KonText
-keeps concordances in its cache; every run adds spaces after the query's first "[" so that each run
-computes (KonText trims only the ends; Manatee ignores the spaces).
+keeps concordances in its cache (on disk, across runs of this script); every run adds spaces after the
+query's first "[", starting from a random count per run of the script, so that each run computes
+(KonText trims only the ends; Manatee ignores the spaces). To be sure, empty KonText's concordance
+cache before a run.
 
 Per query and corpus: first (FQS's time to the first page, the first time this query runs),
 count (to the exact total: pando counts in the background, polled via /status; Manatee counts before
@@ -27,6 +29,7 @@ import argparse
 import importlib.util
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -97,7 +100,9 @@ class Kontext:
     """Manatee through KonText's HTTP interface (anonymous; a local or a tunnelled KonText)."""
 
     def __init__(self, url):
-        self.url, self.runs = url.rstrip("/"), 0
+        # a random start, so that a later run of this script never sends a query text KonText
+        # already has in its (disk) cache from an earlier run
+        self.url, self.runs = url.rstrip("/"), random.randint(1, 400)
 
     def call(self, method, path, body=None, timeout=600):
         data = json.dumps(body).encode() if body is not None else None
