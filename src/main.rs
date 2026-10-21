@@ -5242,6 +5242,8 @@ fn browse_corpus_dto(c: &CorpusEntry) -> Value {
         "facets": facets,
         "corpus_size": c.corpus_size,
         "description": description,
+        // when it was registered: corpus lists can sort by "recent"
+        "created_at": c.created_at,
     })
 }
 
