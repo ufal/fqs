@@ -33,6 +33,7 @@ mod enrich;
 mod fcs;
 mod hot_corpus;
 mod limits;
+mod manatee_jobs;
 mod manatee_lib;
 mod query_lang;
 mod manatee_pool;
@@ -462,6 +463,9 @@ struct HttpQueryRequest {
     timeout_ms: Option<u64>,
     /// User id for per-user limits (believed only without --jwt-secret)
     user: Option<String>,
+    /// manatee: `"async"` answers the page at once and counts the total in the background (`job_id`,
+    /// `GET /status`; manatee_jobs.rs), as KonText asks; else the total is counted before the page
+    total: Option<Value>,
     /// pando: a random sample of this many hits (KonText "random sample"), in corpus order
     sample: Option<u64>,
     /// pando: the hits (or the sample) in a random order (KonText "shuffle")
@@ -2489,14 +2493,24 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
     if limits.has_tiers() {
         eprintln!("[fqs] limits by tier: {}", limits.status_json());
     }
+    let pando_cli = find_flexicorp_pando_cli();
     let pando_hcm = if args.pando_cli_only {
         eprintln!("[fqs] pando hot path disabled (--pando-cli-only); using cold CLI");
+        pando_lib::set_status(pando_mode_status(None, Some("disabled (--pando-cli-only)"), &[], pando_cli.as_deref()));
         None
     } else {
-        match PandoLib::load() {
-            Ok(lib) => {
+        let report = PandoLib::load();
+        pando_lib::set_status(pando_mode_status(
+            report.path.as_deref(),
+            report.error.as_deref(),
+            &report.checked,
+            pando_cli.as_deref(),
+        ));
+        match report.lib {
+            Some(lib) => {
                 eprintln!(
-                    "[fqs] loaded libflexicorp_pando api={} build={}",
+                    "[fqs] loaded libflexicorp_pando {} api={} build={}",
+                    report.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
                     lib.api_version(),
                     lib.build_string()
                 );
@@ -2530,9 +2544,23 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
                 }
                 Some(hcm)
             }
-            Err(err) => {
+            None => {
+                // loud on purpose: a stale or missing library otherwise only shows up as
+                // failing (or slow) pando queries much later
+                eprintln!("[fqs] WARNING: libflexicorp_pando not loaded: {}", report.error.as_deref().unwrap_or("?"));
+                if report.checked.len() > 1 {
+                    for c in &report.checked {
+                        eprintln!("[fqs]   checked {c}");
+                    }
+                }
+                match &pando_cli {
+                    Some(cli) => eprintln!("[fqs]   pando queries fall back to the cold CLI {cli} (pando-cql only, slower)"),
+                    None => eprintln!(
+                        "[fqs]   no flexicorp-pando CLI either (FLEXICORP_PANDO_BIN, PATH): pando queries will fail"
+                    ),
+                }
                 eprintln!(
-                    "[fqs] libflexicorp_pando unavailable ({err}); pando queries fall back to cold CLI"
+                    "[fqs]   fix: put a current libflexicorp_pando next to the fqs binary or set FLEXICORP_PANDO_LIB, then restart"
                 );
                 None
             }
@@ -3680,7 +3708,18 @@ async fn http_health(State(state): State<HttpAppState>) -> Json<Value> {
         // the commit this binary was built from (the version only changes on releases)
         "build": env!("FQS_BUILD"),
         "server_name": state.server_name,
+        // only how pando runs; paths and reasons are in the admin health
+        "pando": {"mode": pando_lib::status().get("mode").cloned().unwrap_or(Value::Null)},
     }))
+}
+
+/// The warm manager's status plus how pando was set up at startup (mode, library path, error).
+fn pando_status_json(state: &HttpAppState) -> Value {
+    let mut out = state.pando_hcm.as_ref().map(|h| h.status_json()).unwrap_or(json!({"available": false}));
+    if let (Some(o), Value::Object(load)) = (out.as_object_mut(), pando_lib::status()) {
+        o.extend(load);
+    }
+    out
 }
 
 fn detailed_health_body(state: &HttpAppState) -> Value {
@@ -3700,11 +3739,7 @@ fn detailed_health_body(state: &HttpAppState) -> Value {
     if let Some(a) = &state.activity {
         body["activity_log"] = a.status_json();
     }
-    if let Some(hcm) = &state.pando_hcm {
-        body["pando"] = hcm.status_json();
-    } else {
-        body["pando"] = json!({"available": false});
-    }
+    body["pando"] = pando_status_json(state);
     body["limits"] = state.limits.status_json();
     body
 }
@@ -4548,11 +4583,7 @@ async fn http_admin_backends(
     headers: HeaderMap,
 ) -> admin::AdminResult<Json<Value>> {
     let _ = admin::require_admin(&state.limits, &headers)?;
-    let pando = state
-        .pando_hcm
-        .as_ref()
-        .map(|h| h.status_json())
-        .unwrap_or(json!({"available": false}));
+    let pando = pando_status_json(&state);
     let report = tokio::task::spawn_blocking(move || services::probe_backends(pando))
         .await
         .map_err(|e| admin::AdminError::msg(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -4932,7 +4963,7 @@ async fn http_root_with_state(State(state): State<HttpAppState>) -> Json<Value> 
             json!({"method":"GET", "path":"/info", "description":"Pando corpus info (?corpus=)"}),
             json!({"method":"GET", "path":"/context", "description":"Pando KWIC context (?corpus=&pos=&left=&right=)"}),
             json!({"method":"GET", "path":"/fragment", "description":"TEITOK XML fragment from xidx (?corpus=&pos=&end=&context=&context_scope=) for KonText token_connect"}),
-            json!({"method":"GET", "path":"/status", "description":"Pando async total job (?corpus=&job=)"}),
+            json!({"method":"GET", "path":"/status", "description":"Async total job, pando or Manatee (?corpus=&job=)"}),
             json!({"method":"POST", "path":"/warm", "description":"Read a corpus's main index files into the file cache ahead of its first query ({corpus}); a frontend calls it when its search page for the corpus opens"}),
             json!({"method":"POST", "path":"/run", "description":"Pando CQL program (JSON: corpus, cql|query, session_id?, …)"}),
             json!({"method":"POST", "path":"/session", "description":"Pando hit-set session (JSON: corpus, session_id?, ttl_s?); /query name / from and /run use it"}),
@@ -5691,7 +5722,7 @@ struct PandoRunRequest {
 async fn http_backends(State(state): State<HttpAppState>) -> Json<Value> {
     Json(json!({
         "ok": true,
-        "pando": state.pando_hcm.as_ref().map(|h| h.status_json()).unwrap_or(json!({"available": false})),
+        "pando": pando_status_json(&state),
     }))
 }
 
@@ -5707,7 +5738,7 @@ async fn pando_dispatch_get(
         .ok_or_else(|| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "libflexicorp_pando hot path not available".to_string(),
+                pando_hot_path_unavailable(),
             )
         })?;
     // Resolve corpus from the in-memory catalog on the async path; only FFI +
@@ -5755,6 +5786,11 @@ async fn http_pando_status(
     let job = q.job.as_deref().unwrap_or("");
     if job.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "job is required".to_string()));
+    }
+    if job.starts_with(manatee_jobs::JOB_PREFIX) {
+        return manatee_jobs::status(job)
+            .map(Json)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("unknown Manatee count job '{job}' (finished over 10 minutes ago, or FQS restarted)")));
     }
     let qs = format!("job={job}");
     pando_dispatch_get(&state, &q.corpus, "/status", &qs).await
@@ -5825,7 +5861,7 @@ async fn http_pando_fragment(
     let hcm = state.pando_hcm.clone().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "libflexicorp_pando hot path not available".to_string(),
+            pando_hot_path_unavailable(),
         )
     })?;
     let corpus = state.catalog.get(&q.corpus).map_err(to_http_err)?;
@@ -5928,7 +5964,7 @@ async fn http_pando_run_inner(
     let hcm = state.pando_hcm.clone().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "libflexicorp_pando hot path not available".to_string(),
+            pando_hot_path_unavailable(),
         )
     })?;
     let cql = req
@@ -6034,7 +6070,7 @@ async fn pando_dispatch(
     body: String,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let hcm = state.pando_hcm.clone().ok_or_else(|| {
-        (StatusCode::SERVICE_UNAVAILABLE, "libflexicorp_pando hot path not available".to_string())
+        (StatusCode::SERVICE_UNAVAILABLE, pando_hot_path_unavailable())
     })?;
     let corpus = state.catalog.get(corpus_id).map_err(to_http_err)?;
     let index_dir = resolve_pando_index_dir(&corpus).map_err(to_http_err)?;
@@ -8135,7 +8171,10 @@ fn run_pando_query(
 
     // Cold CLI fallback (Path A / library missing): pando's own query language only
     if !dialect.is_empty() {
-        anyhow::bail!("query language '{dialect}' needs FQS's pando library (FLEXICORP_PANDO_LIB); without it only pando-cql works");
+        anyhow::bail!(
+            "query language '{dialect}' needs FQS's pando library (FLEXICORP_PANDO_LIB); without it only pando-cql works{}",
+            pando_lib::unavailable_reason().map(|r| format!(" (library: {r})")).unwrap_or_default()
+        );
     }
     let binaries = resolve_flexicorp_pando_bins(corpus);
     let mut output = None;
@@ -8175,10 +8214,12 @@ fn run_pando_query(
     let output = if let Some(out) = output {
         out
     } else {
-        anyhow::bail!(
-            "Failed to execute flexicorp-pando query binary. Tried: {}",
-            spawn_errors.join(" ; ")
-        );
+        let tried = spawn_errors.join(" ; ");
+        match pando_lib::unavailable_reason() {
+            // both ways failed: say so, the CLI error alone points the wrong way
+            Some(lib) => anyhow::bail!("pando cannot run here. Library: {lib}. CLI: none of {tried}"),
+            None => anyhow::bail!("Failed to execute flexicorp-pando query binary. Tried: {tried}"),
+        }
     };
     let exit_code = output.status.code().unwrap_or(-1);
     if !output.status.success() {
@@ -8392,12 +8433,13 @@ fn run_manatee_query(
         .map(fcs::engine::manatee_struct_attr)
         .or_else(|| manatee_lib::fullref(&registry));
     let t0 = Instant::now();
-    let res = pool.kwic(
-        &corpus.id,
-        json!({ "registry": registry, "cql": query_text, "start": start, "size": size, "window": window, "doc_attr": doc_attr }),
-    )?;
+    let req = json!({ "registry": registry, "cql": query_text, "start": start, "size": size, "window": window, "doc_attr": doc_attr });
+    let total_async = query_options.and_then(|q| q.total.as_ref()).and_then(Value::as_str) == Some("async");
+    let res = if total_async { manatee_jobs::kwic(&pool, &corpus.id, req)? } else { pool.kwic(&corpus.id, req)? };
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0;
     let total = res.get("total").and_then(Value::as_u64).unwrap_or(0);
+    let total_exact = res.get("total_exact").and_then(Value::as_bool).unwrap_or(true);
+    let job_id = res.get("job_id").cloned().unwrap_or(Value::Null);
     let words = |h: &Value, k: &str| -> String {
         h.get(k)
             .and_then(Value::as_array)
@@ -8440,9 +8482,10 @@ fn run_manatee_query(
                 "start": start,
                 "requested_size": size,
                 "total": total,
-                "total_exact": true,
+                "total_exact": total_exact,
+                "job_id": job_id,
                 "elapsed_ms": elapsed_ms,
-                "page": { "start": start, "size": size, "returned": hits.len(), "total": total, "total_exact": true },
+                "page": { "start": start, "size": size, "returned": hits.len(), "total": total, "total_exact": total_exact, "job_id": job_id },
                 "lines": lines,
                 "hits": hits
             }
@@ -8793,25 +8836,75 @@ fn resolve_flexicorp_pando_bins(corpus: &CorpusEntry) -> Vec<String> {
     {
         push_unique(v.to_string());
     }
+    for v in default_flexicorp_pando_bins() {
+        push_unique(v);
+    }
+    out
+}
+
+/// The flexicorp-pando CLIs every corpus may use: $FLEXICORP_PANDO_BIN, the build tree (on
+/// the build machine), then PATH.
+fn default_flexicorp_pando_bins() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push_unique = |value: String| {
+        if !out.iter().any(|v| v == &value) {
+            out.push(value);
+        }
+    };
     if let Ok(v) = std::env::var("FLEXICORP_PANDO_BIN") {
         let vv = v.trim();
         if !vv.is_empty() {
             push_unique(vv.to_string());
         }
     }
-    let repo_default = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("flexicorp_pando")
-        .join("build")
-        .join("flexicorp-pando");
+    let repo_default = pando_lib::dev_build_dir().join("flexicorp-pando");
     if is_likely_executable_file(&repo_default) {
         push_unique(repo_default.display().to_string());
     }
     // Final fallback: rely on PATH.
     push_unique("flexicorp-pando".to_string());
     out
+}
+
+/// 503 text for routes that need the warm library, with why it is not loaded.
+fn pando_hot_path_unavailable() -> String {
+    match pando_lib::unavailable_reason() {
+        Some(r) => format!("libflexicorp_pando hot path not available ({r})"),
+        None => "libflexicorp_pando hot path not available".to_string(),
+    }
+}
+
+/// The first default flexicorp-pando CLI that exists (a bare name is looked up on PATH).
+fn find_flexicorp_pando_cli() -> Option<String> {
+    default_flexicorp_pando_bins().into_iter().find_map(|b| {
+        if b.contains('/') {
+            return is_likely_executable_file(Path::new(&b)).then_some(b);
+        }
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .map(|d| d.join(&b))
+            .find(|p| is_likely_executable_file(p))
+            .map(|p| p.display().to_string())
+    })
+}
+
+/// `pando_lib::status()`: how pando queries run here. "library" (warm, in-process), "cli"
+/// (cold flexicorp-pando, pando-cql only) or "unavailable" (neither).
+fn pando_mode_status(library_path: Option<&Path>, error: Option<&str>, checked: &[String], cli: Option<&str>) -> Value {
+    let mode = if error.is_none() && library_path.is_some() {
+        "library"
+    } else if cli.is_some() {
+        "cli"
+    } else {
+        "unavailable"
+    };
+    json!({
+        "mode": mode,
+        "library_path": library_path.map(|p| p.display().to_string()),
+        "error": error,
+        "checked": checked,
+        "cli": cli,
+    })
 }
 
 fn is_likely_executable_file(path: &Path) -> bool {
@@ -8965,6 +9058,21 @@ fn parse_entries_from_json(payload: &str) -> Result<Vec<CorpusEntry>> {
             Ok(vec![entry])
         }
         _ => anyhow::bail!("JSON input must be an object or an array of objects"),
+    }
+}
+
+#[cfg(test)]
+mod pando_mode_tests {
+    use super::*;
+
+    #[test]
+    fn mode_follows_library_then_cli() {
+        let lib = Path::new("/x/libflexicorp_pando.so");
+        assert_eq!(pando_mode_status(Some(lib), None, &[], None)["mode"], "library");
+        let stale = pando_mode_status(Some(lib), Some("missing symbol"), &[], Some("/bin/flexicorp-pando"));
+        assert_eq!(stale["mode"], "cli");
+        assert_eq!(stale["library_path"], "/x/libflexicorp_pando.so");
+        assert_eq!(pando_mode_status(None, Some("not found"), &[], None)["mode"], "unavailable");
     }
 }
 

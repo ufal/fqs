@@ -27,14 +27,13 @@ pub fn probe_backends(pando_status: Value) -> Value {
             .cloned()
             .unwrap_or(Value::Null),
         "detail": pando_status,
-        "notes": if pando_hot {
-            vec!["Hot path via HotCorpusManager"]
-        } else {
-            vec!["Library not loaded; cold CLI may still work"]
-        },
+        "path": pando_status.get("library_path").cloned().unwrap_or(Value::Null),
+        "error": pando_status.get("error").cloned().unwrap_or(Value::Null),
+        "notes": pando_notes(pando_hot, &pando_status),
     }));
 
     let pando_cli = which_bin(&[
+        std::env::var("FLEXICORP_PANDO_BIN").ok().as_deref(),
         std::env::var("PANDO_BINARY").ok().as_deref(),
         Some("pando"),
         Some("flexicorp-pando"),
@@ -1735,6 +1734,23 @@ fn run_restart_block(restart: &serde_json::Map<String, Value>, wait: bool) -> Re
     }
 }
 
+/// What the admin sees on the pando card: the mode, and why the library is not in use.
+fn pando_notes(hot: bool, status: &Value) -> Vec<String> {
+    if hot {
+        return vec!["Hot path via HotCorpusManager".to_string()];
+    }
+    let mut notes = Vec::new();
+    if let Some(e) = status.get("error").and_then(Value::as_str) {
+        notes.push(format!("Library not loaded: {e}"));
+    }
+    notes.push(match status.get("mode").and_then(Value::as_str) {
+        Some("unavailable") => "No flexicorp-pando CLI either: pando queries fail".to_string(),
+        _ => "Queries use the cold flexicorp-pando CLI (pando-cql only, slower)".to_string(),
+    });
+    notes.push("Fix: a current libflexicorp_pando next to the fqs binary, or FLEXICORP_PANDO_LIB; then restart".to_string());
+    notes
+}
+
 fn which_bin(candidates: &[Option<&str>]) -> Option<String> {
     for c in candidates.iter().flatten() {
         let t = c.trim();
@@ -1965,6 +1981,19 @@ pub fn publish_to_frontend(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pando_card_says_why_the_library_is_not_used() {
+        let status = json!({"available": false, "mode": "unavailable", "library_path": "/usr/local/lib/libflexicorp_pando.dylib",
+                            "error": "/usr/local/lib/libflexicorp_pando.dylib: missing symbol flexicorp_pando_build_string"});
+        let notes = pando_notes(false, &status);
+        assert!(notes[0].contains("missing symbol flexicorp_pando_build_string"), "{notes:?}");
+        assert!(notes[1].contains("pando queries fail"), "{notes:?}");
+        let report = probe_backends(status);
+        let pando = &report["backends"][0];
+        assert_eq!(pando["installed"], false);
+        assert_eq!(pando["path"], "/usr/local/lib/libflexicorp_pando.dylib");
+    }
 
     #[test]
     fn kontext_corpus_with_only_a_corpname_joins_the_kontext_card() {

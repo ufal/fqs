@@ -21,6 +21,8 @@ On a Linux server, install the binary, catalog dirs, admin UI, and a `fqs.servic
 sudo ./install.sh --web-user www-data
 # with TEITOK (flexicorp installed in the TEITOK shared venv), additionally:
 #   --teitok-venv /var/www/html/teitok/shared/Resources/venv --scan-root /var/www/html/teitok
+# with pando's warm library (built in flexicorp_pando), additionally:
+#   --pando-lib /path/to/flexicorp_pando/build/libflexicorp_pando.so
 ```
 
 What it does:
@@ -28,6 +30,7 @@ What it does:
 | Piece | Path |
 |---|---|
 | Binary | `/usr/local/bin/fqs` |
+| Pando library (`--pando-lib`) | `/usr/local/lib/fqs/libflexicorp_pando.so`, `FLEXICORP_PANDO_LIB` in `fqs.env` |
 | System config | `/etc/fqs/fqs.json` (`db_path`, `scan_roots`, admin restart via systemctl) |
 | Secrets / env | `/etc/fqs/fqs.env` (`FQS_SECRET`, **`PYTHON_BIN`**, `FQS_SERVER_NAME`, …) |
 | Catalog + WAL | `/var/lib/fqs/` (mode `2775`, user `fqs`, group `fqs`) |
@@ -42,6 +45,17 @@ The installer creates system user/group `fqs` and adds `--web-user` (default `ww
 ```bash
 /var/www/html/teitok/shared/Resources/venv/bin/python -m pip install -e /path/to/flexicorp
 ```
+
+**Pando library.** pando corpora run fastest through `libflexicorp_pando`, loaded into FQS
+(warm). FQS uses `FLEXICORP_PANDO_LIB` when set (only that file); otherwise it looks next to the
+`fqs` binary, then in `/usr/local/lib` and `/usr/lib` (a development build also looks in
+`../flexencoder/flexicorp_pando/build` beside its checkout). A library that is found but cannot
+be used (an old build missing a symbol, a wrong file) is reported and the next place tried.
+Without a library, pando queries run through the cold `flexicorp-pando` CLI
+(`FLEXICORP_PANDO_BIN` or `PATH`; pando-cql only), and fail when that is missing too. FQS prints
+what it checked at startup; `/health` shows `pando.mode` (`library`, `cli` or `unavailable`) and
+the admin health / backends view the library path and the error. Install the library with each
+pando update (an old copy in `/usr/local/lib` is the usual cause of `cli` mode) and restart.
 
 Templates live under `deploy/` (`fqs.service`, `fqs.env.example`). After changing env:
 
@@ -353,7 +367,7 @@ around it.
 - **Engines** (the query is translated per engine; `settings.fcs.engine` or the
   corpus's backend picks one):
   - *pando*: `settings.pando_server: "http://host:port"` (any `pando-server`),
-    else the warm library (libflexicorp_pando), else pando's own command line
+    else the warm library (libflexicorp_pando, see Installation), else pando's own command line
     (`settings.pando_binary`, `PANDO_BINARY` or `pando` on the PATH; one process
     per request, under the process slots). pando has no `|`
     between sequences and no quantified groups: those are expanded into several
@@ -631,7 +645,7 @@ Renaming or friendly labels belong in UI/config (e.g. flexicorp.php / query libr
 ## Roles, tiers and limits
 
 FQS decides **who** is asking and **how much** they may use; the engine (pando,
-through `libflexicorp_pando` api ≥ 4) enforces what one request may do.
+through `libflexicorp_pando` api ≥ 4, see Installation) enforces what one request may do.
 
 **Roles.** Callers send `request_role`: `visitor` (not logged in), `user`
 (logged in), `admin` (corpus / server admin; `corpus_admin`, `server_admin`
@@ -669,7 +683,7 @@ when FQS is reachable from the front-ends alone.
   `process_slots` (default half the CPUs, at least 2), pages included, waiting
   at most `process_queue_ms` (default 30000, then **503** busy). That covers the
   CQP backend (`python -m flexicorp` + `cqp` per search) and pando without
-  libflexicorp_pando (the cold CLI); FCS searchRetrieve too. A burst of CWB
+  libflexicorp_pando (the cold CLI, `/health` → `pando.mode: "cli"`); FCS searchRetrieve too. A burst of CWB
   searches queues instead of starting one process each. Hot pando searches run
   inside FQS and never take one. `/health` → `limits.process_slots_free`.
 * Engine side — the same tier objects go to pando, and FQS puts `"tier"` into

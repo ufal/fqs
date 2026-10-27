@@ -5,6 +5,7 @@
 #   sudo ./install.sh
 #   sudo ./install.sh --teitok-venv /var/www/html/teitok/shared/Resources/venv   # with TEITOK only
 #   sudo ./install.sh --skip-build --web-user www-data
+#   sudo ./install.sh --pando-lib /path/to/flexicorp_pando/build/libflexicorp_pando.so   # warm pando
 #
 # See README «Installation» and deploy/fqs.env.example.
 set -euo pipefail
@@ -20,13 +21,14 @@ SERVICE_USER=fqs
 SERVICE_GROUP=fqs
 WEB_USER=www-data
 TEITOK_VENV=
+PANDO_LIB=
 SKIP_BUILD=0
 NO_SYSTEMD=0
 ENABLE_NOW=1
 SCAN_ROOTS=()
 
 usage() {
-	sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
 	cat <<EOF
 
 Options:
@@ -36,6 +38,7 @@ Options:
   --web-user NAME       PHP/TEITOK user added to service group (default: www-data)
   --teitok-venv DIR     optional (TEITOK only): venv with flexicorp; sets PYTHON_BIN in fqs.env
   --scan-root DIR       Add a scan_roots entry (repeatable)
+  --pando-lib FILE      libflexicorp_pando to install (PREFIX/lib/fqs); sets FLEXICORP_PANDO_LIB
   --skip-build          Use existing target/release/fqs (do not cargo build)
   --no-systemd          Install files only; do not enable/start unit
   --no-start            Install + enable unit but do not start now
@@ -60,6 +63,7 @@ while [[ $# -gt 0 ]]; do
 		--web-user) WEB_USER=${2:?}; shift 2 ;;
 		--teitok-venv) TEITOK_VENV=${2:?}; shift 2 ;;
 		--scan-root) SCAN_ROOTS+=("${2:?}"); shift 2 ;;
+		--pando-lib) PANDO_LIB=${2:?}; shift 2 ;;
 		--skip-build) SKIP_BUILD=1; shift ;;
 		--no-systemd) NO_SYSTEMD=1; shift ;;
 		--no-start) ENABLE_NOW=0; shift ;;
@@ -130,6 +134,15 @@ chmod 2775 "$STATE_DIR" "$LOG_DIR"
 log "installing $BIN_DIR/fqs"
 install -m 0755 "$FQS_ROOT/target/release/fqs" "$BIN_DIR/fqs"
 
+if [[ -n "$PANDO_LIB" ]]; then
+	[[ -f "$PANDO_LIB" ]] || die "--pando-lib: no such file: $PANDO_LIB"
+	LIB_DIR=$PREFIX/lib/fqs
+	install -d -m 0755 "$LIB_DIR"
+	PANDO_LIB_DEST=$LIB_DIR/$(basename "$PANDO_LIB")
+	log "installing $PANDO_LIB_DEST"
+	install -m 0755 "$PANDO_LIB" "$PANDO_LIB_DEST"
+fi
+
 log "installing admin UI → $SHARE_DIR/admin"
 install -m 0644 "$FQS_ROOT/admin/index.html" "$FQS_ROOT/admin/admin.css" "$FQS_ROOT/admin/app.js" \
 	"$SHARE_DIR/admin/"
@@ -183,6 +196,18 @@ if [[ ! -f "$ENV_FILE" ]]; then
 	mv "$tmp" "$ENV_FILE"
 else
 	log "keeping existing $ENV_FILE"
+fi
+
+if [[ -n "$PANDO_LIB" ]]; then
+	tmp=$(mktemp)
+	awk -v p="$PANDO_LIB_DEST" '
+		BEGIN { done=0 }
+		/^#? ?FLEXICORP_PANDO_LIB=/ && !done { print "FLEXICORP_PANDO_LIB=" p; done=1; next }
+		{ print }
+		END { if (!done) print "FLEXICORP_PANDO_LIB=" p }
+	' "$ENV_FILE" >"$tmp"
+	mv "$tmp" "$ENV_FILE"
+	log "FLEXICORP_PANDO_LIB=$PANDO_LIB_DEST"
 fi
 
 if [[ -n "$TEITOK_VENV" ]]; then

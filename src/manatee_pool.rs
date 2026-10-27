@@ -28,6 +28,15 @@ use std::time::{Duration, Instant};
 pub const TOTAL_TTL: Duration = Duration::from_secs(600);
 pub const TOTALS_MAX: usize = 2000;
 
+/// (corpus, registry, query): what a total is remembered by.
+pub fn total_key(corpus: &str, req: &Value) -> (String, String, String) {
+    (
+        corpus.to_string(),
+        req.get("registry").and_then(Value::as_str).unwrap_or("").to_string(),
+        req.get("cql").and_then(Value::as_str).unwrap_or("").trim().to_string(),
+    )
+}
+
 /// Two crashes on a corpus within this time: the corpus is not queried for this long.
 const QUARANTINE: Duration = Duration::from_secs(600);
 const CRASHES_TO_QUARANTINE: u32 = 2;
@@ -232,20 +241,19 @@ impl Pool {
         e.0 += 1;
     }
 
+    /// The total of a `kwic` request's query, when it was counted within TOTAL_TTL.
+    pub fn known_total(&self, corpus: &str, req: &Value) -> Option<u64> {
+        let map = self.totals.lock().unwrap_or_else(|p| p.into_inner());
+        map.get(&total_key(corpus, req)).filter(|(_, at)| at.elapsed() < TOTAL_TTL).map(|(t, _)| *t)
+    }
+
     /// A `kwic` request ({"registry", "cql", "start", "size", …}) with the total remembered: when the
     /// query's total is known (counted within TOTAL_TTL), the worker walks only to the end of the
     /// page and the answer gets the known total ("total_reused": true); else it counts, and the
     /// total is kept.
     pub fn kwic(&self, corpus: &str, mut req: Value) -> Result<Value> {
-        let key = (
-            corpus.to_string(),
-            req.get("registry").and_then(Value::as_str).unwrap_or("").to_string(),
-            req.get("cql").and_then(Value::as_str).unwrap_or("").trim().to_string(),
-        );
-        let known = {
-            let map = self.totals.lock().unwrap_or_else(|p| p.into_inner());
-            map.get(&key).filter(|(_, at)| at.elapsed() < TOTAL_TTL).map(|(t, _)| *t)
-        };
+        let key = total_key(corpus, &req);
+        let known = self.known_total(corpus, &req);
         req["op"] = json!("kwic");
         req["count"] = json!(known.is_none());
         let mut res = self.call(corpus, req)?;

@@ -7,11 +7,11 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use libloading::{Library, Symbol};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_double, c_int, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 type ApiVersionFn = unsafe extern "C" fn() -> c_int;
 type BuildStringFn = unsafe extern "C" fn() -> *const c_char;
@@ -56,28 +56,99 @@ pub struct PandoLib {
     cached_api_version: i32,
 }
 
+/// Outcome of looking for libflexicorp_pando at startup (see `PandoLib::load`).
+pub struct LoadReport {
+    pub lib: Option<Arc<PandoLib>>,
+    /// The library in use, or the one that was found but could not be used.
+    pub path: Option<PathBuf>,
+    /// Why no library is in use.
+    pub error: Option<String>,
+    /// Every path looked at, with what happened ("not found", the load error, "loaded").
+    pub checked: Vec<String>,
+}
+
+/// How this FQS reaches pando, set once at startup: shown in /health and the admin backends
+/// view, and named in query errors when pando cannot run at all.
+static STATUS: OnceLock<Value> = OnceLock::new();
+
+pub fn set_status(status: Value) {
+    let _ = STATUS.set(status);
+}
+
+/// `{mode: "library"|"cli"|"unavailable", library_path, error, checked, cli}`; `{}` before startup.
+pub fn status() -> Value {
+    STATUS.get().cloned().unwrap_or_else(|| json!({}))
+}
+
+/// Why the library is not in use, for query errors ("library: …").
+pub fn unavailable_reason() -> Option<String> {
+    let s = STATUS.get()?;
+    if s.get("mode").and_then(Value::as_str) == Some("library") {
+        return None;
+    }
+    s.get("error").and_then(Value::as_str).map(str::to_string)
+}
+
 impl PandoLib {
-    pub fn load() -> Result<Arc<Self>> {
-        let path = resolve_lib_path().context("could not locate libflexicorp_pando")?;
+    /// Looks for the library: `$FLEXICORP_PANDO_LIB` alone when set; else next to the fqs
+    /// executable, flexicorp_pando's build folder beside this checkout (development only),
+    /// /usr/local/lib, /usr/lib. A library that is found but cannot be used (an old build
+    /// without a needed symbol, a wrong file) is reported and the next candidate tried.
+    pub fn load() -> LoadReport {
+        let mut report = LoadReport { lib: None, path: None, error: None, checked: Vec::new() };
+        let explicit = std::env::var("FLEXICORP_PANDO_LIB").ok().filter(|s| !s.trim().is_empty());
+        let candidates = match &explicit {
+            Some(p) => vec![PathBuf::from(p.trim())],
+            None => lib_candidates(),
+        };
+        for path in candidates {
+            if !path.is_file() {
+                report.checked.push(format!("{}: not found", path.display()));
+                if explicit.is_some() {
+                    report.error = Some(format!("FLEXICORP_PANDO_LIB={}: no such file", path.display()));
+                }
+                continue;
+            }
+            match Self::load_from(&path) {
+                Ok(lib) => {
+                    report.checked.push(format!("{}: loaded", path.display()));
+                    report.lib = Some(lib);
+                    report.path = Some(path);
+                    report.error = None;
+                    return report;
+                }
+                Err(e) => {
+                    report.checked.push(format!("{}: {e:#}", path.display()));
+                    if report.error.is_none() {
+                        report.error = Some(format!("{}: {e:#}", path.display()));
+                        report.path = Some(path);
+                    }
+                }
+            }
+        }
+        if report.error.is_none() {
+            report.error = Some(
+                "libflexicorp_pando not found (put it next to the fqs binary or set FLEXICORP_PANDO_LIB)"
+                    .to_string(),
+            );
+        }
+        report
+    }
+
+    pub fn load_from(path: &Path) -> Result<Arc<Self>> {
         // SAFETY: documented C ABI from flexicorp_pando.h
-        let lib = unsafe { Library::new(&path) }
-            .with_context(|| format!("failed to load {}", path.display()))?;
+        let lib = unsafe { Library::new(path) }.context("cannot be loaded")?;
         unsafe {
-            let api_version_fn: Symbol<ApiVersionFn> = lib.get(b"flexicorp_pando_api_version\0")?;
-            let build_string_fn: Symbol<BuildStringFn> = lib.get(b"flexicorp_pando_build_string\0")?;
-            let open: Symbol<OpenFn> = lib.get(b"flexicorp_pando_open\0")?;
-            let close: Symbol<CloseFn> = lib.get(b"flexicorp_pando_close\0")?;
-            let request: Symbol<RequestFn> = lib.get(b"flexicorp_pando_request\0")?;
-            let free: Symbol<FreeFn> = lib.get(b"flexicorp_pando_free\0")?;
-            let last_error: Symbol<LastErrorFn> = lib.get(b"flexicorp_pando_last_error\0")?;
-            let api_version_fn = *api_version_fn;
+            let api_version_fn: ApiVersionFn = required(&lib, "flexicorp_pando_api_version")?;
+            let build_string_fn: BuildStringFn = required(&lib, "flexicorp_pando_build_string")?;
+            let open: OpenFn = required(&lib, "flexicorp_pando_open")?;
+            let close: CloseFn = required(&lib, "flexicorp_pando_close")?;
+            let request: RequestFn = required(&lib, "flexicorp_pando_request")?;
+            let free: FreeFn = required(&lib, "flexicorp_pando_free")?;
+            let last_error: LastErrorFn = required(&lib, "flexicorp_pando_last_error")?;
             let ver = api_version_fn();
             if ver < 2 {
-                bail!(
-                    "libflexicorp_pando at {} reports api_version {} (need >= 2 for flexicorp_pando_request)",
-                    path.display(),
-                    ver
-                );
+                bail!("reports api_version {ver} (need >= 2 for flexicorp_pando_request): an old build");
             }
             let build_json_fn = if ver >= 3 {
                 lib.get::<BuildJsonFn>(b"flexicorp_pando_build_json\0")
@@ -109,21 +180,17 @@ impl PandoLib {
                 None
             };
             if ver >= 3 && (busy_fn.is_none() || idle_seconds_fn.is_none()) {
-                bail!(
-                    "libflexicorp_pando at {} claims api_version {} but missing busy/idle_seconds",
-                    path.display(),
-                    ver
-                );
+                bail!("claims api_version {ver} but is missing busy/idle_seconds");
             }
             Ok(Arc::new(Self {
-                build_string_fn: *build_string_fn,
+                build_string_fn,
                 build_json_fn,
-                open: *open,
+                open,
                 open_opts_fn,
-                close: *close,
-                request: *request,
-                free: *free,
-                last_error: *last_error,
+                close,
+                request,
+                free,
+                last_error,
                 busy_fn,
                 idle_seconds_fn,
                 xidx_fragments_fn,
@@ -304,38 +371,62 @@ impl PandoLib {
     }
 }
 
-fn resolve_lib_path() -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("FLEXICORP_PANDO_LIB") {
-        let pb = PathBuf::from(p);
-        if pb.is_file() {
-            return Ok(pb);
-        }
-    }
-    let names = if cfg!(target_os = "macos") {
-        vec!["libflexicorp_pando.dylib"]
+/// A symbol the library must have; its absence means an old or foreign build.
+unsafe fn required<T: Copy>(lib: &Library, name: &str) -> Result<T> {
+    let sym: Symbol<T> = unsafe { lib.get(format!("{name}\0").as_bytes()) }
+        .map_err(|e| anyhow!("missing symbol {name}, an old or incompatible build ({e})"))?;
+    Ok(*sym)
+}
+
+/// flexicorp_pando's build folder in a flexitools checkout next to this crate (development only).
+pub fn dev_build_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../flexencoder/flexicorp_pando/build")
+}
+
+/// Where to look when FLEXICORP_PANDO_LIB is not set. The build-tree path is compiled in and
+/// so only exists on the machine fqs was built on; releases rely on the executable's folder
+/// (install.sh puts the library there) or FLEXICORP_PANDO_LIB.
+fn lib_candidates() -> Vec<PathBuf> {
+    let name = if cfg!(target_os = "macos") {
+        "libflexicorp_pando.dylib"
     } else if cfg!(target_os = "windows") {
-        vec!["flexicorp_pando.dll"]
+        "flexicorp_pando.dll"
     } else {
-        vec!["libflexicorp_pando.so"]
+        "libflexicorp_pando.so"
     };
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            for n in &names {
-                candidates.push(dir.join(n));
-            }
+            candidates.push(dir.join(name));
         }
     }
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for n in &names {
-        candidates.push(manifest_dir.join("../flexicorp_pando/build").join(n));
-        candidates.push(PathBuf::from("/usr/local/lib").join(n));
-        candidates.push(PathBuf::from("/usr/lib").join(n));
+    candidates.push(dev_build_dir().join(name));
+    candidates.push(PathBuf::from("/usr/local/lib").join(name));
+    candidates.push(PathBuf::from("/usr/lib").join(name));
+    candidates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_that_is_no_library_is_reported_not_skipped() {
+        let dir = std::env::temp_dir().join(format!("fqs-pando-lib-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("libflexicorp_pando.so");
+        std::fs::write(&fake, b"not a library").unwrap();
+        let err = PandoLib::load_from(&fake).err().expect("a text file must not load");
+        assert!(format!("{err:#}").contains("cannot be loaded"), "{err:#}");
+        std::fs::remove_dir_all(&dir).ok();
     }
-    for c in candidates {
-        if c.is_file() {
-            return Ok(c);
-        }
+
+    #[test]
+    fn reason_only_when_the_library_is_not_in_use() {
+        // STATUS is process-wide, so this test is the only one that sets it
+        assert_eq!(unavailable_reason(), None);
+        set_status(json!({"mode": "cli", "error": "x: missing symbol flexicorp_pando_build_string"}));
+        assert_eq!(unavailable_reason().as_deref(), Some("x: missing symbol flexicorp_pando_build_string"));
+        assert_eq!(status()["mode"], "cli");
     }
-    bail!("set FLEXICORP_PANDO_LIB to libflexicorp_pando")
 }
