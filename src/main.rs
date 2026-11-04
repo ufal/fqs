@@ -36,6 +36,7 @@ mod limits;
 mod manatee_jobs;
 mod manatee_lib;
 mod query_lang;
+mod registry_info;
 mod manatee_pool;
 mod manatee_worker;
 mod pando_lib;
@@ -4960,7 +4961,7 @@ async fn http_root_with_state(State(state): State<HttpAppState>) -> Json<Value> 
             json!({"method":"POST", "path":"/reindex/jobs/mark-finished", "description":"Worker callback: mark finished"}),
             json!({"method":"POST", "path":"/query", "description":"Run query (JSON body: corpus, query, language?, start?, size?, request_role?)"}),
             json!({"method":"GET", "path":"/backends", "description":"Warm backend / HCM status"}),
-            json!({"method":"GET", "path":"/info", "description":"Pando corpus info (?corpus=)"}),
+            json!({"method":"GET", "path":"/info", "description":"Corpus info (?corpus=): attributes and structures, for every engine (CWB and Manatee from the registry)"}),
             json!({"method":"GET", "path":"/context", "description":"Pando KWIC context (?corpus=&pos=&left=&right=)"}),
             json!({"method":"GET", "path":"/fragment", "description":"TEITOK XML fragment from xidx (?corpus=&pos=&end=&context=&context_scope=) for KonText token_connect"}),
             json!({"method":"GET", "path":"/status", "description":"Async total job, pando or Manatee (?corpus=&job=)"}),
@@ -5774,7 +5775,32 @@ async fn http_pando_info(
     AxumQuery(q): AxumQuery<PandoCorpusQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     gate_corpus(&state, &headers, &q.corpus)?;
-    pando_dispatch_get(&state, &q.corpus, "/info", "").await
+    let corpus = state.catalog.get(&q.corpus).map_err(to_http_err)?;
+    let backend = resolve_effective_backend(&corpus).unwrap_or_default();
+    // CWB and Manatee: what the registry declares, in Pando's shape (registry_info.rs)
+    let registry = match backend.as_str() {
+        "pando" | "" => return pando_dispatch_get(&state, &q.corpus, "/info", "").await,
+        "cqp" => {
+            let name = corpus
+                .settings
+                .get("corpus_name")
+                .and_then(|v| v.as_str())
+                .or_else(|| corpus.settings.get("cqp_corpus").and_then(|v| v.as_str()))
+                .unwrap_or(&corpus.id)
+                .to_lowercase();
+            resolve_cqp_registry(&corpus).1.map(|dir| dir.join(name))
+        }
+        "manatee" => manatee_lib::registry_file(&corpus.settings, &corpus.id),
+        other => {
+            return Err((StatusCode::BAD_REQUEST, format!("/info is not supported for the {other} engine (corpus '{}')", corpus.id)));
+        }
+    };
+    let Some(file) = registry else {
+        return Err((StatusCode::NOT_FOUND, format!("no registry known for corpus '{}' ({backend})", corpus.id)));
+    };
+    let result = registry_info::info_from_registry_file(&file, corpus.corpus_size, &backend)
+        .map_err(|e| (StatusCode::NOT_FOUND, format!("corpus '{}': {e}", corpus.id)))?;
+    Ok(Json(json!({ "ok": true, "operation": "info", "result": result })))
 }
 
 async fn http_pando_status(
@@ -8562,6 +8588,30 @@ fn clone_process_command(cmd: &ProcessCommand) -> ProcessCommand {
     c
 }
 
+
+/// The working directory for `python -m flexicorp` (the CQP route): FLEXICORP_HOME when set; else a
+/// flexicorp checkout next to FQS's source tree (development: the package found from the current
+/// directory); else none, and the package comes from the Python that runs it (TEITOK's venv,
+/// PYTHON_BIN), as installed. Never a folder that is not there: the build folder is gone after an
+/// install, and starting in it failed as if Python were missing.
+fn flexicorp_workdir() -> Option<PathBuf> {
+    flexicorp_workdir_from(std::env::var("FLEXICORP_HOME").ok())
+}
+
+/// [`flexicorp_workdir`] for a given FLEXICORP_HOME.
+fn flexicorp_workdir_from(home: Option<String>) -> Option<PathBuf> {
+    if let Some(home) = home.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        let p = PathBuf::from(home);
+        return p.is_dir().then_some(p);
+    }
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let parent = src.parent()?.to_path_buf();
+    // fqs inside the flexicorp repo (flexicorp/fqs), or the fqs repo next to a flexicorp checkout
+    [parent.clone(), parent.join("flexicorp")]
+        .into_iter()
+        .find(|d| d.join("flexicorp").join("__init__.py").is_file())
+}
+
 fn run_flexicorp_cqp_query(
     corpus: &CorpusEntry,
     query_text: &str,
@@ -8592,16 +8642,15 @@ fn run_flexicorp_cqp_query(
     candidates.push("python".to_string());
     candidates.push("python3".to_string());
 
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let workdir = flexicorp_workdir();
     let mut last_err = String::new();
 
     for python_bin in candidates {
         let mut cmd = ProcessCommand::new(&python_bin);
-        cmd.current_dir(&repo_root)
-            .arg("-m")
+        if let Some(dir) = &workdir {
+            cmd.current_dir(dir);
+        }
+        cmd.arg("-m")
             .arg(flexicorp_module)
             .arg("query")
             .arg("--backend")
@@ -8656,7 +8705,10 @@ fn run_flexicorp_cqp_query(
         let output = match cmd.output() {
             Ok(o) => o,
             Err(e) => {
-                last_err = format!("{python_bin}: cannot be started ({e})");
+                last_err = match &workdir {
+                    Some(dir) => format!("{python_bin}: cannot be started in {} ({e})", dir.display()),
+                    None => format!("{python_bin}: cannot be started ({e})"),
+                };
                 continue;
             }
         };
@@ -9219,5 +9271,21 @@ mod catalog_fresh_tests {
         // TEITOK: upsert, then enqueue right away
         assert_eq!(cat.get("ntrex").unwrap().label, "NTREX");
         let _ = fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod flexicorp_workdir_tests {
+    use super::*;
+
+    #[test]
+    fn never_a_missing_folder() {
+        // the installer's build folder is gone after an install: no working directory, not that one
+        assert_eq!(flexicorp_workdir_from(Some("/nonexistent/teitok-stack-build".into())), None);
+        let here = std::env::temp_dir();
+        assert_eq!(flexicorp_workdir_from(Some(here.to_string_lossy().into())), Some(here));
+        if let Some(d) = flexicorp_workdir_from(None) {
+            assert!(d.join("flexicorp").join("__init__.py").is_file(), "only a real checkout: {}", d.display());
+        }
     }
 }
