@@ -5094,6 +5094,9 @@ async fn http_list_corpora(
         for (row, c) in items.iter_mut().zip(filtered.iter()) {
             if let Some(o) = row.as_object_mut() {
                 o.insert("query_languages".into(), json!(query_lang::corpus_languages(c)));
+                // real TEITOK XML around each hit (from xidx); without it a front end asks for
+                // synthetic fragments (`fragment: true`) built from the index
+                o.insert("xml_fragments".into(), json!(corpus_xidx_dir(c).is_some()));
             }
         }
     }
@@ -8174,7 +8177,7 @@ fn run_pando_query(
             .unwrap_or(true);
         if wants_xml && !extra.contains_key("fragment") {
             let root = &corpus.project_root;
-            if root.join("xidx").join("tokens.bin").is_file() {
+            if corpus_xidx_dir(corpus).is_some() {
                 let scope = query_options
                     .and_then(|q| q.context_scope.as_deref())
                     .map(str::trim)
@@ -8976,6 +8979,19 @@ fn is_likely_executable_file(path: &Path) -> bool {
     {
         true
     }
+}
+
+/// The corpus's xidx folder, when it has one: in the TEITOK project (flexencoder's default), else
+/// next to its pando index (`<index>/../xidx`), as when indexes are kept together in one place
+/// apart from the projects. Its XML stays in the project (the adapter reads it from there).
+fn corpus_xidx_dir(corpus: &CorpusEntry) -> Option<PathBuf> {
+    let in_project = corpus.project_root.join("xidx");
+    if in_project.join("tokens.bin").is_file() {
+        return Some(in_project);
+    }
+    let index = resolve_pando_index_dir(corpus).ok()?;
+    let beside = index.parent()?.join("xidx");
+    beside.join("tokens.bin").is_file().then_some(beside)
 }
 
 fn resolve_pando_index_dir(corpus: &CorpusEntry) -> Result<PathBuf> {
