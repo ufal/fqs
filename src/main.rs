@@ -37,6 +37,7 @@ mod manatee_jobs;
 mod manatee_lib;
 mod query_lang;
 mod registry_info;
+mod synthetic_fragment;
 mod manatee_pool;
 mod manatee_worker;
 mod pando_lib;
@@ -8401,6 +8402,14 @@ fn run_cqp_query(
         }
         hits.push(hit);
     }
+    // synthetic fragments (`fragment: true`, as for Pando): the hits' context with every token's
+    // attributes and the sentences, from cwb-decode
+    if query_options.and_then(|q| q.fragment).unwrap_or(false) && !hits.is_empty() {
+        let window = query_options.and_then(|q| q.window).unwrap_or(5).max(0) as i64;
+        if let Err(e) = add_cwb_fragments(corpus, &cqp_bin, &registry_dir, &corpus_name, &sattrs, window, &mut hits) {
+            eprintln!("[fqs] {}: CWB fragments: {e:#}", corpus.id);
+        }
+    }
     let lines = stdout
         .lines()
         .map(|l| strip_cqp_prompts(l).trim())
@@ -8461,8 +8470,18 @@ fn run_manatee_query(
         .and_then(Value::as_str)
         .map(fcs::engine::manatee_struct_attr)
         .or_else(|| manatee_lib::fullref(&registry));
+    // synthetic fragments (`fragment: true`, as for Pando): every token's attributes, `word` first
+    let want_fragment = query_options.and_then(|q| q.fragment).unwrap_or(false);
+    let frag_attrs: Vec<String> = if want_fragment {
+        std::fs::read_to_string(&registry).map(|t| registry_info::fragment_attributes(&t)).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     let t0 = Instant::now();
-    let req = json!({ "registry": registry, "cql": query_text, "start": start, "size": size, "window": window, "doc_attr": doc_attr });
+    let mut req = json!({ "registry": registry, "cql": query_text, "start": start, "size": size, "window": window, "doc_attr": doc_attr });
+    if !frag_attrs.is_empty() {
+        req["attrs"] = json!(frag_attrs);
+    }
     let total_async = query_options.and_then(|q| q.total.as_ref()).and_then(Value::as_str) == Some("async");
     let res = if total_async { manatee_jobs::kwic(&pool, &corpus.id, req)? } else { pool.kwic(&corpus.id, req)? };
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0;
@@ -8489,12 +8508,33 @@ fn run_manatee_query(
             .and_then(Value::as_array)
             .map(|ts| ts.iter().enumerate().map(|(i, t)| json!({ "pos": pos + i as i64, "word": t.get(0).and_then(Value::as_str).unwrap_or("") })).collect())
             .unwrap_or_default();
-        hits.push(json!({
+        let mut hit = json!({
             "match_start": pos, "match_end": end - 1, "left": left, "kwic": kwic, "right": right,
             "context": { "left": left, "match": kwic, "right": right },
             "doc_id": h.get("doc").cloned().unwrap_or(Value::Null),
             "tokens": tokens
-        }));
+        });
+        if !frag_attrs.is_empty() {
+            // the context's tokens with their attributes (Manatee gives no sentence boundaries here)
+            let side = |k: &str| h.get(k).and_then(Value::as_array).cloned().unwrap_or_default();
+            let (l, m, r) = (side("left"), side("kwic"), side("right"));
+            let mut pieces = Vec::new();
+            let mut match_ids = Vec::new();
+            for (first, part, is_match) in [(pos - l.len() as i64, &l, false), (pos, &m, true), (end, &r, false)] {
+                for (i, t) in part.iter().enumerate() {
+                    let vals: Vec<String> = t.as_array().map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect()).unwrap_or_default();
+                    let attrs: Vec<(String, String)> = frag_attrs.iter().cloned().zip(vals.iter().cloned()).collect();
+                    let p = first + i as i64;
+                    if is_match {
+                        match_ids.push(synthetic_fragment::tok_id(p, &attrs));
+                    }
+                    pieces.push(synthetic_fragment::Piece::Tok { pos: p, form: vals.first().cloned().unwrap_or_default(), attrs });
+                }
+            }
+            hit["fragment"] = json!(synthetic_fragment::build(&pieces));
+            hit["highlight_map"] = synthetic_fragment::highlight_map(&match_ids);
+        }
+        hits.push(hit);
     }
     let payload = json!({
         "success": true,
@@ -8813,6 +8853,102 @@ fn check_single_cqp_statement(query: &str) -> Result<()> {
             (None, ';') => anyhow::bail!("query must be a single CQP expression (no ';' outside quotes)"),
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// `fragment` and `highlight_map` for CWB hits (synthetic_fragment.rs): one `cwb-decode -p` call for
+/// the page, each hit's window `[match_start - window, match_end + window]` (within the corpus), with
+/// the registry's positional attributes and, when the registry has them, the `s` regions.
+fn add_cwb_fragments(
+    corpus: &CorpusEntry,
+    cqp_bin: &str,
+    registry_dir: &str,
+    corpus_name: &str,
+    sattrs: &HashSet<String>,
+    window: i64,
+    hits: &mut [Value],
+) -> Result<()> {
+    let reg_file = Path::new(registry_dir).join(corpus_name.to_lowercase());
+    let attrs = registry_info::fragment_attributes(&std::fs::read_to_string(&reg_file).with_context(|| format!("reading {}", reg_file.display()))?);
+    if attrs.is_empty() {
+        return Ok(());
+    }
+    // cwb-decode next to cqp (CQP_BINARY / settings.cqp_binary), else from the PATH
+    let decode = Path::new(cqp_bin).parent().filter(|d| !d.as_os_str().is_empty()).map(|d| d.join("cwb-decode")).filter(|p| p.is_file())
+        .map(|p| p.display().to_string()).unwrap_or_else(|| "cwb-decode".to_string());
+    // a window past the corpus end makes cwb-decode give up: the size from the catalogue, else asked
+    let size = match corpus.corpus_size.filter(|n| *n > 0) {
+        Some(n) => n,
+        None => {
+            let out = ProcessCommand::new(Path::new(&decode).with_file_name("cwb-describe-corpus"))
+                .arg("-r").arg(registry_dir).arg(corpus_name).output()?;
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("size (tokens):").and_then(|v| v.trim().parse::<i64>().ok()))
+                .ok_or_else(|| anyhow::anyhow!("corpus size unknown"))?
+        }
+    };
+    let mut ranges = Vec::new();
+    for h in hits.iter() {
+        let (Some(ms), Some(me)) = (h.get("match_start").and_then(Value::as_i64), h.get("match_end").and_then(Value::as_i64)) else {
+            ranges.push(None);
+            continue;
+        };
+        ranges.push(Some(((ms - window).max(0), (me + window).min(size - 1), ms, me)));
+    }
+    let stdin: String = ranges.iter().flatten().map(|(a, b, _, _)| format!("{a} {b}\n")).collect();
+    let mut cmd = ProcessCommand::new(&decode);
+    cmd.arg("-r").arg(registry_dir).arg("-Cx").arg("-n").arg("-p").arg(corpus_name);
+    for a in &attrs {
+        cmd.arg("-P").arg(a);
+    }
+    if sattrs.contains("s") {
+        cmd.arg("-S").arg("s");
+    }
+    let mut child = cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn()
+        .with_context(|| format!("starting {decode}"))?;
+    child.stdin.take().map(|mut i| i.write_all(stdin.as_bytes())).transpose()?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        anyhow::bail!("cwb-decode: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    // the windows in order, separated by blank lines: tokens "pos\tv1\tv2…", and <s> / </s>
+    let mut windows: Vec<Vec<synthetic_fragment::Piece>> = vec![Vec::new()];
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let l = line.trim_end_matches('\r');
+        if l.trim().is_empty() {
+            if !windows.last().map(Vec::is_empty).unwrap_or(true) {
+                windows.push(Vec::new());
+            }
+            continue;
+        }
+        if l.starts_with("<s>") || l.starts_with("<s ") {
+            windows.last_mut().unwrap().push(synthetic_fragment::Piece::SOpen);
+        } else if l.starts_with("</s>") {
+            windows.last_mut().unwrap().push(synthetic_fragment::Piece::SClose);
+        } else if !l.starts_with('<') {
+            let mut cells = l.split('\t');
+            let Some(pos) = cells.next().and_then(|c| c.trim().parse::<i64>().ok()) else { continue };
+            let vals: Vec<String> = cells.map(str::to_string).collect();
+            let form = vals.first().cloned().unwrap_or_default();
+            let attrs: Vec<(String, String)> = attrs.iter().cloned().zip(vals).collect();
+            windows.last_mut().unwrap().push(synthetic_fragment::Piece::Tok { pos, form, attrs });
+        }
+    }
+    let mut w = windows.into_iter();
+    for (h, r) in hits.iter_mut().zip(ranges) {
+        let Some((_, _, ms, me)) = r else { continue };
+        let Some(pieces) = w.next() else { break };
+        let match_ids: Vec<String> = pieces
+            .iter()
+            .filter_map(|p| match p {
+                synthetic_fragment::Piece::Tok { pos, attrs, .. } if *pos >= ms && *pos <= me => Some(synthetic_fragment::tok_id(*pos, attrs)),
+                _ => None,
+            })
+            .collect();
+        h["fragment"] = json!(synthetic_fragment::build(&pieces));
+        h["highlight_map"] = synthetic_fragment::highlight_map(&match_ids);
     }
     Ok(())
 }

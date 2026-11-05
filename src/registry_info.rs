@@ -123,6 +123,25 @@ fn named(name: &str, label: &Option<String>) -> Value {
     }
 }
 
+/// A positional attribute: derived from another one (Manatee's DYNAMIC, e.g. `lc` from `word`)?
+fn is_dynamic(it: &Item) -> bool {
+    it.inner.iter().any(|x| x.key == "DYNAMIC")
+}
+
+/// The positional attributes a registry declares, without the derived (DYNAMIC) ones, `word` first
+/// (the token's text), the others in order: the attributes a synthetic fragment's tokens carry
+/// (synthetic_fragment.rs).
+pub fn fragment_attributes(text: &str) -> Vec<String> {
+    let toks = tokens(text);
+    let mut i = 0;
+    let mut a: Vec<String> = items(&toks, &mut i).into_iter().filter(|x| x.key == "ATTRIBUTE" && !is_dynamic(x)).map(|x| x.name).collect();
+    if let Some(w) = a.iter().position(|x| x == "word") {
+        let word = a.remove(w);
+        a.insert(0, word);
+    }
+    a
+}
+
 /// CWB labels: `ATTRIBUTE name  # Label` / `STRUCTURE name  # Label` lines (no block on the line).
 fn line_comment_labels(text: &str) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
@@ -154,7 +173,17 @@ pub fn info_from_registry_text(text: &str, size: Option<i64>, engine: &str) -> V
         }
     }
     let corpus_name = top.iter().find(|x| x.key == "NAME").map(|x| x.name.clone()).unwrap_or_default();
-    let attributes: Vec<Value> = top.iter().filter(|x| x.key == "ATTRIBUTE").map(|x| named(&x.name, &x.label)).collect();
+    let attributes: Vec<Value> = top
+        .iter()
+        .filter(|x| x.key == "ATTRIBUTE")
+        .map(|x| {
+            let mut v = named(&x.name, &x.label);
+            if is_dynamic(x) {
+                v["dynamic"] = json!(true);   // derived from another attribute (Manatee DYNAMIC)
+            }
+            v
+        })
+        .collect();
     let structs: Vec<&Item> = top.iter().filter(|x| x.key == "STRUCTURE").collect();
     // CWB: `text_id` is an attribute of `text` when `text` is a structure of its own
     let is_flat_attr = |n: &str| {
@@ -247,6 +276,8 @@ STRUCTURE s
         let v = info_from_registry_text(reg, None, "manatee");
         assert_eq!(v["attributes"][0], json!({"name": "word", "label": "Word form"}));
         assert_eq!(v["attributes"][1]["name"], "lc");
+        assert_eq!(v["attributes"][1]["dynamic"], true);
+        assert_eq!(fragment_attributes(reg), vec!["word".to_string()], "lc is derived from word");
         let doc = &v["structures"][0];
         assert_eq!(doc["label"], "Document");
         assert_eq!(doc["region_attrs"], json!([{"name": "id"}, {"name": "title", "label": "Title"}]));
@@ -266,6 +297,7 @@ STRUCTURE s
 
     #[test]
     fn nested_owner_is_the_longest() {
+        assert_eq!(fragment_attributes("ATTRIBUTE pos\nATTRIBUTE word\nATTRIBUTE id\n"), vec!["word", "pos", "id"]);
         let reg = "STRUCTURE n\nSTRUCTURE np\nSTRUCTURE np_head\n";
         let v = info_from_registry_text(reg, None, "cqp");
         let st = v["structures"].as_array().unwrap();
