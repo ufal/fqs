@@ -724,6 +724,34 @@ options it was opened with until FQS closes and reopens it.
 
 `/health` → `limits` shows the tiers, free slots and the role trust mode.
 
+## Access by group
+
+A corpus can be restricted to groups, as KonText restricts corpora: its `settings.access` lists
+the groups that may use it (`["anonymous"]`, `["authenticated"]`, or named groups; `fqs corpora
+import` writes KonText's `access="…"` there). The caller's groups come from the front-end, in
+its signed token: a `groups` claim (a list, or a comma-separated string), next to `role` and
+`user`. Every caller is in `anonymous`, a signed-in one (role `user` or `admin`) also in
+`authenticated`. A caller may use the corpus when the two share a group; a corpus without
+`access` is open, as before. Only a verified token carries groups: without a secret nothing a
+request says about itself is checked.
+
+Whether this is applied: `access.mode` in the limits file (`{"access": {"mode": "report"}}`), or
+env `FQS_ACCESS_MODE`; a corpus's `settings.access_mode` overrides it, so one corpus can be
+switched on before the rest.
+
+* `off` (default) — `access` is not looked at;
+* `report` — decided, and every "would refuse" written to the activity log (event
+  `access_report`: corpus, route, role, groups, the corpus's `access`, whether the token was
+  verified, and the user as the log writes users), or to the service log without an activity
+  log; the request is answered as before. For checking a rollout against what the front-ends
+  decide before anything is refused;
+* `enforce` — refused (403, the message names the groups), and left out of `/corpora`,
+  `/labels` and FCS.
+
+The check covers every route that reads a corpus (`/query`, `/run`, `/info`, `/context`,
+`/fragment`, `/status`, `/session`, `/warm`). An admin caller passes (`access.admin_bypass`,
+default `true`). `/health` → `access.mode`.
+
 ## Activity log
 
 `fqs serve --activity-log FILE` (or `FQS_ACTIVITY_LOG`) writes one JSON object
@@ -738,6 +766,7 @@ rotates like the request log (`--log-max-bytes`, `--log-keep-files`).
 | `warm_close` | `corpus`, `reason` (`lru`: room for another corpus; `idle`: idle TTL), `age_secs`, `idle_secs`, `requests` served |
 | `warm_full` | no room could be made (all open corpora in use, or the oldest still counting): FQS goes over `--pando-max-warm` for a while |
 | `warm_state` | every `--activity-state-secs` (default 300; 0 = none): the open corpora with age, idle time and requests, and the process's `rss_bytes` |
+| `access_report` | access mode `report`: a request the group check would refuse (`corpus`, `route`, `role`, `groups`, `access`, `verified`, `user`); see "Access by group" |
 
 `--activity-events queries|warm|all` (default all) picks what is logged.
 `--activity-log-users hash|plain|none` (default hash): the user is the identity

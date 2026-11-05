@@ -71,6 +71,8 @@ pub struct Limits {
     process: Arc<Semaphore>,
     process_n: usize,
     process_queue: Duration,
+    /// per-corpus access by group (access.rs): the file's `access`, FQS_ACCESS_MODE
+    access: crate::access::Config,
 }
 
 fn default_process_slots() -> usize {
@@ -84,6 +86,8 @@ pub struct Caller {
     pub tier: String,
     pub user: String,
     pub verified: bool,
+    /// the verified token's `groups` (empty without one): access.rs
+    pub groups: Vec<String>,
 }
 
 /// Held while a heavy request runs (moved into its blocking task).
@@ -130,6 +134,7 @@ impl Limits {
             process: Arc::new(Semaphore::new(default_process_slots())),
             process_n: default_process_slots(),
             process_queue: Duration::from_secs(30),
+            access: crate::access::Config::from(&Value::Null),
         })
     }
 
@@ -171,7 +176,9 @@ impl Limits {
             .unwrap_or_else(default_process_slots);
         let process_queue =
             Duration::from_millis(config.get("process_queue_ms").and_then(Value::as_u64).unwrap_or(30000));
+        let access = crate::access::Config::from(&config);
         Ok(Arc::new(Self {
+            access,
             config,
             default_tier,
             tier_names,
@@ -261,7 +268,7 @@ impl Limits {
         session_id: Option<&str>,
         client_ip: &str,
     ) -> Caller {
-        let (role, sub, verified) = match &self.jwt_secret {
+        let (role, sub, verified, groups) = match &self.jwt_secret {
             Some(secret) => match bearer_claims(headers, secret) {
                 Some(claims) => (
                     normalize_role(claims.get("role").and_then(Value::as_str)),
@@ -271,10 +278,12 @@ impl Limits {
                         .and_then(Value::as_str)
                         .map(str::to_string),
                     true,
+                    crate::access::groups_from_claim(claims.get("groups")),
                 ),
-                None => ("visitor".to_string(), None, false),
+                None => ("visitor".to_string(), None, false, Vec::new()),
             },
-            None => (normalize_role(request_role), None, false),
+            // without a secret nothing the request says about itself is checked: no groups from it
+            None => (normalize_role(request_role), None, false, Vec::new()),
         };
         let tier = if self.tiers.contains_key(&role) { role.clone() } else { self.default_tier.clone() };
         let user = sub
@@ -282,11 +291,16 @@ impl Limits {
             .filter(|s| !s.is_empty())
             .or_else(|| session_id.filter(|s| !s.is_empty()).map(|s| format!("session:{s}")))
             .unwrap_or_else(|| format!("ip:{client_ip}"));
-        Caller { role, tier, user, verified }
+        Caller { role, tier, user, verified, groups }
     }
 
     /// True when FQS runs with a JWT secret: roles then come only from verified tokens.
     /// Without one (local dev) the request's role hint is believed, as in [`Limits::caller`].
+    /// Per-corpus access by group (access.rs).
+    pub fn access(&self) -> &crate::access::Config {
+        &self.access
+    }
+
     pub fn auth_enabled(&self) -> bool {
         self.jwt_secret.is_some()
     }
@@ -492,7 +506,7 @@ mod tests {
     #[tokio::test]
     async fn admission_per_user_and_slots() {
         let l = limits(None);
-        let v1 = Caller { role: "visitor".into(), tier: "visitor".into(), user: "a".into(), verified: false };
+        let v1 = Caller { role: "visitor".into(), tier: "visitor".into(), user: "a".into(), verified: false, groups: Vec::new() };
         let v2 = Caller { user: "b".into(), ..v1.clone() };
         let p1 = l.admit(&v1).await.expect("first visitor");
         assert_eq!(l.admit(&v1).await.err().map(|e| e.0), Some(StatusCode::TOO_MANY_REQUESTS));
@@ -500,10 +514,10 @@ mod tests {
         assert_eq!(l.admit(&v2).await.err().map(|e| e.0), Some(StatusCode::SERVICE_UNAVAILABLE));
         drop(p1);
         let p2 = l.admit(&v2).await.expect("slot free again");
-        let u = Caller { role: "user".into(), tier: "user".into(), user: "c".into(), verified: false };
+        let u = Caller { role: "user".into(), tier: "user".into(), user: "c".into(), verified: false, groups: Vec::new() };
         let p3 = l.admit(&u).await.expect("user uses the second global slot");
         // global heavy_slots (2) exhausted: admin waits its default queue (5 s)… use a short check
-        let a = Caller { role: "admin".into(), tier: "admin".into(), user: "d".into(), verified: false };
+        let a = Caller { role: "admin".into(), tier: "admin".into(), user: "d".into(), verified: false, groups: Vec::new() };
         let t0 = std::time::Instant::now();
         let r = tokio::time::timeout(Duration::from_millis(200), l.admit(&a)).await;
         assert!(r.is_err() && t0.elapsed() < Duration::from_secs(1), "admin waits for a global slot");

@@ -41,6 +41,7 @@ mod synthetic_fragment;
 mod xidx_build;
 mod engine_status;
 mod catalog_import;
+mod access;
 mod manatee_pool;
 mod manatee_worker;
 mod pando_lib;
@@ -3811,6 +3812,8 @@ async fn http_health(State(state): State<HttpAppState>) -> Json<Value> {
         // only how pando runs; paths and reasons are in the admin health
         "pando": {"mode": pando_lib::status().get("mode").cloned().unwrap_or(Value::Null)},
         "engines": engines,
+        // per-corpus access by group (access.rs): off, report or enforce
+        "access": {"mode": state.limits.access().mode.as_str()},
     }))
 }
 
@@ -3854,6 +3857,7 @@ fn detailed_health_body(state: &HttpAppState) -> Value {
     body["pando"] = pando_status_json(state);
     body["engines"] = engine_status::engines(&body["pando"], true, Some(&corpora_per_engine(state)));
     body["limits"] = state.limits.status_json();
+    body["access"] = state.limits.access().status_json();
     body
 }
 
@@ -5123,7 +5127,8 @@ async fn http_list_corpora(
     AxumQuery(params): AxumQuery<HttpCorporaQuery>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let role = route_caller(&state, &headers, params.request_role.as_deref()).role;
+    let caller = route_caller(&state, &headers, params.request_role.as_deref());
+    let role = caller.role.clone();
     let include_noncurrent = params.include_noncurrent.unwrap_or(false);
     let requested_facets =
         services::parse_facet_params(raw.as_deref(), params.facets.as_deref());
@@ -5152,7 +5157,8 @@ async fn http_list_corpora(
 
     let filtered: Vec<CorpusEntry> = corpora
         .into_iter()
-        .filter(|c| is_http_access_allowed(c, &role) && is_http_operation_allowed(c, "catalog"))
+        // restricted corpora are left out of lists only in enforce mode (access.rs)
+        .filter(|c| is_http_access_allowed(c, &role) && is_http_operation_allowed(c, "catalog") && access::listed(state.limits.access(), &c.settings, &caller))
         .filter(|c| {
             if frontend.as_deref() != Some("teitok") {
                 return true;
@@ -5229,7 +5235,8 @@ async fn http_browse_labels(
     AxumQuery(params): AxumQuery<HttpCorporaQuery>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let role = route_caller(&state, &headers, params.request_role.as_deref()).role;
+    let caller = route_caller(&state, &headers, params.request_role.as_deref());
+    let role = caller.role.clone();
     let include_noncurrent = params.include_noncurrent.unwrap_or(false);
     let requested_facets =
         services::parse_facet_params(raw.as_deref(), params.facets.as_deref());
@@ -5247,7 +5254,8 @@ async fn http_browse_labels(
 
     let filtered: Vec<CorpusEntry> = corpora
         .into_iter()
-        .filter(|c| is_http_access_allowed(c, &role) && is_http_operation_allowed(c, "catalog"))
+        // restricted corpora are left out of lists only in enforce mode (access.rs)
+        .filter(|c| is_http_access_allowed(c, &role) && is_http_operation_allowed(c, "catalog") && access::listed(state.limits.access(), &c.settings, &caller))
         .filter(|c| {
             if frontend.as_deref() != Some("teitok") {
                 return true;
@@ -5609,6 +5617,9 @@ async fn http_query_inner(
     if !is_http_access_allowed(&corpus, &role) {
         policy_reasons.push(format!("http access disabled by mode '{}'", corpus.http_policy_mode));
     }
+    if let access::Check::Refuse(msg) = access_check(&state, &corpus, &caller, "/query") {
+        policy_reasons.push(msg);
+    }
     if !is_http_operation_allowed(&corpus, "query") {
         policy_reasons.push("query operation not allowed for this corpus".to_string());
     }
@@ -5754,7 +5765,7 @@ async fn http_warm(
     headers: HeaderMap,
     Json(req): Json<WarmRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    gate_corpus(&state, &headers, &req.corpus)?;
+    gate_corpus(&state, &headers, &req.corpus, "/warm")?;
     let corpus = state.catalog.get(&req.corpus).map_err(to_http_err)?;
     let backend = resolve_effective_backend(&corpus).unwrap_or_default();
     let target: Option<(PathBuf, &'static [&'static str])> = match backend.as_str() {
@@ -5899,7 +5910,7 @@ async fn http_pando_info(
     headers: HeaderMap,
     AxumQuery(q): AxumQuery<PandoCorpusQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    gate_corpus(&state, &headers, &q.corpus)?;
+    gate_corpus(&state, &headers, &q.corpus, "/info")?;
     let corpus = state.catalog.get(&q.corpus).map_err(to_http_err)?;
     let backend = resolve_effective_backend(&corpus).unwrap_or_default();
     // CWB and Manatee: what the registry declares, in Pando's shape (registry_info.rs)
@@ -5933,7 +5944,7 @@ async fn http_pando_status(
     headers: HeaderMap,
     AxumQuery(q): AxumQuery<PandoCorpusQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    gate_corpus(&state, &headers, &q.corpus)?;
+    gate_corpus(&state, &headers, &q.corpus, "/status")?;
     let job = q.job.as_deref().unwrap_or("");
     if job.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "job is required".to_string()));
@@ -5952,7 +5963,7 @@ async fn http_pando_context(
     headers: HeaderMap,
     AxumQuery(q): AxumQuery<PandoCorpusQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    gate_corpus(&state, &headers, &q.corpus)?;
+    gate_corpus(&state, &headers, &q.corpus, "/context")?;
     let pos = q.pos.as_deref().unwrap_or("");
     if pos.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "pos is required".to_string()));
@@ -5978,7 +5989,7 @@ async fn http_pando_fragment(
     headers: HeaderMap,
     AxumQuery(q): AxumQuery<PandoCorpusQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    gate_corpus(&state, &headers, &q.corpus)?;
+    gate_corpus(&state, &headers, &q.corpus, "/fragment")?;
     let pos_s = q.pos.as_deref().unwrap_or("").trim();
     if pos_s.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "pos is required".to_string()));
@@ -6135,7 +6146,7 @@ async fn http_pando_run_inner(
     );
     rec.caller(&caller);
     let corpus = state.catalog.get(&req.corpus).map_err(to_http_err)?;
-    gate_corpus_role(&corpus, &caller.role)?;
+    gate_corpus_role(&state, &corpus, &caller, "/run")?;
     // the program's language (`language`, or pando's own `dialect`): one the corpus accepts for pando
     // (query_lang.rs), passed on as pando's dialect
     let mut requested_language = str_field("language").or_else(|| str_field("dialect")).unwrap_or_default();
@@ -6249,7 +6260,7 @@ async fn http_pando_session_create(
     headers: HeaderMap,
     Json(req): Json<PandoSessionRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    gate_corpus(&state, &headers, &req.corpus)?;
+    gate_corpus(&state, &headers, &req.corpus, "/session")?;
     let mut body = json!({});
     if let Some(sid) = req.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         if !valid_engine_session_id(sid) {
@@ -6268,7 +6279,7 @@ async fn http_pando_session_info(
     headers: HeaderMap,
     AxumQuery(q): AxumQuery<PandoCorpusQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    gate_corpus(&state, &headers, &q.corpus)?;
+    gate_corpus(&state, &headers, &q.corpus, "/session")?;
     let sid = q.session_id.as_deref().unwrap_or("").trim().to_string();
     if !valid_engine_session_id(&sid) {
         return Err((StatusCode::BAD_REQUEST, "session_id is required".to_string()));
@@ -6281,7 +6292,7 @@ async fn http_pando_session_close(
     headers: HeaderMap,
     Json(req): Json<PandoSessionRequest>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    gate_corpus(&state, &headers, &req.corpus)?;
+    gate_corpus(&state, &headers, &req.corpus, "/session")?;
     let sid = req.session_id.as_deref().unwrap_or("").trim().to_string();
     if !valid_engine_session_id(&sid) {
         return Err((StatusCode::BAD_REQUEST, "session_id is required".to_string()));
@@ -6393,13 +6404,17 @@ fn fcs_resource(state: &HttpAppState, corpus: &CorpusEntry) -> Option<fcs::Resou
 }
 
 /// The FCS resources a caller may search (FCS-enabled, current, HTTP-visible).
-fn fcs_resources(state: &HttpAppState, role: &str) -> Vec<(fcs::Resource, CorpusEntry)> {
+fn fcs_resources(state: &HttpAppState, caller: &Caller) -> Vec<(fcs::Resource, CorpusEntry)> {
+    let role = caller.role.as_str();
     state
         .catalog
         .list(None, false, None)
         .into_iter()
         .filter(|c| is_fcs_enabled(c))
-        .filter(|c| state.test_mode || (is_http_access_allowed(c, role) && is_http_operation_allowed(c, "query")))
+        .filter(|c| {
+            state.test_mode
+                || (is_http_access_allowed(c, role) && is_http_operation_allowed(c, "query") && access::listed(state.limits.access(), &c.settings, caller))
+        })
         .filter_map(|c| fcs_resource(state, &c).map(|r| (r, c)))
         .collect()
 }
@@ -6582,7 +6597,7 @@ async fn http_fcs(
     let ep = fcs_endpoint(&state);
     // FCS clients (the aggregator) are anonymous unless a front end signs a token
     let caller = state.limits.caller(&headers, None, None, None, &header_client_ip(&headers));
-    let visible = fcs_resources(&state, &caller.role);
+    let visible = fcs_resources(&state, &caller);
     let resources: Vec<fcs::Resource> = visible.iter().map(|(r, _)| r.clone()).collect();
     let req = match fcs::parse_request(&params, &ep) {
         Ok(r) => r,
@@ -6800,20 +6815,39 @@ fn route_caller(state: &HttpAppState, headers: &HeaderMap, role_hint: Option<&st
 }
 
 /// The access rule of `/query`, for every other route that reads corpus content
-/// (`/run`, `/info`, `/context`, `/fragment`, `/status`, `/session*`).
-fn gate_corpus_role(corpus: &CorpusEntry, role: &str) -> Result<(), (StatusCode, String)> {
+/// (`/run`, `/info`, `/context`, `/fragment`, `/status`, `/session*`, `/warm`): the corpus's
+/// http policy for the role, then its groups (access.rs).
+fn gate_corpus_role(state: &HttpAppState, corpus: &CorpusEntry, caller: &Caller, route: &str) -> Result<(), (StatusCode, String)> {
+    let role = caller.role.as_str();
     if !is_http_access_allowed(corpus, role) || !is_http_operation_allowed(corpus, "query") {
         return Err((
             StatusCode::FORBIDDEN,
             format!("access to corpus '{}' is not allowed for role '{role}'", corpus.id),
         ));
     }
-    Ok(())
+    match access_check(state, corpus, caller, route) {
+        access::Check::Pass => Ok(()),
+        access::Check::Refuse(msg) => Err((StatusCode::FORBIDDEN, msg)),
+    }
 }
 
-fn gate_corpus(state: &HttpAppState, headers: &HeaderMap, corpus_id: &str) -> Result<(), (StatusCode, String)> {
+/// The group check of one request; a "would refuse" (report mode) goes to the activity log, or to
+/// the service log when there is none.
+fn access_check(state: &HttpAppState, corpus: &CorpusEntry, caller: &Caller, route: &str) -> access::Check {
+    access::check(state.limits.access(), &corpus.id, &corpus.settings, caller, route, |mut f| match &state.activity {
+        Some(a) => {
+            if let Some(u) = a.user_field(&caller.user) {
+                f.insert("user".into(), json!(u));
+            }
+            a.event("access_report", f);
+        }
+        None => eprintln!("[fqs] access_report {}", Value::Object(f)),
+    })
+}
+
+fn gate_corpus(state: &HttpAppState, headers: &HeaderMap, corpus_id: &str, route: &str) -> Result<(), (StatusCode, String)> {
     let corpus = state.catalog.get(corpus_id).map_err(to_http_err)?;
-    gate_corpus_role(&corpus, &route_caller(state, headers, None).role)
+    gate_corpus_role(state, &corpus, &route_caller(state, headers, None), route)
 }
 
 /// Admin-only when FQS runs with a JWT secret (reindex control, worker callbacks,
