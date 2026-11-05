@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use fqs in your research, please cite it as below."
+type: software
+title: "fqs"
+abstract: "Uniform search server over corpus engines (CWB, pando, Manatee): one HTTP API, a corpus catalogue, admission limits, a CLARIN-FCS 2.0 endpoint and an admin UI."
+authors:
+  - family-names: Janssen
+    given-names: Maarten
+    affiliation: "Institute of Formal and Applied Linguistics, Charles University"
+license: MIT
+repository-code: "https://github.com/ufal/fqs"

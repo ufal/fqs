@@ -801,3 +801,9 @@ through every hit per request and are not stored in sessions.
 
 - `fqs query` currently supports `pando` and `cqp`; other backends return `not implemented yet`.
 - The HTTP surface is intended as the primary control/query interface for UI integrations.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE). Exception: the optional Manatee plug-in in [`manatee/`](manatee/) links manatee-open and is GPL-2.0 (FQS loads it at run time only when it is installed).
+
+If you use fqs in research, please cite it: [`CITATION.cff`](CITATION.cff) has the reference (GitHub shows it as "Cite this repository").
