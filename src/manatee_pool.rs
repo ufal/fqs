@@ -61,6 +61,13 @@ pub struct Pool {
     totals: Mutex<HashMap<(String, String, String), (u64, Instant)>>,
 }
 
+/// Why the pool did not start although FQS_MANATEE_LIB is set (engine_status.rs).
+static START_ERROR: OnceLock<String> = OnceLock::new();
+
+pub fn start_error() -> Option<String> {
+    START_ERROR.get().cloned()
+}
+
 /// The pool, started once (None without FQS_MANATEE_LIB, or when a worker cannot load the library:
 /// the reason is logged and FQS runs without native Manatee).
 pub fn global() -> Option<Arc<Pool>> {
@@ -74,6 +81,7 @@ pub fn global() -> Option<Arc<Pool>> {
             }
             Err(e) => {
                 eprintln!("[fqs] FQS_MANATEE_LIB: {e:#}; native Manatee is off");
+                let _ = START_ERROR.set(format!("{e:#}"));
                 None
             }
         }
@@ -206,6 +214,28 @@ impl Pool {
             crashes: Mutex::new(HashMap::new()),
             totals: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// (workers, running, busy): how many there are, how many run now (busy ones included; the
+    /// others start on first use or after one ended), and how many answer a query now.
+    pub fn worker_counts(&self) -> (usize, usize, usize) {
+        let (mut running, mut busy) = (0, 0);
+        for slot in &self.workers {
+            match slot.try_lock() {
+                Ok(mut g) => {
+                    if let Some(w) = g.as_mut() {
+                        if matches!(w.child.try_wait(), Ok(None)) {
+                            running += 1;
+                        }
+                    }
+                }
+                Err(_) => {
+                    running += 1;
+                    busy += 1;
+                }
+            }
+        }
+        (self.workers.len(), running, busy)
     }
 
     /// A free worker if there is one, else wait for the next in turn.

@@ -310,7 +310,8 @@ cargo run -- status --host 127.0.0.1 --port 8787
 
 Endpoints:
 
-- `GET /health` — minimal public liveness (`ok`, `service`, `version`, optional `server_name`). Full details on `GET /admin/api/health` (admin JWT).
+- `GET /health` — minimal public liveness (`ok`, `service`, `version`, optional `server_name`), and per engine whether it can run and how: `engines: {"pando": {"available": true, "mode": "library"}, "cqp": {…, "mode": "process"}, "manatee": {…, "mode": "native"}}`. Full details on `GET /admin/api/health` (admin JWT).
+- `GET /backends` — one entry per engine in the same shape: `available`, `mode`, `version`, `error` when it can't run, the number of current `corpora` it serves, and for native Manatee `workers`, `workers_running` (the others start on first use) and `workers_busy`. Monitoring can alert on `available: false` (e.g. Manatee corpora in the catalogue, Manatee not available). File paths and detailed errors (which may name paths) only for an admin caller (admin JWT); `pando` keeps the library's status, without paths for others. Native Manatee here is FQS's own (`FQS_MANATEE_LIB`), not KonText's Python bindings, which `/admin/api/backends` lists apart.
 - `GET /corpora?request_role=visitor|admin&tag=<browse-label>&frontend=teitok&facet=lang:cs&facet=feature:spoken&q=…&view=browse` — catalog list; `frontend=teitok` keeps TEITOK-listable rows; repeated `facet=` is AND across groups / OR within; `view=browse` returns a public DTO (no `project_root` / settings dump)
 - `GET /labels?frontend=teitok&facet=…` — distinct browse labels plus `facets` groups with counts (KonText-style)
 - `GET /reindex/jobs?status=queued&corpus=<id>&limit=100` — queue/running overview

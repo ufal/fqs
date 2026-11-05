@@ -1751,7 +1751,7 @@ fn pando_notes(hot: bool, status: &Value) -> Vec<String> {
     notes
 }
 
-fn which_bin(candidates: &[Option<&str>]) -> Option<String> {
+pub(crate) fn which_bin(candidates: &[Option<&str>]) -> Option<String> {
     for c in candidates.iter().flatten() {
         let t = c.trim();
         if t.is_empty() {
@@ -1773,7 +1773,7 @@ fn which_bin(candidates: &[Option<&str>]) -> Option<String> {
     None
 }
 
-fn version_from_cmd(bin: &str, args: &[&str]) -> Option<String> {
+pub(crate) fn version_from_cmd(bin: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(bin).args(args).output().ok()?;
     let text = format!(
         "{}{}",

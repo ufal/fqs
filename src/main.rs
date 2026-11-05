@@ -39,6 +39,7 @@ mod query_lang;
 mod registry_info;
 mod synthetic_fragment;
 mod xidx_build;
+mod engine_status;
 mod manatee_pool;
 mod manatee_worker;
 mod pando_lib;
@@ -3704,6 +3705,11 @@ fn execute_reindex_job_for_worker(db_path: &Path, job_id: &str, worker_id: &str)
 
 async fn http_health(State(state): State<HttpAppState>) -> Json<Value> {
     // Public: deliberately minimal (no db path, slots, engine options, admin flag).
+    let pando = pando_status_json(&state);
+    // whether each engine can run, and how (engine_status.rs; the cqp check starts a process now and then)
+    let engines = tokio::task::spawn_blocking(move || engine_status::summary(&engine_status::engines(&pando, false, None)))
+        .await
+        .unwrap_or(Value::Null);
     Json(json!({
         "ok": true,
         "service": "fqs",
@@ -3713,7 +3719,19 @@ async fn http_health(State(state): State<HttpAppState>) -> Json<Value> {
         "server_name": state.server_name,
         // only how pando runs; paths and reasons are in the admin health
         "pando": {"mode": pando_lib::status().get("mode").cloned().unwrap_or(Value::Null)},
+        "engines": engines,
     }))
+}
+
+/// Current catalogue rows per engine (pando / cqp / manatee).
+fn corpora_per_engine(state: &HttpAppState) -> std::collections::BTreeMap<String, usize> {
+    let mut counts = std::collections::BTreeMap::new();
+    for c in state.catalog.list(None, false, None) {
+        if let Ok(b) = resolve_effective_backend(&c) {
+            *counts.entry(b).or_insert(0) += 1;
+        }
+    }
+    counts
 }
 
 /// The warm manager's status plus how pando was set up at startup (mode, library path, error).
@@ -3743,6 +3761,7 @@ fn detailed_health_body(state: &HttpAppState) -> Value {
         body["activity_log"] = a.status_json();
     }
     body["pando"] = pando_status_json(state);
+    body["engines"] = engine_status::engines(&body["pando"], true, Some(&corpora_per_engine(state)));
     body["limits"] = state.limits.status_json();
     body
 }
@@ -4962,7 +4981,7 @@ async fn http_root_with_state(State(state): State<HttpAppState>) -> Json<Value> 
             json!({"method":"POST", "path":"/reindex/jobs/mark-started", "description":"Worker callback: mark started"}),
             json!({"method":"POST", "path":"/reindex/jobs/mark-finished", "description":"Worker callback: mark finished"}),
             json!({"method":"POST", "path":"/query", "description":"Run query (JSON body: corpus, query, language?, start?, size?, request_role?)"}),
-            json!({"method":"GET", "path":"/backends", "description":"Warm backend / HCM status"}),
+            json!({"method":"GET", "path":"/backends", "description":"Every engine's status (pando, cqp, native Manatee): available, mode, version, corpora"}),
             json!({"method":"GET", "path":"/info", "description":"Corpus info (?corpus=): attributes and structures, for every engine (CWB and Manatee from the registry)"}),
             json!({"method":"GET", "path":"/context", "description":"Pando KWIC context (?corpus=&pos=&left=&right=)"}),
             json!({"method":"GET", "path":"/fragment", "description":"TEITOK XML fragment from xidx (?corpus=&pos=&end=&context=&context_scope=) for KonText token_connect"}),
@@ -5725,10 +5744,20 @@ struct PandoRunRequest {
     extra: HashMap<String, Value>,
 }
 
-async fn http_backends(State(state): State<HttpAppState>) -> Json<Value> {
+/// Every engine's status (engine_status.rs), with how many current corpora each one serves; file
+/// paths only for an admin caller. `pando`: the library's status as before (without paths for others).
+async fn http_backends(State(state): State<HttpAppState>, headers: HeaderMap) -> Json<Value> {
+    let admin = admin::require_admin(&state.limits, &headers).is_ok();
+    let pando = pando_status_json(&state);
+    let counts = corpora_per_engine(&state);
+    let p = pando.clone();
+    let engines = tokio::task::spawn_blocking(move || engine_status::engines(&p, admin, Some(&counts)))
+        .await
+        .unwrap_or(Value::Null);
     Json(json!({
         "ok": true,
-        "pando": pando_status_json(&state),
+        "pando": if admin { pando } else { engine_status::pando_status_public(&pando) },
+        "engines": engines,
     }))
 }
 
