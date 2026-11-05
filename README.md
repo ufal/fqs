@@ -750,7 +750,8 @@ switched on before the rest.
 
 The check covers every route that reads a corpus (`/query`, `/run`, `/info`, `/context`,
 `/fragment`, `/status`, `/session`, `/warm`). An admin caller passes (`access.admin_bypass`,
-default `true`). `/health` → `access.mode`.
+default `true`). `/health` → `access.mode`. Which groups may use a corpus is for admins: `/corpora`
+leaves `settings.access` and `settings.access_mode` out for other callers.
 
 ## Activity log
 

@@ -152,6 +152,14 @@ pub fn check(cfg: &Config, id: &str, settings: &Value, caller: &Caller, route: &
     Check::Refuse(format!("corpus '{id}' is restricted to {} (your groups: {})", open_to.join(", "), caller_groups(caller).join(", ")))
 }
 
+/// A corpus's settings as a non-admin sees them: without its groups (`access`) and `access_mode`.
+pub fn hide_from_non_admin(settings: &mut Value) {
+    if let Some(o) = settings.as_object_mut() {
+        o.remove("access");
+        o.remove("access_mode");
+    }
+}
+
 /// Is the corpus listed for this caller (corpus lists, FCS)? Only enforce leaves corpora out.
 pub fn listed(cfg: &Config, settings: &Value, caller: &Caller) -> bool {
     cfg.mode_for(settings) != Mode::Enforce || allowed(cfg, settings, caller)
@@ -201,6 +209,13 @@ mod tests {
         let off = Config { mode: Mode::Off, admin_bypass: true };
         assert!(matches!(check(&off, "c", &early, &v, "/query", |_| ()), Check::Refuse(_)));
         assert!(matches!(check(&off, "c", &acad, &v, "/query", |_| panic!("off")), Check::Pass));
+    }
+
+    #[test]
+    fn hidden_settings() {
+        let mut s = json!({"access": ["acad"], "access_mode": "enforce", "description": "d"});
+        hide_from_non_admin(&mut s);
+        assert_eq!(s, json!({"description": "d"}));
     }
 
     #[test]

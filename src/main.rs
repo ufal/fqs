@@ -5211,6 +5211,12 @@ async fn http_list_corpora(
     if let Value::Array(items) = &mut rows {
         for (row, c) in items.iter_mut().zip(filtered.iter()) {
             if let Some(o) = row.as_object_mut() {
+                // which groups may use a corpus is for admins (access.rs)
+                if role != "admin" {
+                    if let Some(s) = o.get_mut("settings") {
+                        access::hide_from_non_admin(s);
+                    }
+                }
                 o.insert("query_languages".into(), json!(query_lang::corpus_languages(c)));
                 // real TEITOK XML around each hit (from xidx); without it a front end asks for
                 // synthetic fragments (`fragment: true`) built from the index
