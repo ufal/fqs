@@ -83,6 +83,7 @@ Current capabilities:
 - `query` command with live execution for `pando` corpora (via `flexicorp-pando` CLI)
 - `corpora validate` command (basic + full probe mode; optional `--enrich`)
 - `corpora enrich` — one-shot languages/features/interfaces from on-disk TEITOK/pando/cqp layout
+- `corpora import` — catalogue rows from existing TEITOK and KonText installations, for `upsert-json` (see below)
 - reindex control-plane and execution lifecycle:
   - `fqs reindex enqueue|queue|history|mark-started|mark-finished`
   - `fqs reindex dispatch-once` and `fqs reindex worker-heartbeat`
@@ -461,6 +462,24 @@ Upsert from stdin:
 
 ```bash
 cat corpora-batch.json | cargo run -- corpora upsert-json --stdin
+```
+
+Rows for corpora that existing installations already have, instead of registering them one by one:
+`corpora import` reads a TEITOK folder (every project's `settings.xml` and indexes, the shared
+corpus list) and/or KonText's `corplist.xml` with the Manatee registry files (the corpus's name,
+data path, description, language, and its attributes with their labels, as `/info` gives them),
+and writes rows for `upsert-json`, a review table and a summary. It writes nothing to the
+catalogue: check the table, then load the file. Run it on each old server with what that server
+has (`--map-path OLD=NEW` gives the paths as the FQS server will see them); `--existing` (an
+`export-json`) keeps what is set in the catalogue already, filling only empty fields. KonText's
+access groups are kept in `settings.access`: FQS does not check them, so the corpora that are not
+open to anonymous users are listed. `fqs corpora import --help` has all options.
+
+```bash
+fqs corpora import --teitok /var/www/html/teitok --teitok-url https://example.org/teitok \
+    --kontext-corplist auto --kontext-url https://example.org/kontext \
+    --out rows.json --report rows.tsv
+fqs corpora upsert-json --json-file rows.json
 ```
 
 List corpora (default hides superseded `is_current=0`):

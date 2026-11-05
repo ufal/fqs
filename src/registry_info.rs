@@ -142,6 +142,20 @@ pub fn fragment_attributes(text: &str) -> Vec<String> {
     a
 }
 
+/// The first value of each top-level key other than ATTRIBUTE and STRUCTURE (NAME, PATH, INFO,
+/// LANGUAGE, ENCODING, …), keys in upper case: what describes the corpus rather than its layout.
+pub fn top_values(text: &str) -> std::collections::BTreeMap<String, String> {
+    let toks = tokens(text);
+    let mut i = 0;
+    let mut out = std::collections::BTreeMap::new();
+    for it in items(&toks, &mut i) {
+        if it.key != "ATTRIBUTE" && it.key != "STRUCTURE" && !it.name.is_empty() {
+            out.entry(it.key).or_insert(it.name);
+        }
+    }
+    out
+}
+
 /// CWB labels: `ATTRIBUTE name  # Label` / `STRUCTURE name  # Label` lines (no block on the line).
 fn line_comment_labels(text: &str) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();
@@ -234,6 +248,15 @@ pub fn info_from_registry_file(file: &Path, size: Option<i64>, engine: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn top_level_values() {
+        let v = top_values("NAME \"SiR 1.0\"\nPATH /opt/manatee/sir\nINFO \"A corpus\"\nATTRIBUTE word\nSTRUCTURE doc {\n ATTRIBUTE title\n}\nLANGUAGE Czech\n");
+        assert_eq!(v.get("NAME").map(String::as_str), Some("SiR 1.0"));
+        assert_eq!(v.get("PATH").map(String::as_str), Some("/opt/manatee/sir"));
+        assert_eq!(v.get("LANGUAGE").map(String::as_str), Some("Czech"));
+        assert!(!v.contains_key("ATTRIBUTE"));
+    }
 
     #[test]
     fn cwb_flat_structure_attributes() {

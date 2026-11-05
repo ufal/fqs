@@ -114,7 +114,7 @@ fn kontext_corplist_candidates() -> Vec<(PathBuf, &'static str)> {
 
 
 /// Resolve a KonText corplist.xml path: fqs.json → env → KonText config.xml / install.
-fn resolve_kontext_corplist(cfg: Option<&Value>) -> (Option<PathBuf>, Option<&'static str>) {
+pub(crate) fn resolve_kontext_corplist(cfg: Option<&Value>) -> (Option<PathBuf>, Option<&'static str>) {
     if let Some(p) = cfg_str(cfg, &["corplist", "corplist_path"]) {
         return (Some(PathBuf::from(p)), Some("fqs.json"));
     }
@@ -191,7 +191,7 @@ fn resolve_pando_corpora(cfg: Option<&Value>, corplist: Option<&Path>) -> (Optio
 
 
 /// Manatee registry directory, to check that KonText can open a corpus.
-fn resolve_manatee_registry(cfg: Option<&Value>) -> Option<PathBuf> {
+pub(crate) fn resolve_manatee_registry(cfg: Option<&Value>) -> Option<PathBuf> {
     if let Some(p) = cfg_str(cfg, &["registry", "manatee_registry"]) {
         return Some(PathBuf::from(p));
     }

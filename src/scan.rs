@@ -519,7 +519,7 @@ fn suggested_id(dir: &Path) -> String {
     sanitize_id(&name)
 }
 
-fn sanitize_id(s: &str) -> String {
+pub(crate) fn sanitize_id(s: &str) -> String {
     let mut out = String::new();
     for c in s.chars() {
         if c.is_ascii_alphanumeric() || c == '_' || c == '-' {

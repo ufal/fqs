@@ -40,6 +40,7 @@ mod registry_info;
 mod synthetic_fragment;
 mod xidx_build;
 mod engine_status;
+mod catalog_import;
 mod manatee_pool;
 mod manatee_worker;
 mod pando_lib;
@@ -248,6 +249,24 @@ enum CorporaAction {
     UpsertJson(UpsertJsonArgs),
     /// Export corpus entries as JSON object array
     ExportJson(ExportJsonArgs),
+    /// Catalogue rows from existing TEITOK and KonText installations, for upsert-json
+    ///
+    /// Reads what a TEITOK folder and/or a KonText installation already know about their corpora
+    /// and writes catalogue rows for `fqs corpora upsert-json --json-file FILE`, a review
+    /// table (--report) and a summary (stderr). Nothing is written to the catalogue: check the table, then
+    /// load the file on the FQS server as the FQS service user. Run it on each old server with what that
+    /// server has, and load the outputs one after the other.
+    ///
+    /// Access: KonText's groups (access="…") are kept in settings.access; FQS does not check groups, so
+    /// every corpus is public_query, and the ones not open to "anonymous" are listed (protected by the
+    /// front-ends' login only; do not enable FCS for them).
+    ///
+    /// Example (on the old KonText server, paths as they will be on the FQS server):
+    ///   fqs corpora import --kontext-corplist /opt/kontext/conf/corplist.xml --registry /var/lib/manatee/registry \
+    ///     --kontext-url https://lindat.mff.cuni.cz/services/kontext --map-path /opt/manatee=/var/lib/manatee \
+    ///     --out kontext-rows.json --report kontext-rows.tsv
+    #[command(verbatim_doc_comment)]
+    Import(ImportArgs),
     /// Validate corpus registry entries and optionally run query probes
     Validate(ValidateArgs),
     /// One-shot: detect languages / features / interfaces from TEITOK+index layout
@@ -850,6 +869,58 @@ struct ListCorporaArgs {
     group_by_family: bool,
     #[command(flatten)]
     db: DbPathArg,
+}
+
+#[derive(Args, Debug)]
+struct ImportArgs {
+    /// TEITOK folder: every <DIR>/<project>/Resources/settings.xml (title, cqp corpus, fqs_corpus_id; pando/, cqp/)
+    #[arg(long, value_name = "DIR")]
+    teitok: Option<PathBuf>,
+    /// The shared project's corpus list (default: <DIR>/shared/Resources/corplist.xml)
+    #[arg(long = "teitok-corplist", value_name = "FILE")]
+    teitok_corplist: Option<PathBuf>,
+    /// Public base URL of that TEITOK, for project_url
+    #[arg(long = "teitok-url", value_name = "URL")]
+    teitok_url: Option<String>,
+    /// KonText's corplist.xml; `auto` finds it (fqs.json, FQS_KONTEXT_CORPLIST, KonText's config.xml)
+    #[arg(long = "kontext-corplist", value_name = "FILE|auto")]
+    kontext_corplist: Option<PathBuf>,
+    /// The Manatee registry folder (default: MANATEE_REGISTRY, else the usual places)
+    #[arg(long, value_name = "DIR")]
+    registry: Option<PathBuf>,
+    /// Public base URL of that KonText, for project_url (and for --manatee kontext)
+    #[arg(long = "kontext-url", value_name = "URL")]
+    kontext_url: Option<String>,
+    /// native: FQS opens the Manatee data itself (libfqs_manatee); kontext: FQS reaches each corpus through KonText
+    #[arg(long, value_parser = ["native", "kontext"], default_value = "native")]
+    manatee: String,
+    /// Rewrite paths that start with OLD (repeatable): as the FQS server will see them
+    #[arg(long = "map-path", value_name = "OLD=NEW")]
+    map_path: Vec<String>,
+    /// `fqs corpora export-json --include-noncurrent` output: rows already there only get their empty fields filled
+    #[arg(long, value_name = "FILE")]
+    existing: Option<PathBuf>,
+    /// The rows' environment
+    #[arg(long, default_value = "live")]
+    environment: String,
+    /// Add this label to the KonText rows (a TEITOK portal selects it with <fqsportal tag=…>)
+    #[arg(long = "portal-label", value_name = "LABEL")]
+    portal_label: Option<String>,
+    /// The same without a visible label: settings.portals = [NAME] (<fqsportal portal=…>)
+    #[arg(long, value_name = "NAME")]
+    portal: Option<String>,
+    /// The portal's URL: settings.portal_url = its search page for the corpus
+    #[arg(long = "portal-url", value_name = "URL")]
+    portal_url: Option<String>,
+    /// Only these corpus ids (comma-separated)
+    #[arg(long, value_delimiter = ',')]
+    only: Vec<String>,
+    /// Write the rows here (default: stdout)
+    #[arg(long, value_name = "FILE")]
+    out: Option<PathBuf>,
+    /// Write the review table (TSV) here
+    #[arg(long, value_name = "FILE")]
+    report: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1497,6 +1568,26 @@ fn handle_corpora(args: CorporaArgs) -> Result<()> {
                     "ids": entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>()
                 }))?
             );
+        }
+        CorporaAction::Import(args) => {
+            let opts = catalog_import::Options {
+                teitok: args.teitok,
+                teitok_corplist: args.teitok_corplist,
+                teitok_url: args.teitok_url,
+                kontext_corplist: args.kontext_corplist,
+                registry: args.registry,
+                kontext_url: args.kontext_url,
+                manatee_native: args.manatee == "native",
+                map_path: args.map_path,
+                existing: args.existing,
+                environment: args.environment,
+                portal_label: args.portal_label,
+                portal: args.portal,
+                portal_url: args.portal_url,
+                only: args.only.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+            };
+            let outcome = catalog_import::run(&opts)?;
+            catalog_import::write(&outcome, args.out.as_deref(), args.report.as_deref())?;
         }
         CorporaAction::ExportJson(args) => {
             let conn = open_db(&resolve_db_path(&args.db))?;
