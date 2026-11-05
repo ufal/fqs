@@ -38,6 +38,7 @@ mod manatee_lib;
 mod query_lang;
 mod registry_info;
 mod synthetic_fragment;
+mod xidx_build;
 mod manatee_pool;
 mod manatee_worker;
 mod pando_lib;
@@ -9120,14 +9121,20 @@ fn is_likely_executable_file(path: &Path) -> bool {
 /// The corpus's xidx folder, when it has one: in the TEITOK project (flexencoder's default), else
 /// next to its pando index (`<index>/../xidx`), as when indexes are kept together in one place
 /// apart from the projects. Its XML stays in the project (the adapter reads it from there).
+/// None as well when the xidx is from another flexencoder run than the index (xidx_build.rs).
 fn corpus_xidx_dir(corpus: &CorpusEntry) -> Option<PathBuf> {
+    let index = resolve_pando_index_dir(corpus).ok();
     let in_project = corpus.project_root.join("xidx");
-    if in_project.join("tokens.bin").is_file() {
-        return Some(in_project);
-    }
-    let index = resolve_pando_index_dir(corpus).ok()?;
-    let beside = index.parent()?.join("xidx");
-    beside.join("tokens.bin").is_file().then_some(beside)
+    let dir = if in_project.join("tokens.bin").is_file() {
+        in_project
+    } else {
+        let beside = index.as_deref()?.parent()?.join("xidx");
+        if !beside.join("tokens.bin").is_file() {
+            return None;
+        }
+        beside
+    };
+    xidx_build::xidx_matches_index(&dir, index.as_deref()).then_some(dir)
 }
 
 fn resolve_pando_index_dir(corpus: &CorpusEntry) -> Result<PathBuf> {
