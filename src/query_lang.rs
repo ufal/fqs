@@ -1,7 +1,7 @@
 //! Query languages: which ones a corpus accepts, by engine and annotation, and what `language` on
 //! `/query` and `/run` becomes for the engine.
 //!
-//! - pando: `pando-cql` (its own), `cwb-cql`, and with dependency annotation `pmltq`, with
+//! - pando: `pando-cql` (its own), `cwb-cql`, `manatee-cql`, and with the label `feature:dependencies` `pmltq`, with
 //!   constituency annotation (`node` regions) `tiger` — pando translates them (its `dialect`);
 //! - CWB (`cqp`): `cwb-cql`; Manatee: `manatee-cql`.
 //!
@@ -79,8 +79,10 @@ fn has_feature(corpus: &CorpusEntry, feature: &str) -> bool {
 pub fn engine_languages(corpus: &CorpusEntry, backend: &str) -> Vec<&'static str> {
     match backend {
         "pando" => {
-            let mut v = vec!["pando-cql", "cwb-cql"];
-            if has_feature(corpus, "dependencies") || has_feature(corpus, "ud") {
+            let mut v = vec!["pando-cql", "cwb-cql", "manatee-cql"];
+            // the dependency label, whatever the scheme (UD, PROIEL, …); `feature:ud` is UD
+            // morphology (upos / feats), which says nothing about trees
+            if has_feature(corpus, "dependencies") {
                 v.push("pmltq");
             }
             if has_feature(corpus, "constituency") || has_feature(corpus, "trees") {
@@ -173,24 +175,28 @@ mod tests {
     #[test]
     fn languages_by_engine_and_annotation() {
         let ud = corpus("pando", &["feature:dependencies"], json!({}));
-        assert_eq!(accepted(&ud, "pando"), vec!["pando-cql", "cwb-cql", "pmltq"]);
+        assert_eq!(accepted(&ud, "pando"), vec!["pando-cql", "cwb-cql", "manatee-cql", "pmltq"]);
+        let morph = corpus("pando", &["feature:ud"], json!({}));
+        assert_eq!(accepted(&morph, "pando"), vec!["pando-cql", "cwb-cql", "manatee-cql"], "UD morphology only: no PML-TQ");
         let plain = corpus("pando", &[], json!({}));
-        assert_eq!(accepted(&plain, "pando"), vec!["pando-cql", "cwb-cql"], "no trees: no PML-TQ");
+        assert_eq!(accepted(&plain, "pando"), vec!["pando-cql", "cwb-cql", "manatee-cql"], "no trees: no PML-TQ");
         assert_eq!(accepted(&plain, "cqp"), vec!["cwb-cql"]);
         assert_eq!(accepted(&plain, "manatee"), vec!["manatee-cql"]);
         let narrowed = corpus("pando", &["feature:dependencies"], json!({ "query_languages": ["pando-cql", "pml-tq", "manatee-cql"] }));
-        assert_eq!(accepted(&narrowed, "pando"), vec!["pando-cql", "pmltq"], "the corpus's list narrows, never widens");
+        assert_eq!(accepted(&narrowed, "pando"), vec!["pando-cql", "manatee-cql", "pmltq"], "the corpus's list narrows");
+        let narrower = corpus("pando", &[], json!({ "query_languages": ["pando-cql", "pml-tq"] }));
+        assert_eq!(accepted(&narrower, "pando"), vec!["pando-cql"], "never widens: no PML-TQ without trees");
     }
 
     #[test]
     fn effective_language() {
-        let ud = corpus("pando", &["feature:ud"], json!({}));
+        let ud = corpus("pando", &["feature:dependencies"], json!({}));
         assert_eq!(effective(&ud, "pando", "").unwrap(), "pando-cql");
         assert_eq!(effective(&ud, "pando", "auto").unwrap(), "pando-cql");
         assert_eq!(effective(&ud, "pando", "PML-TQ").unwrap(), "pmltq");
         assert_eq!(effective(&ud, "pando", "cqp").unwrap(), "cwb-cql");
         let err = effective(&ud, "pando", "tiger").unwrap_err().to_string();
-        assert!(err.contains("it accepts: pando-cql, cwb-cql, pmltq"), "{err}");
+        assert!(err.contains("it accepts: pando-cql, cwb-cql, manatee-cql, pmltq"), "{err}");
         assert!(effective(&ud, "cqp", "pmltq").is_err(), "CWB does not take PML-TQ");
         assert!(effective(&ud, "manatee", "pando-cql").is_err());
     }
@@ -209,7 +215,7 @@ mod tests {
     #[test]
     fn listing() {
         let auto = corpus("auto", &["feature:dependencies"], json!({}));
-        assert_eq!(corpus_languages(&auto), vec!["pando-cql", "cwb-cql", "pmltq"]);
+        assert_eq!(corpus_languages(&auto), vec!["pando-cql", "cwb-cql", "manatee-cql", "pmltq"]);
         let man = corpus("manatee", &[], json!({ "available_backends": ["manatee"] }));
         assert_eq!(corpus_languages(&man), vec!["manatee-cql"]);
     }

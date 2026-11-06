@@ -2456,7 +2456,7 @@ fn execute_query(
     let (effective_language, exec_kind, exec_binary, exec_target, payload, exit_code) =
         match backend.as_str() {
             "pando" => {
-                // the corpus's languages for pando (query_lang.rs): pando-cql, cwb-cql, pmltq, tiger;
+                // the corpus's languages for pando (query_lang.rs): pando-cql, cwb-cql, manatee-cql, pmltq, tiger;
                 // other than pando's own, pando translates (its "dialect")
                 let effective = query_lang::effective(corpus, "pando", &requested_language)?.to_string();
                 let pando_query = normalize_pando_query(query_text);

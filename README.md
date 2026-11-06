@@ -326,10 +326,15 @@ Endpoints:
   - `{"corpus":"...","query":"...","language":"auto","start":0,"size":25,"request_role":"visitor","backend":"pando"}`
   - optional **`backend`**: `pando` or `cqp` — TEITOK/flexicorp should set from project config; catalogue `preferred_backend` may be `auto`
   - **`language`**: the query's language, one the corpus accepts with that engine (`src/query_lang.rs`):
-    pando `pando-cql` (default), `cwb-cql`, and with dependency annotation `pmltq`, with constituency
-    annotation `tiger` (pando translates them; it needs FQS's pando library); CWB `cwb-cql`; Manatee
-    `manatee-cql`. Aliases: `cqp`, `pml-tq`, `tigersearch`, `native`. Another language: 400 with the
-    list the corpus accepts. A corpus can narrow its list with `settings.query_languages`. The same
+    pando `pando-cql` (default), `cwb-cql`, `manatee-cql`, and `pmltq` / `tiger` for a corpus labelled
+    for them (pando translates them; it needs FQS's pando library); CWB `cwb-cql`; Manatee
+    `manatee-cql`. **The labels decide, not the index:** `pmltq` needs the label `feature:dependencies`
+    (any scheme: UD, PROIEL, …; `feature:ud` alone is UD morphology and does not), `tiger` `feature:constituency` (or `feature:trees`), in the corpus's `labels` or
+    `capabilities.browse.features`. FQS does not look into the index per query: `fqs corpora enrich`
+    sets `feature:dependencies` when `deprel` and `head` are indexed; `feature:constituency` is set by
+    hand. A UD corpus without the label is offered pando CQL, CWB CQL and Manatee CQL only.
+    Aliases: `cqp`, `pml-tq`, `tigersearch`, `native`. Another language: 400 with the list the
+    corpus accepts. A corpus can narrow its list with `settings.query_languages`. The same
     `language` on `POST /run` (programs). `GET /corpora` gives each corpus's `query_languages` (the
     default first), so a front end offers exactly those (e.g. a query-language choice next to KonText's
     "advanced" query). A query can also name its language as its first word, in capitals: `PMLTQ`,
