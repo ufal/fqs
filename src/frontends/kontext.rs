@@ -637,7 +637,8 @@ pub fn manatee_registry_text(spec: &ShellSpec<'_>, paths: &ShellPaths) -> String
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| format!("{} (Pando index, served through FQS)", spec.label));
+        // users see INFO as the corpus description: never the engine or FQS
+        .unwrap_or_else(|| spec.label.to_string());
     o.push_str(&format!("INFO {}\n", registry_quote(&info_text)));
     o.push_str(&format!("PATH {}\n", registry_quote(&format!("{}/", paths.data.display()))));
     o.push_str(&format!("VERTICAL {}\n", registry_quote(&paths.vertical.display().to_string())));
