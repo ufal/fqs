@@ -36,24 +36,25 @@ pcre() { if grep -q "^#define USE_PCRE2 " "$1/config.hh"; then echo "-lpcre2-8";
 S=$(cd "$MANATEE_SRC" && pwd)
 [ -f "$S/config.hh" ] || { echo "missing $S/config.hh: run ./configure in $S (with the options Manatee was built with)" >&2; exit 1; }
 inc=$(src_inc "$S")
+sources="$here/fqs_manatee.cc $here/fqs_manatee_aligned.cc"   # + fqs_manatee.hh
 regex=$(pcre "$S")
 
 if [ -n "${MANATEE_PREFIX:-}" ]; then
 	P=$(cd "$MANATEE_PREFIX" && pwd)
 	has_lib "$P/lib" || { echo "no libmanatee in $P/lib" >&2; exit 1; }
-	$CXX $flags $inc "$here/fqs_manatee.cc" -L"$P/lib" -lmanatee -Wl,-rpath,"$P/lib" $ld $regex $sys -o "$out"
+	$CXX $flags $inc $sources -L"$P/lib" -lmanatee -Wl,-rpath,"$P/lib" $ld $regex $sys -o "$out"
 	echo "built $out (against the installed $P/lib/libmanatee; if FQS refuses it at start-up, use the source tree)"
 	exit 0
 fi
 
 lib="$S/src/.libs"
 [ -f "$lib/libbuiltinmanatee.a" ] || { echo "missing $lib/libbuiltinmanatee.a: run make in $S" >&2; exit 1; }
-if $CXX $flags $inc "$here/fqs_manatee.cc" "$lib/libbuiltinmanatee.a" $ld $regex $sys -o "$out" 2>"$here/.build-static.log"; then
+if $CXX $flags $inc $sources "$lib/libbuiltinmanatee.a" $ld $regex $sys -o "$out" 2>"$here/.build-static.log"; then
 	rm -f "$here/.build-static.log"
 	echo "built $out (Manatee linked in: $lib/libbuiltinmanatee.a)"
 	exit 0
 fi
 echo "linking libbuiltinmanatee.a failed (see manatee/.build-static.log); trying the tree's shared libmanatee" >&2
 has_lib "$lib" || { echo "no shared libmanatee in $lib either" >&2; exit 1; }
-$CXX $flags $inc "$here/fqs_manatee.cc" -L"$lib" -lmanatee -Wl,-rpath,"$lib" $ld $regex $sys -o "$out"
+$CXX $flags $inc $sources -L"$lib" -lmanatee -Wl,-rpath,"$lib" $ld $regex $sys -o "$out"
 echo "built $out (against $lib/libmanatee, rpath recorded)"

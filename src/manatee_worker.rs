@@ -4,7 +4,9 @@
 //!
 //! Requests: {"op": "hello"} | {"op": "query", "corpus", "registry", "cql", "start", "size",
 //! "window", "attr"?, "skip_check"?} | {"op": "kwic", …as query, "attrs": [..], "doc_attr"?,
-//! "count"? (false: walk only to the end of the page)} |
+//! "count"? (false: walk only to the end of the page), "aligned"? (a parallel corpus: the aligned
+//! corpora's registry names, a list or comma-separated, or "*" / true for all: per hit their aligned
+//! segments)} |
 //! {"op": "freq", "corpus", "registry", "cql", "crit", "limit"}.
 //! Answers: {"ok": true, "result"} or {"ok": false, "error", "check"?}, each line starting with
 //! [`MARK`]: the library may write to stdout itself, and such lines are not answers.
@@ -68,10 +70,23 @@ fn n(req: &Value, key: &str, default: u64) -> u64 {
     req.get(key).and_then(Value::as_u64).unwrap_or(default)
 }
 
+/// The library's `aligned` argument: None (no aligned segments), "*" (all) or "a,b".
+fn aligned_arg(v: Option<&Value>) -> Option<String> {
+    match v? {
+        Value::Bool(true) => Some("*".to_string()),
+        Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        Value::Array(a) => {
+            let names: Vec<&str> = a.iter().filter_map(Value::as_str).map(str::trim).filter(|x| !x.is_empty()).collect();
+            (!names.is_empty()).then(|| names.join(","))
+        }
+        _ => None,
+    }
+}
+
 fn handle(lib: &ManateeLib, req: &Value, checked: &mut HashMap<String, std::result::Result<(), String>>) -> std::result::Result<Value, Failure> {
     let op = s(req, "op");
     if op == "hello" {
-        return Ok(json!({ "version": lib.version, "path": lib.path.display().to_string(), "check": lib.has_check() }));
+        return Ok(json!({ "version": lib.version, "path": lib.path.display().to_string(), "check": lib.has_check(), "aligned": lib.has_aligned() }));
     }
     let corpus = s(req, "corpus");
     let registry = PathBuf::from(s(req, "registry"));
@@ -109,9 +124,27 @@ fn handle(lib: &ManateeLib, req: &Value, checked: &mut HashMap<String, std::resu
             };
             let doc = req.get("doc_attr").and_then(Value::as_str).filter(|d| !d.is_empty());
             let count = req.get("count").and_then(Value::as_bool).unwrap_or(true);
-            Ok(lib.kwic(corpus, &registry, s(req, "cql"), n(req, "start", 0), n(req, "size", 20), n(req, "window", 5) as u32, &attrs, doc, count)?)
+            let aligned = aligned_arg(req.get("aligned"));
+            Ok(lib.kwic(corpus, &registry, s(req, "cql"), n(req, "start", 0), n(req, "size", 20), n(req, "window", 5) as u32, &attrs, doc, count, aligned.as_deref())?)
         }
         "freq" => Ok(lib.freq(corpus, &registry, s(req, "cql"), s(req, "crit"), n(req, "limit", 0))?),
         other => Err(anyhow!("unknown op '{other}'").into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aligned_arg;
+    use serde_json::json;
+
+    #[test]
+    fn aligned_argument() {
+        assert_eq!(aligned_arg(None), None);
+        assert_eq!(aligned_arg(Some(&json!(false))), None);
+        assert_eq!(aligned_arg(Some(&json!(true))).as_deref(), Some("*"));
+        assert_eq!(aligned_arg(Some(&json!("*"))).as_deref(), Some("*"));
+        assert_eq!(aligned_arg(Some(&json!(" par_en "))).as_deref(), Some("par_en"));
+        assert_eq!(aligned_arg(Some(&json!(["par_en", "", "par_de"]))).as_deref(), Some("par_en,par_de"));
+        assert_eq!(aligned_arg(Some(&json!([]))), None);
     }
 }

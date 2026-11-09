@@ -3,54 +3,23 @@
 //
 // Every function catches C++ exceptions and reports them as an error string: nothing crosses into
 // Rust. Strings returned are malloc'ed JSON, freed with fqsm_free. One corpus handle is not meant
-// for parallel calls: FQS holds a lock per corpus.
+// for parallel calls: FQS holds a lock per corpus. Parallel corpora: fqs_manatee_aligned.cc.
 //
 // Licence: links manatee-open (GPL-2); this library is GPL-2 as well, and optional for FQS.
 
-#include "corpus.hh"
-#include "cqpeval.hh"
+#include "fqs_manatee.hh"
 
 #include <algorithm>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <stdexcept>
-#include <string>
-#include <vector>
+
+using fqsm::dup;
+using fqsm::eval;
+using fqsm::json_str;
+using fqsm::set_err;
+using fqsm::use;
+using fqsm::walk;
 
 namespace {
-
-char *dup(const std::string &s) {
-    char *p = static_cast<char *>(std::malloc(s.size() + 1));
-    if (p) std::memcpy(p, s.c_str(), s.size() + 1);
-    return p;
-}
-
-void set_err(char **err, const std::string &msg) {
-    if (err) *err = dup(msg);
-}
-
-void json_str(std::string &out, const char *s) {
-    out += '"';
-    for (const unsigned char *c = reinterpret_cast<const unsigned char *>(s ? s : ""); *c; ++c) {
-        switch (*c) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (*c < 0x20) {
-                    char buf[8];
-                    std::snprintf(buf, sizeof buf, "\\u%04x", *c);
-                    out += buf;
-                } else {
-                    out += static_cast<char>(*c);
-                }
-        }
-    }
-    out += '"';
-}
 
 // the tokens [from, to) of attribute `pa`, space-separated
 std::string span(PosAttr *pa, Position from, Position to) {
@@ -62,46 +31,53 @@ std::string span(PosAttr *pa, Position from, Position to) {
     return s;
 }
 
-// a query as the Python wrapper evaluates it: with a closing ';'
-RangeStream *eval(Corpus *c, const char *cql) {
-    std::string q(cql ? cql : "");
-    while (!q.empty() && (q.back() == ' ' || q.back() == ';' || q.back() == '\n')) q.pop_back();
-    q += ';';
-    return c->filter_query(eval_cqpquery(q.c_str(), c));
-}
-
-// Walk a query's result: `fn(beg, end)` for hits [start, start+size); the total (exact: every hit
-// is walked), or with `count_all` false the hits up to the end of the page only (then the total is
-// exact only when it is below start+size: the result ended inside the page).
-template <class Fn>
-long long walk(Corpus *c, const char *cql, long long start, long long size, Fn fn, bool count_all = true) {
-    RangeStream *rs = eval(c, cql);
-    long long total = 0;
-    try {
-        while (!rs->end()) {
-            if (total >= start && total < start + size) fn(rs->peek_beg(), rs->peek_end());
-            ++total;
-            if (!count_all && total >= start + size) break;
-            rs->next();
-        }
-    } catch (...) {
-        delete rs;
-        throw;
-    }
-    delete rs;
-    return total;
-}
-
 }  // namespace
+
+std::string fqsm::read_problem(Corpus *c, int &checked) {
+    const Position last = c->size() - 1;
+    for (const std::string &name : fqsm::split_list(c->get_conf("ATTRLIST"))) {
+        PosAttr *pa = c->get_attr(name);
+        const int range = pa->id_range();
+        if (range <= 0) continue;
+        const int ids[] = {0, range / 3, range / 2, (2 * range) / 3, range - 1};
+        for (int id : ids) {
+            FastStream *fs = pa->id2poss(id);
+            if (!fs) continue;
+            const Position p = fs->peek();
+            const bool has = p < fs->final();
+            delete fs;
+            if (!has) continue;
+            const int back = pa->pos2id(p);
+            if (back != id) {
+                std::string got = (back >= 0 && back < range) ? pa->id2str(back) : "an id out of range";
+                return "attribute " + name + ": the index has \"" + pa->id2str(id) + "\" at position " + std::to_string(p) +
+                       ", the token text reads \"" + got +
+                       "\" (does the registry name the attribute TYPE the corpus was compiled with?)";
+            }
+            ++checked;
+        }
+        if (last >= 0) {
+            const int id = pa->pos2id(last);
+            if (id < 0 || id >= range) return "attribute " + name + ": the last position does not read (id " + std::to_string(id) + ")";
+        }
+    }
+    return "";
+}
 
 extern "C" {
 
-const char *fqsm_version() { return "fqs-manatee 0.4"; }
+const char *fqsm_version() { return "fqs-manatee 0.5"; }
 
 // Open a corpus: a registry file path (or a name in MANATEE_REGISTRY). NULL and *err on failure.
+// The registry file's folder is where its aligned corpora are looked for first (fqsm::use).
 void *fqsm_open(const char *registry, char **err) {
     try {
-        return new Corpus(registry ? registry : "");
+        std::string reg = registry ? registry : "";
+        size_t slash = reg.rfind('/');
+        std::string dir = slash == std::string::npos ? "" : (slash == 0 ? "/" : reg.substr(0, slash));
+        fqsm::Handle probe{nullptr, dir};
+        use(&probe);
+        return new fqsm::Handle{new Corpus(reg), dir};
     } catch (std::exception &e) {
         set_err(err, e.what());
     } catch (...) {
@@ -112,14 +88,16 @@ void *fqsm_open(const char *registry, char **err) {
 
 void fqsm_close(void *h) {
     try {
-        delete static_cast<Corpus *>(h);
+        fqsm::Handle *hd = static_cast<fqsm::Handle *>(h);
+        if (hd) delete hd->corp;
+        delete hd;
     } catch (...) {
     }
 }
 
 long long fqsm_size(void *h) {
     try {
-        return h ? static_cast<long long>(static_cast<Corpus *>(h)->size()) : -1;
+        return h ? static_cast<long long>(use(h)->size()) : -1;
     } catch (...) {
         return -1;
     }
@@ -131,11 +109,11 @@ long long fqsm_size(void *h) {
 // attribute). The total is exact (the whole result is walked).
 char *fqsm_query(void *h, const char *cql, long long start, long long size, int window, const char *attr, char **err) {
     try {
-        Corpus *c = static_cast<Corpus *>(h);
+        Corpus *c = use(h);
         PosAttr *pa = (attr && *attr) ? c->get_attr(attr) : c->get_default_attr();
         const Position csize = c->size();
         std::string hits;
-        long long total = walk(c, cql, start, size, [&](Position b, Position e) {
+        long long total = walk(c, cql, start, size, [&](Position b, Position e, RangeStream *) {
             const Position lb = b > window ? b - window : 0;
             const Position re = e + window < csize ? e + window : csize;
             if (!hits.empty()) hits += ',';
@@ -156,37 +134,17 @@ char *fqsm_query(void *h, const char *cql, long long start, long long size, int 
     return nullptr;
 }
 
-// Run a query with tokens: {"total": N, "attrs": [...], "hits": [{"pos", "end", "doc", "left":
-// [[v1, v2, …], …], "kwic": [...], "right": [...]}]}: per token the values of `attrs` (comma-
-// separated positional attributes; empty: the default attribute), `window` tokens of context on each
-// side, and `doc` the value of the structure attribute `doc_attr` ("doc.id"; empty: none) at the hit.
-// For FCS (layers, the document) and pando-shaped answers.
-char *fqsm_kwic_page(void *h, const char *cql, long long start, long long size, int window, const char *attrs,
-                     const char *doc_attr, int count_all, char **err);
+namespace {
 
-char *fqsm_kwic(void *h, const char *cql, long long start, long long size, int window, const char *attrs,
-                const char *doc_attr, char **err) {
-    return fqsm_kwic_page(h, cql, start, size, window, attrs, doc_attr, 1, err);
-}
-
-// fqsm_kwic, but with `count_all` 0 the result is walked only up to the end of the page: for a
-// query whose total FQS already knows (another page, KonText's second request). "total" is then
-// the hits seen, "counted": false.
-char *fqsm_kwic_page(void *h, const char *cql, long long start, long long size, int window, const char *attrs,
-                     const char *doc_attr, int count_all, char **err) {
+// fqsm_kwic_page and fqsm_kwic_aligned: `aligned` NULL for no aligned corpora.
+char *kwic_impl(void *h, const char *cql, long long start, long long size, int window, const char *attrs,
+                const char *doc_attr, int count_all, const char *aligned, char **err) {
+    fqsm::AlignedPage *al = nullptr;
     try {
-        Corpus *c = static_cast<Corpus *>(h);
-        std::vector<std::string> names;
+        Corpus *c = use(h);
+        std::vector<std::string> names = fqsm::split_list(attrs ? attrs : "");
         std::vector<PosAttr *> pas;
-        std::string list = attrs ? attrs : "";
-        for (size_t from = 0; from <= list.size();) {
-            size_t comma = list.find(',', from);
-            std::string n = list.substr(from, comma == std::string::npos ? std::string::npos : comma - from);
-            from = comma == std::string::npos ? list.size() + 1 : comma + 1;
-            if (n.empty()) continue;
-            names.push_back(n);
-            pas.push_back(c->get_attr(n));
-        }
+        for (const std::string &n : names) pas.push_back(c->get_attr(n));
         if (pas.empty()) {
             names.push_back(c->get_conf("DEFAULTATTR"));
             pas.push_back(c->get_default_attr());
@@ -200,22 +158,10 @@ char *fqsm_kwic_page(void *h, const char *cql, long long start, long long size, 
             doc_st = c->get_struct(d.substr(0, dot));
             doc_pa = doc_st->get_attr(d.substr(dot + 1));
         }
+        if (aligned) al = fqsm::aligned_page_new(c, aligned, names);
         const Position csize = c->size();
-        auto tokens = [&](std::string &out, Position from, Position to) {
-            out += '[';
-            for (Position p = from; p < to; ++p) {
-                if (p > from) out += ',';
-                out += '[';
-                for (size_t i = 0; i < pas.size(); ++i) {
-                    if (i) out += ',';
-                    json_str(out, pas[i]->pos2str(p));
-                }
-                out += ']';
-            }
-            out += ']';
-        };
         std::string hits;
-        long long total = walk(c, cql, start, size, [&](Position b, Position e) {
+        long long total = walk(c, cql, start, size, [&](Position b, Position e, RangeStream *rs) {
             const Position lb = b > window ? b - window : 0;
             const Position re = e + window < csize ? e + window : csize;
             if (!hits.empty()) hits += ',';
@@ -226,11 +172,15 @@ char *fqsm_kwic_page(void *h, const char *cql, long long start, long long size, 
                 if (n >= 0) json_str(hits, doc_pa->pos2str(n)); else hits += "null";
             }
             hits += ",\"left\":";
-            tokens(hits, lb, b);
+            fqsm::tokens(hits, pas, lb, b);
             hits += ",\"kwic\":";
-            tokens(hits, b, e);
+            fqsm::tokens(hits, pas, b, e);
             hits += ",\"right\":";
-            tokens(hits, e, re);
+            fqsm::tokens(hits, pas, e, re);
+            if (al) {
+                hits += ",\"aligned\":";
+                fqsm::aligned_page_hit(al, hits, b, rs);
+            }
             hits += '}';
         }, count_all != 0);
         std::string an;
@@ -238,21 +188,61 @@ char *fqsm_kwic_page(void *h, const char *cql, long long start, long long size, 
             if (i) an += ',';
             json_str(an, names[i].c_str());
         }
-        return dup("{\"total\":" + std::to_string(total) + ",\"counted\":" + (count_all ? "true" : "false") +
-                   ",\"attrs\":[" + an + "],\"hits\":[" + hits + "]}");
+        std::string out = "{\"total\":" + std::to_string(total) + ",\"counted\":" + (count_all ? "true" : "false") +
+                          ",\"attrs\":[" + an + "]";
+        if (al) out += ",\"aligned_corpora\":" + fqsm::aligned_page_names(al);
+        out += ",\"hits\":[" + hits + "]}";
+        fqsm::aligned_page_free(al);
+        return dup(out);
     } catch (std::exception &e) {
         set_err(err, e.what());
     } catch (...) {
         set_err(err, "unknown error in the query");
     }
+    fqsm::aligned_page_free(al);
     return nullptr;
+}
+
+}  // namespace
+
+// Run a query with tokens: {"total": N, "attrs": [...], "hits": [{"pos", "end", "doc", "left":
+// [[v1, v2, …], …], "kwic": [...], "right": [...]}]}: per token the values of `attrs` (comma-
+// separated positional attributes; empty: the default attribute), `window` tokens of context on each
+// side, and `doc` the value of the structure attribute `doc_attr` ("doc.id"; empty: none) at the hit.
+// For FCS (layers, the document) and pando-shaped answers.
+char *fqsm_kwic(void *h, const char *cql, long long start, long long size, int window, const char *attrs,
+                const char *doc_attr, char **err) {
+    return kwic_impl(h, cql, start, size, window, attrs, doc_attr, 1, nullptr, err);
+}
+
+// fqsm_kwic, but with `count_all` 0 the result is walked only up to the end of the page: for a
+// query whose total FQS already knows (another page, KonText's second request). "total" is then
+// the hits seen, "counted": false.
+char *fqsm_kwic_page(void *h, const char *cql, long long start, long long size, int window, const char *attrs,
+                     const char *doc_attr, int count_all, char **err) {
+    return kwic_impl(h, cql, start, size, window, attrs, doc_attr, count_all, nullptr, err);
+}
+
+// fqsm_kwic_page with, per hit, the aligned segments of the parallel corpora `aligned` (comma-
+// separated registry names from the corpus's ALIGNED; "*": all of them) (fqs-manatee 0.5):
+// "aligned_corpora": [names], and per hit "aligned": [{"corpus", "pos", "end", "tokens": [[v1, …],
+// …], "match"?: {"pos", "end"}}], one entry per aligned corpus in that order. The segment is what
+// Manatee's add_aligned gives (KonText's aligned column): the aligned structure (ALIGNSTRUCT) the hit
+// starts in, mapped by number or, with ALIGNDEF, by the level file mkalign wrote; "pos"/"end" null
+// and "tokens" empty when the hit has no counterpart there. "match": the part of the segment that a
+// `within CORPUS: query` condition matched (Manatee's labels), when the query has one for it. The
+// tokens carry the values of `attrs` (empty: the default attribute; "" for an attribute the aligned
+// corpus lacks). Without ALIGNED in the registry: an error.
+char *fqsm_kwic_aligned(void *h, const char *cql, long long start, long long size, int window, const char *attrs,
+                        const char *doc_attr, int count_all, const char *aligned, char **err) {
+    return kwic_impl(h, cql, start, size, window, attrs, doc_attr, count_all, aligned ? aligned : "*", err);
 }
 
 // Frequencies of a query's hits by a Manatee criterion ("word 0", "lemma/i 0", "doc.id 0", …):
 // {"rows": [{"value", "count"}]}, the most frequent first, at most `limit` (0: all).
 char *fqsm_freq(void *h, const char *cql, const char *crit, long long limit, char **err) {
     try {
-        Corpus *c = static_cast<Corpus *>(h);
+        Corpus *c = use(h);
         RangeStream *rs = eval(c, cql);
         std::vector<std::string> words;
         std::vector<NumOfPos> freqs, norms;
@@ -284,52 +274,23 @@ char *fqsm_freq(void *h, const char *cql, const char *crit, long long limit, cha
 // same word; and the last position must read. A registry that names the wrong layout (the files
 // written as FD_FGD, the registry without TYPE "FD_FGD") fails here instead of answering wrong text
 // or crashing on context. {"ok": true, "checked": N} or {"ok": false, "problem": "..."}.
+// A parallel corpus (ALIGNED in its registry): its aligned corpora are checked the same way, and
+// listed in "aligned" ([{"corpus", "ok", "segments", "warning"?, "error"?}]; fqs-manatee 0.5): one
+// that does not open is reported there (queries on it fail with Manatee's message), one that reads
+// wrongly fails the check.
 char *fqsm_check(void *h, char **err) {
     try {
-        Corpus *c = static_cast<Corpus *>(h);
-        std::string attrs = c->get_conf("ATTRLIST");
-        const Position last = c->size() - 1;
+        Corpus *c = use(h);
         int checked = 0;
-        size_t from = 0;
-        while (from <= attrs.size()) {
-            size_t comma = attrs.find(',', from);
-            std::string name = attrs.substr(from, comma == std::string::npos ? std::string::npos : comma - from);
-            from = comma == std::string::npos ? attrs.size() + 1 : comma + 1;
-            if (name.empty()) continue;
-            PosAttr *pa = c->get_attr(name);
-            const int range = pa->id_range();
-            if (range <= 0) continue;
-            const int ids[] = {0, range / 3, range / 2, (2 * range) / 3, range - 1};
-            for (int id : ids) {
-                FastStream *fs = pa->id2poss(id);
-                if (!fs) continue;
-                const Position p = fs->peek();
-                const bool has = p < fs->final();
-                delete fs;
-                if (!has) continue;
-                const int back = pa->pos2id(p);
-                if (back != id) {
-                    std::string got = (back >= 0 && back < range) ? pa->id2str(back) : "an id out of range";
-                    return dup("{\"ok\":false,\"problem\":" + [&] {
-                        std::string s;
-                        json_str(s, ("attribute " + name + ": the index has \"" + pa->id2str(id) + "\" at position " +
-                                     std::to_string(p) + ", the token text reads \"" + got +
-                                     "\" (does the registry name the attribute TYPE the corpus was compiled with?)").c_str());
-                        return s;
-                    }() + "}");
-                }
-                ++checked;
-            }
-            if (last >= 0) {
-                const int id = pa->pos2id(last);
-                if (id < 0 || id >= range) {
-                    std::string s;
-                    json_str(s, ("attribute " + name + ": the last position does not read (id " + std::to_string(id) + ")").c_str());
-                    return dup("{\"ok\":false,\"problem\":" + s + "}");
-                }
-            }
+        std::string problem = fqsm::read_problem(c, checked);
+        if (!problem.empty()) return dup("{\"ok\":false,\"problem\":" + json_str(problem) + "}");
+        std::string aligned;
+        if (!c->get_conf("ALIGNED").empty()) {
+            aligned = fqsm::aligned_check(c, checked, problem);
+            if (!problem.empty())
+                return dup("{\"ok\":false,\"problem\":" + json_str(problem) + ",\"aligned\":" + aligned + "}");
         }
-        return dup("{\"ok\":true,\"checked\":" + std::to_string(checked) + "}");
+        return dup("{\"ok\":true,\"checked\":" + std::to_string(checked) + (aligned.empty() ? "" : ",\"aligned\":" + aligned) + "}");
     } catch (std::exception &e) {
         set_err(err, e.what());
     } catch (...) {

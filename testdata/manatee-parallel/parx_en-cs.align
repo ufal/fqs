@@ -1,0 +1,6 @@
+# parx_en segment(s) -> parx_cs segment; mkalign input
+0	0
+1,2	1
+3	2
+-1	3
+4	4

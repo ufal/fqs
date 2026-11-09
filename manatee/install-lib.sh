@@ -52,7 +52,7 @@ fi
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/fqs-manatee.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
-cp "$here/build.sh" "$here/fqs_manatee.cc" "$tmp/"
+cp "$here/build.sh" "$here"/fqs_manatee*.cc "$here"/fqs_manatee*.hh "$tmp/"
 MANATEE_SRC=$src sh "$tmp/build.sh" >"$tmp/build.log" 2>&1 || { cat "$tmp/build.log" >&2; echo "building libfqs_manatee failed" >&2; exit 1; }
 new="$tmp/libfqs_manatee.$ext"
 [ -f "$new" ] || { cat "$tmp/build.log" >&2; exit 1; }

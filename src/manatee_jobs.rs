@@ -76,6 +76,9 @@ fn start_count(pool: &Arc<Pool>, corpus: &str, req: Value) -> String {
     let mut count_req = req;
     count_req["start"] = json!(0);
     count_req["size"] = json!(0);
+    if let Some(o) = count_req.as_object_mut() {
+        o.remove("aligned");   // counting needs no aligned segments
+    }
     std::thread::spawn(move || {
         // the pool's kwic counts every hit (the total is not known) and keeps the total for later pages
         let state = match pool.kwic(&corpus, count_req) {

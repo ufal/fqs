@@ -343,6 +343,16 @@ Endpoints:
     can send PML-TQ or CWB CQL as it is. On `/run` the rest of the program can follow in pando CQL
     (`PMLTQ a-node [ lemma = "be" ]; freq by upos`).
 
+  - **`aligned`** (native Manatee, a parallel corpus: one corpus per language, each naming the others
+    in its registry's `ALIGNED`): `true` (all of them) or registry names (`"czeng_en"`, `["a","b"]`).
+    The answer gets `aligned_corpora` and per hit `aligned: [{corpus, pos, end, text, tokens, match?}]`,
+    the aligned segment of each (as KonText's aligned column; `pos` null when the hit has none there).
+    Filtering by the other language is Manatee CQL as KonText writes it: `[lemma="pes"] within
+    czeng_en:[lemma="dog"]` (`within!` for "not"); `match` is then the part of the segment it matched.
+    The aligned corpora's registry files must be in the same folder; `fqs corpora import` lists them in
+    `settings.manatee_aligned`. Needs libfqs_manatee 0.5 (`manatee/build.sh`); test data and a check
+    against Manatee's Python module in `testdata/manatee-parallel/`.
+
 In `--test` mode, `/query` adds a `policy` block:
 - `would_block`: whether normal locked mode would reject
 - `reasons`: policy reasons

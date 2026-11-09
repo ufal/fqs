@@ -34,6 +34,7 @@ mod fcs;
 mod hot_corpus;
 mod limits;
 mod manatee_jobs;
+mod manatee_aligned;
 mod manatee_lib;
 mod query_lang;
 mod registry_info;
@@ -490,6 +491,10 @@ struct HttpQueryRequest {
     /// manatee: `"async"` answers the page at once and counts the total in the background (`job_id`,
     /// `GET /status`; manatee_jobs.rs), as KonText asks; else the total is counted before the page
     total: Option<Value>,
+    /// manatee, a parallel corpus: per hit the aligned segments of its aligned corpora (`true` / `"*"`:
+    /// all of the registry's ALIGNED; a name or a list of names); manatee_aligned.rs
+    #[serde(default)]
+    aligned: Option<Value>,
     /// pando: a random sample of this many hits (KonText "random sample"), in corpus order
     sample: Option<u64>,
     /// pando: the hits (or the sample) in a random order (KonText "shuffle")
@@ -8643,12 +8648,17 @@ fn run_manatee_query(
     if !frag_attrs.is_empty() {
         req["attrs"] = json!(frag_attrs);
     }
+    // a parallel corpus: the aligned segments per hit (`aligned`; manatee_aligned.rs)
+    if let Some(al) = manatee_aligned::request(query_options.and_then(|q| q.aligned.as_ref()))? {
+        req["aligned"] = al;
+    }
     let total_async = query_options.and_then(|q| q.total.as_ref()).and_then(Value::as_str) == Some("async");
     let res = if total_async { manatee_jobs::kwic(&pool, &corpus.id, req)? } else { pool.kwic(&corpus.id, req)? };
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0;
     let total = res.get("total").and_then(Value::as_u64).unwrap_or(0);
     let total_exact = res.get("total_exact").and_then(Value::as_bool).unwrap_or(true);
     let job_id = res.get("job_id").cloned().unwrap_or(Value::Null);
+    let res_attrs: Vec<String> = res.get("attrs").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect()).unwrap_or_default();
     let words = |h: &Value, k: &str| -> String {
         h.get(k)
             .and_then(Value::as_array)
@@ -8675,6 +8685,9 @@ fn run_manatee_query(
             "doc_id": h.get("doc").cloned().unwrap_or(Value::Null),
             "tokens": tokens
         });
+        if let Some(al) = manatee_aligned::hit(&h, &res_attrs) {
+            hit["aligned"] = al;
+        }
         if !frag_attrs.is_empty() {
             // the context's tokens with their attributes (Manatee gives no sentence boundaries here)
             let side = |k: &str| h.get(k).and_then(Value::as_array).cloned().unwrap_or_default();
@@ -8721,6 +8734,10 @@ fn run_manatee_query(
             }
         }
     });
+    let mut payload = payload;
+    if let Some(names) = res.get("aligned_corpora") {
+        payload["done"]["result"]["aligned_corpora"] = names.clone();
+    }
     Ok(CqpExecResult {
         kind: "fqs-manatee-worker".to_string(),
         binary: pool.lib_path.clone(),

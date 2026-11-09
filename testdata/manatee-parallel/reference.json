@@ -1,0 +1,228 @@
+[
+ {
+  "corpus": "par_cs",
+  "cql": "[lemma=\"pes\"]",
+  "total": 3,
+  "hits": [
+   {
+    "pos": 0,
+    "end": 1,
+    "aligned": {
+     "par_en": {
+      "pos": 0,
+      "end": 4,
+      "text": "The dog barks .",
+      "labelled": false
+     }
+    }
+   },
+   {
+    "pos": 8,
+    "end": 9,
+    "aligned": {
+     "par_en": {
+      "pos": 11,
+      "end": 19,
+      "text": "The dog and the cat are friends .",
+      "labelled": false
+     }
+    }
+   },
+   {
+    "pos": 17,
+    "end": 18,
+    "aligned": {
+     "par_en": {
+      "pos": 24,
+      "end": 28,
+      "text": "The dog sleeps .",
+      "labelled": false
+     }
+    }
+   }
+  ]
+ },
+ {
+  "corpus": "par_cs",
+  "cql": "[lemma=\"pes\"] within par_en:[word=\"sleeps\"]",
+  "total": 1,
+  "hits": [
+   {
+    "pos": 17,
+    "end": 18,
+    "aligned": {
+     "par_en": {
+      "pos": 26,
+      "end": 27,
+      "text": "sleeps",
+      "labelled": true
+     }
+    }
+   }
+  ]
+ },
+ {
+  "corpus": "par_cs",
+  "cql": "[lemma=\"pes\"] within! par_en:[word=\"sleeps\"]",
+  "total": 2,
+  "hits": [
+   {
+    "pos": 0,
+    "end": 1,
+    "aligned": {
+     "par_en": {
+      "pos": 0,
+      "end": 4,
+      "text": "The dog barks .",
+      "labelled": false
+     }
+    }
+   },
+   {
+    "pos": 8,
+    "end": 9,
+    "aligned": {
+     "par_en": {
+      "pos": 11,
+      "end": 19,
+      "text": "The dog and the cat are friends .",
+      "labelled": false
+     }
+    }
+   }
+  ]
+ },
+ {
+  "corpus": "par_en",
+  "cql": "[word=\"cat\"]",
+  "total": 2,
+  "hits": [
+   {
+    "pos": 5,
+    "end": 6,
+    "aligned": {
+     "par_cs": {
+      "pos": 3,
+      "end": 8,
+      "text": "Kočka spí na gauči .",
+      "labelled": false
+     }
+    }
+   },
+   {
+    "pos": 15,
+    "end": 16,
+    "aligned": {
+     "par_cs": {
+      "pos": 8,
+      "end": 14,
+      "text": "Pes a kočka jsou přátelé .",
+      "labelled": false
+     }
+    }
+   }
+  ]
+ },
+ {
+  "corpus": "parx_cs",
+  "cql": "[lemma=\"kočka\"]",
+  "total": 2,
+  "hits": [
+   {
+    "pos": 3,
+    "end": 4,
+    "aligned": {
+     "parx_en": {
+      "pos": 4,
+      "end": 14,
+      "text": "The cat sleeps . It lies on the sofa .",
+      "labelled": false
+     }
+    }
+   },
+   {
+    "pos": 10,
+    "end": 11,
+    "aligned": {
+     "parx_en": {
+      "pos": 14,
+      "end": 22,
+      "text": "The dog and the cat are friends .",
+      "labelled": false
+     }
+    }
+   }
+  ]
+ },
+ {
+  "corpus": "parx_cs",
+  "cql": "[word=\"Venku\"]",
+  "total": 1,
+  "hits": [
+   {
+    "pos": 14,
+    "end": 15,
+    "aligned": {
+     "parx_en": null
+    }
+   }
+  ]
+ },
+ {
+  "corpus": "parx_cs",
+  "cql": "[lemma=\"kočka\"] within parx_en:[word=\"lies\"]",
+  "total": 1,
+  "hits": [
+   {
+    "pos": 3,
+    "end": 4,
+    "aligned": {
+     "parx_en": {
+      "pos": 9,
+      "end": 10,
+      "text": "lies",
+      "labelled": true
+     }
+    }
+   }
+  ]
+ },
+ {
+  "corpus": "parx_en",
+  "cql": "[word=\"lies\"]",
+  "total": 1,
+  "hits": [
+   {
+    "pos": 9,
+    "end": 10,
+    "aligned": {
+     "parx_cs": {
+      "pos": 3,
+      "end": 8,
+      "text": "Kočka spí na gauči .",
+      "labelled": false
+     }
+    }
+   }
+  ]
+ },
+ {
+  "corpus": "parx_en",
+  "cql": "[lemma=\"cat\"] within parx_cs:[lemma=\"spát\"]",
+  "total": 1,
+  "hits": [
+   {
+    "pos": 5,
+    "end": 6,
+    "aligned": {
+     "parx_cs": {
+      "pos": 4,
+      "end": 5,
+      "text": "spí",
+      "labelled": true
+     }
+    }
+   }
+  ]
+ }
+]

@@ -119,6 +119,11 @@ pub(crate) fn resolve_sources(corplist: &Path, registry: Option<&Path>, found: &
     Ok((corplist, registry))
 }
 
+/// The names in a registry's `ALIGNED` ("cs,en": comma-separated).
+fn aligned_names(v: &str) -> Vec<String> {
+    v.split(',').map(str::trim).filter(|x| !x.is_empty()).map(str::to_string).collect()
+}
+
 fn find_registry(dir: &Path, ident: &str) -> Option<PathBuf> {
     [ident.to_string(), ident.to_lowercase()].into_iter().map(|n| dir.join(n)).find(|p| p.is_file())
 }
@@ -185,6 +190,17 @@ pub(crate) fn rows(
         let lang = get("LANGUAGE");
         if !lang.is_empty() {
             s.insert("languages".into(), json!([lang]));
+        }
+        // a parallel corpus: its aligned corpora (the registry's ALIGNED), by the names `/query`'s
+        // `aligned` and CQL's `within NAME:` use; Manatee finds them next to this registry
+        let aligned = aligned_names(&get("ALIGNED"));
+        if !aligned.is_empty() {
+            if let Some(dir) = reg_path.as_deref().and_then(Path::parent) {
+                for a in aligned.iter().filter(|a| !dir.join(a).is_file()) {
+                    notes.push(format!("aligned corpus '{a}' (ALIGNED) has no registry file next to this one: aligned queries on it fail"));
+                }
+            }
+            s.insert("manatee_aligned".into(), json!(aligned));
         }
         if let Some(a) = &c.access {
             s.insert("access".into(), json!(a));
@@ -291,5 +307,12 @@ mod tests {
         assert_eq!(c[0].desc, "Spoken Czech");
         assert_eq!(c[0].access.as_deref(), Some(&["anonymous".to_string(), "authenticated".to_string()][..]));
         assert_eq!(c[1].access.as_deref(), Some(&["cnc_users".to_string()][..]));
+    }
+
+    #[test]
+    fn aligned_from_registry() {
+        let top = registry_info::top_values("PATH /x\nALIGNSTRUCT \"s\"\nALIGNED \"czeng_en, czeng_de\"\nATTRIBUTE word\n");
+        assert_eq!(aligned_names(top.get("ALIGNED").map(String::as_str).unwrap_or("")), vec!["czeng_en", "czeng_de"]);
+        assert!(aligned_names("").is_empty());
     }
 }

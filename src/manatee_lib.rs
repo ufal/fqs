@@ -24,6 +24,7 @@ type VersionFn = unsafe extern "C" fn() -> *const c_char;
 type CheckFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_char) -> *mut c_char;
 type KwicFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_longlong, c_longlong, c_int, *const c_char, *const c_char, *mut *mut c_char) -> *mut c_char;
 type KwicPageFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_longlong, c_longlong, c_int, *const c_char, *const c_char, c_int, *mut *mut c_char) -> *mut c_char;
+type KwicAlignedFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_longlong, c_longlong, c_int, *const c_char, *const c_char, c_int, *const c_char, *mut *mut c_char) -> *mut c_char;
 
 /// An open corpus (a `Corpus *` inside the library).
 struct Handle(*mut c_void);
@@ -42,6 +43,7 @@ pub struct ManateeLib {
     check: Option<CheckFn>,
     kwic: Option<KwicFn>,
     kwic_page: Option<KwicPageFn>,
+    kwic_aligned: Option<KwicAlignedFn>,
     corpora: Mutex<HashMap<String, Arc<Mutex<Handle>>>>,
 }
 
@@ -99,7 +101,22 @@ impl ManateeLib {
             let check = lib.get::<CheckFn>(b"fqsm_check\0").ok().map(|f| *f);   // from fqs-manatee 0.2
             let kwic = lib.get::<KwicFn>(b"fqsm_kwic\0").ok().map(|f| *f);   // from fqs-manatee 0.3
             let kwic_page = lib.get::<KwicPageFn>(b"fqsm_kwic_page\0").ok().map(|f| *f);   // from 0.4
-            Ok(ManateeLib { _lib: lib, path: path.to_path_buf(), version, open, close, query, freq, free, check, kwic, kwic_page, corpora: Mutex::new(HashMap::new()) })
+            let kwic_aligned = lib.get::<KwicAlignedFn>(b"fqsm_kwic_aligned\0").ok().map(|f| *f);   // from 0.5
+            Ok(ManateeLib {
+                _lib: lib,
+                path: path.to_path_buf(),
+                version,
+                open,
+                close,
+                query,
+                freq,
+                free,
+                check,
+                kwic,
+                kwic_page,
+                kwic_aligned,
+                corpora: Mutex::new(HashMap::new()),
+            })
         }
     }
 
@@ -158,20 +175,35 @@ impl ManateeLib {
         }
     }
 
+    /// Whether the library gives aligned segments (fqsm_kwic_aligned, fqs-manatee 0.5 and later).
+    pub fn has_aligned(&self) -> bool {
+        self.kwic_aligned.is_some()
+    }
+
     /// {"total", "counted", "attrs", "hits": [{"pos", "end", "doc"?, "left", "kwic", "right"}]}: per
     /// token the values of `attrs` (empty: the default attribute), `doc_attr` ("doc.id") at the hit.
     /// `count_all` false: the result is walked only to the end of the page ("counted": false; a
-    /// library before 0.4 always counts).
+    /// library before 0.4 always counts). `aligned` (a parallel corpus: registry names of aligned
+    /// corpora, comma-separated, `*` all): also "aligned_corpora" and per hit "aligned" (0.5).
     #[allow(clippy::too_many_arguments)]
-    pub fn kwic(&self, id: &str, registry: &Path, cql: &str, start: u64, size: u64, window: u32, attrs: &[String], doc_attr: Option<&str>, count_all: bool) -> Result<Value> {
+    pub fn kwic(&self, id: &str, registry: &Path, cql: &str, start: u64, size: u64, window: u32, attrs: &[String], doc_attr: Option<&str>, count_all: bool, aligned: Option<&str>) -> Result<Value> {
         let kwic = self.kwic.ok_or_else(|| anyhow!("{} has no fqsm_kwic: rebuild the library (fqs-manatee 0.3 or later)", self.version))?;
+        let aligned_fn = match aligned {
+            Some(_) => Some(self.kwic_aligned.ok_or_else(|| anyhow!("{} gives no aligned segments: rebuild the library (fqs-manatee 0.5 or later)", self.version))?),
+            None => None,
+        };
         let h = self.handle(id, registry)?;
         let h = h.lock().map_err(|_| anyhow!("manatee corpus lock poisoned"))?;
         let q = CString::new(cql)?;
         let a = CString::new(attrs.join(","))?;
         let d = CString::new(doc_attr.unwrap_or(""))?;
+        let al = CString::new(aligned.unwrap_or(""))?;
         let mut err: *mut c_char = std::ptr::null_mut();
         unsafe {
+            if let Some(f) = aligned_fn {
+                let out = f(h.0, q.as_ptr(), start as c_longlong, size as c_longlong, window as c_int, a.as_ptr(), d.as_ptr(), count_all as c_int, al.as_ptr(), &mut err);
+                return take(self.free, out, err);
+            }
             let out = match self.kwic_page {
                 Some(page) => page(h.0, q.as_ptr(), start as c_longlong, size as c_longlong, window as c_int, a.as_ptr(), d.as_ptr(), count_all as c_int, &mut err),
                 None => kwic(h.0, q.as_ptr(), start as c_longlong, size as c_longlong, window as c_int, a.as_ptr(), d.as_ptr(), &mut err),
