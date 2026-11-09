@@ -5860,6 +5860,8 @@ struct PandoCorpusQuery {
     left: Option<String>,
     right: Option<String>,
     sentence: Option<String>,
+    /// `/context`: also the region attributes at `pos` (`regions=1`, pando-server's option)
+    regions: Option<String>,
     /// TEITOK xidx window (sentence/region units) for `/fragment`
     context: Option<String>,
     /// TEITOK xidx scope structure name for `/fragment` (default `s`)
@@ -6033,6 +6035,9 @@ async fn http_pando_context(
     }
     if let Some(s) = &q.sentence {
         parts.push(format!("sentence={s}"));
+    }
+    if let Some(r) = &q.regions {
+        parts.push(format!("regions={}", if matches!(r.as_str(), "1" | "true" | "yes") { "1" } else { "0" }));
     }
     let qs = parts.join("&");
     pando_dispatch_get(&state, &q.corpus, "/context", &qs).await

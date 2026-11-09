@@ -489,8 +489,13 @@ fn pando_corpora_idents(path: &Path) -> Option<std::collections::HashSet<String>
 }
 
 
+/// A name Manatee's registry takes: ASCII letters, digits, `_`, and not starting with a capital
+/// (the registry parser reads a word starting with one as a keyword: `ATTRIBUTE CorrectForm` is a
+/// syntax error, so UD MISC keys like CorrectForm, Gloss are left out of the shell).
 fn manatee_name_ok(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    !s.is_empty()
+        && !s.starts_with(|c: char| c.is_ascii_uppercase())
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 
@@ -502,6 +507,13 @@ fn registry_quote(s: &str) -> String {
 /// The shell's positional attributes, in vertical-column order: the word form first.
 fn shell_attributes(info: &PandoCorpusInfo) -> Vec<String> {
     let mut attrs: Vec<String> = info.positional.iter().filter(|a| manatee_name_ok(a)).cloned().collect();
+    // KonText's base attribute is `word` (BASE_ATTR, hard-coded throughout KonText: frequency
+    // filters, simple queries): a pando index's `form` is offered as `word`, which pando reads as `form`
+    if !attrs.iter().any(|a| a == "word") {
+        if let Some(i) = attrs.iter().position(|a| a == "form") {
+            attrs[i] = "word".to_string();
+        }
+    }
     let first = ["word", "form"].iter().find(|w| attrs.iter().any(|a| a == *w)).map(|w| w.to_string());
     if let Some(f) = first {
         attrs.retain(|a| *a != f);
@@ -1488,6 +1500,15 @@ mod tests {
     }
 
     #[test]
+    fn manatee_names_without_capitals() {
+        assert!(manatee_name_ok("lemma"));
+        assert!(manatee_name_ok("24_sent_id"));
+        assert!(!manatee_name_ok("CorrectForm"));
+        assert!(!manatee_name_ok("Gloss"));
+        assert!(!manatee_name_ok("a-b"));
+    }
+
+    #[test]
     fn registry_shell_from_corpus_info() {
         let info = ud_info();
         assert_eq!(info.struct_attrs, vec![
@@ -1513,6 +1534,10 @@ mod tests {
         // the word form first, then lemma; deletions (zero-width) left out
         let attrs: Vec<&str> = reg.lines().filter_map(|l| l.strip_prefix("ATTRIBUTE ")).map(|a| a.trim_end_matches(" {")).collect();
         assert_eq!(&attrs[..2], &["word", "lemma"]);
+        // a pando index's `form` is KonText's `word` (BASE_ATTR); capitalised MISC keys are left out
+        let mut info2 = info.clone();
+        info2.positional = vec!["CorrectForm".into(), "form".into(), "lemma".into(), "upos".into()];
+        assert_eq!(shell_attributes(&info2), vec!["word", "lemma", "upos"]);
         assert!(!reg.contains("STRUCTURE del"));
         assert!(reg.contains("STRUCTURE text {\n    ATTRIBUTE id\n}\n"));
         let vert = manatee_shell_vertical(&spec);
