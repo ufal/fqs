@@ -153,6 +153,7 @@ pub fn require_admin(limits: &Limits, headers: &HeaderMap) -> AdminResult<Caller
         user,
         verified: true,
         groups: crate::access::groups_from_claim(claims.get("groups")),
+        owned_groups: crate::access::groups_from_claim(claims.get("owned_groups")),
     })
 }
 

@@ -7,7 +7,10 @@
 //! "count"? (false: walk only to the end of the page), "aligned"? (a parallel corpus: the aligned
 //! corpora's registry names, a list or comma-separated, or "*" / true for all: per hit their aligned
 //! segments)} |
-//! {"op": "freq", "corpus", "registry", "cql", "crit", "limit"}.
+//! {"op": "freq", "corpus", "registry", "cql", "crit", "limit"} |
+//! {"op": "subc_create", "corpus", "registry", "path", "structure", "query"} (write a .subc) |
+//! {"op": "sizes", "corpus", "registry"}.
+//! `"subc": PATH` on query / kwic / freq / sizes: run under that subcorpus (Manatee's SubCorpus).
 //! Answers: {"ok": true, "result"} or {"ok": false, "error", "check"?}, each line starting with
 //! [`MARK`]: the library may write to stdout itself, and such lines are not answers.
 //!
@@ -86,7 +89,7 @@ fn aligned_arg(v: Option<&Value>) -> Option<String> {
 fn handle(lib: &ManateeLib, req: &Value, checked: &mut HashMap<String, std::result::Result<(), String>>) -> std::result::Result<Value, Failure> {
     let op = s(req, "op");
     if op == "hello" {
-        return Ok(json!({ "version": lib.version, "path": lib.path.display().to_string(), "check": lib.has_check(), "aligned": lib.has_aligned() }));
+        return Ok(json!({ "version": lib.version, "path": lib.path.display().to_string(), "check": lib.has_check(), "aligned": lib.has_aligned(), "subcorpora": lib.has_subcorpora() }));
     }
     let corpus = s(req, "corpus");
     let registry = PathBuf::from(s(req, "registry"));
@@ -111,7 +114,21 @@ fn handle(lib: &ManateeLib, req: &Value, checked: &mut HashMap<String, std::resu
             return Err(Failure::Check(format!("Manatee corpus '{corpus}' does not read as its registry describes: {problem}")));
         }
     }
+    if op == "subc_create" {
+        let path = PathBuf::from(s(req, "path"));
+        return Ok(lib.subc_create(corpus, &registry, &path, s(req, "structure"), s(req, "query"))?);
+    }
+    let subc = Some(s(req, "subc")).filter(|p| !p.is_empty()).map(PathBuf::from);
+    lib.set_subcorpus(subc);
+    let result = run(lib, op, corpus, &registry, req);
+    lib.set_subcorpus(None);
+    result
+}
+
+fn run(lib: &ManateeLib, op: &str, corpus: &str, registry: &Path, req: &Value) -> std::result::Result<Value, Failure> {
+    let registry = registry.to_path_buf();
     match op {
+        "sizes" => Ok(lib.sizes(corpus, &registry)?),
         "query" => {
             let attr = req.get("attr").and_then(Value::as_str).filter(|a| !a.is_empty());
             Ok(lib.query(corpus, &registry, s(req, "cql"), n(req, "start", 0), n(req, "size", 20), n(req, "window", 5) as u32, attr)?)

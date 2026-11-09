@@ -49,6 +49,7 @@ mod manatee_worker;
 mod pando_lib;
 mod scan;
 mod services;
+mod subcorpus;
 mod warm;
 mod frontends;
 
@@ -508,6 +509,17 @@ struct HttpQueryRequest {
     /// (`hits[].attrs`, as `tabulate … match <name>`); names the registry lacks are ignored
     #[serde(default)]
     attributes: Option<Vec<String>>,
+    /// A stored subcorpus by name (subcorpus/apply.rs): `subcorpus_mode` use (default) | within,
+    /// `subcorpus_owner` when several of that name are visible
+    #[serde(default)]
+    subcorpus: Option<Value>,
+    #[serde(default)]
+    subcorpus_mode: Option<Value>,
+    #[serde(default)]
+    subcorpus_owner: Option<Value>,
+    /// Set by FQS: the subcorpus prepared for the engine
+    #[serde(skip_deserializing, default)]
+    subcorpus_applied: Option<subcorpus::apply::Applied>,
     /// Set by FQS (never from the client): the caller's engine tier
     #[serde(skip_deserializing, default)]
     engine_tier: Option<String>,
@@ -2784,6 +2796,11 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         .route("/", get(http_root_with_state))
         .route("/health", get(http_health))
         .route("/corpora", get(http_list_corpora))
+        .route("/corpora/{id}/subcorpora", get(subcorpus::api::list).post(subcorpus::api::create))
+        .route(
+            "/corpora/{id}/subcorpora/{name}",
+            get(subcorpus::api::show).patch(subcorpus::api::patch).delete(subcorpus::api::delete),
+        )
         .route("/labels", get(http_browse_labels))
         .route("/fcs", get(http_fcs))
         .route("/reindex/jobs", get(http_reindex_jobs).post(http_reindex_enqueue))
@@ -5658,6 +5675,10 @@ async fn http_query_inner(
         return Err((StatusCode::FORBIDDEN, msg));
     }
 
+    req.subcorpus_applied = subcorpus::apply::for_request(
+        &state, &corpus, &caller, req.backend.as_deref(),
+        req.subcorpus.as_ref(), req.subcorpus_mode.as_ref(), req.subcorpus_owner.as_ref(),
+    ).await?;
     let language = req
         .language
         .as_deref()
@@ -5734,6 +5755,9 @@ async fn http_query_inner(
             ));
         }
     };
+    if let Some(a) = &req.subcorpus_applied {
+        response["subcorpus"] = a.report(response.pointer("/raw/engine/subcorpus"));
+    }
     if let Some(obj) = response.as_object_mut() {
         obj.insert(
             "policy".to_string(),
@@ -5848,6 +5872,12 @@ struct PandoCorpusQuery {
     context_scope: Option<String>,
     /// Inclusive end position for `/fragment` (default: same as `pos`)
     end: Option<String>,
+    /// `/info`: under a stored subcorpus (subcorpus/apply.rs); `user`: who asks, believed only
+    /// without --jwt-secret (as on /query)
+    subcorpus: Option<String>,
+    user: Option<String>,
+    subcorpus_mode: Option<String>,
+    subcorpus_owner: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5927,10 +5957,27 @@ async fn http_pando_info(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     gate_corpus(&state, &headers, &q.corpus, "/info")?;
     let corpus = state.catalog.get(&q.corpus).map_err(to_http_err)?;
-    let backend = resolve_effective_backend(&corpus).unwrap_or_default();
+    let s = |v: &Option<String>| v.clone().map(Value::String);
+    let applied = subcorpus::apply::for_request(
+        &state, &corpus, &state.limits.caller(&headers, None, q.user.as_deref(), None, &header_client_ip(&headers)), None,
+        s(&q.subcorpus).as_ref(), s(&q.subcorpus_mode).as_ref(), s(&q.subcorpus_owner).as_ref(),
+    ).await?;
+    let answer = http_pando_info_whole(&state, &corpus, &q).await?;
+    Ok(match applied {
+        Some(a) => Json(subcorpus::apply::info(answer.0, &a)),
+        None => answer,
+    })
+}
+
+async fn http_pando_info_whole(
+    state: &HttpAppState,
+    corpus: &CorpusEntry,
+    q: &PandoCorpusQuery,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let backend = resolve_effective_backend(corpus).unwrap_or_default();
     // CWB and Manatee: what the registry declares, in Pando's shape (registry_info.rs)
     let registry = match backend.as_str() {
-        "pando" | "" => return pando_dispatch_get(&state, &q.corpus, "/info", "").await,
+        "pando" | "" => return pando_dispatch_get(state, &q.corpus, "/info", "").await,
         "cqp" => {
             let name = corpus
                 .settings
@@ -6174,10 +6221,17 @@ async fn http_pando_run_inner(
         None => cql,
     };
     let effective = query_lang::effective(&corpus, "pando", &requested_language).map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let applied = subcorpus::apply::for_request(
+        &state, &corpus, &caller, Some("pando"),
+        req.extra.get("subcorpus"), req.extra.get("subcorpus_mode"), req.extra.get("subcorpus_owner"),
+    ).await?;
     let mut body = json!({ "cql": cql });
+    if let Some(a) = &applied {
+        body["subcorpus"] = a.pando_field();
+    }
     if let Some(obj) = body.as_object_mut() {
         for (k, v) in req.extra {
-            if !matches!(k.as_str(), "corpus" | "request_role" | "user" | "tier" | "language" | "dialect") {
+            if !matches!(k.as_str(), "corpus" | "request_role" | "user" | "tier" | "language" | "dialect" | "subcorpus" | "subcorpus_mode" | "subcorpus_owner") {
                 obj.insert(k, v);
             }
         }
@@ -6223,9 +6277,13 @@ async fn http_pando_run_inner(
         )
     })?
     .map_err(to_http_err)?;
-    let (status, payload) = result;
+    let (status, mut payload) = result;
     if status >= 400 {
         return Err(engine_error_response(status, &payload));
+    }
+    if let Some(a) = &applied {
+        let report = a.report(payload.get("subcorpus"));
+        payload["subcorpus"] = report;
     }
     Ok(Json(payload))
 }
@@ -7166,6 +7224,7 @@ CREATE INDEX IF NOT EXISTS idx_reindex_workers_heartbeat ON reindex_workers(last
         "interface_preference",
         "ALTER TABLE corpora ADD COLUMN interface_preference TEXT",
     )?;
+    subcorpus::store::init(conn)?;
     Ok(())
 }
 
@@ -8320,6 +8379,9 @@ fn run_pando_query(
             if let Some(sd) = q.seed {
                 extra.insert("seed".into(), json!(sd));
             }
+            if let Some(a) = &q.subcorpus_applied {
+                extra.insert("subcorpus".into(), a.pando_field());
+            }
             // hit-set session: only when the caller stores or pages a set
             let sid = q.session_id.as_deref().map(str::trim).unwrap_or("");
             if (q.name.is_some() || q.from.is_some()) && valid_engine_session_id(sid) {
@@ -8370,6 +8432,9 @@ fn run_pando_query(
     }
 
     // Cold CLI fallback (Path A / library missing): pando's own query language only
+    if query_options.is_some_and(|q| q.subcorpus_applied.is_some()) {
+        anyhow::bail!("subcorpora on pando corpora need FQS's pando library (FLEXICORP_PANDO_LIB)");
+    }
     if !dialect.is_empty() {
         anyhow::bail!(
             "query language '{dialect}' needs FQS's pando library (FLEXICORP_PANDO_LIB); without it only pando-cql works{}",
@@ -8655,6 +8720,10 @@ fn run_manatee_query(
     // a parallel corpus: the aligned segments per hit (`aligned`; manatee_aligned.rs)
     if let Some(al) = manatee_aligned::request(query_options.and_then(|q| q.aligned.as_ref()))? {
         req["aligned"] = al;
+    }
+    // a stored subcorpus: the query runs on the corpus opened as its .subc (subcorpus/apply.rs)
+    if let Some(subc) = query_options.and_then(|q| q.subcorpus_applied.as_ref()).and_then(|a| a.manatee_subc.as_ref()) {
+        req["subc"] = json!(subc);
     }
     let total_async = query_options.and_then(|q| q.total.as_ref()).and_then(Value::as_str) == Some("async");
     let res = if total_async { manatee_jobs::kwic(&pool, &corpus.id, req)? } else { pool.kwic(&corpus.id, req)? };

@@ -28,11 +28,13 @@ use std::time::{Duration, Instant};
 pub const TOTAL_TTL: Duration = Duration::from_secs(600);
 pub const TOTALS_MAX: usize = 2000;
 
-/// (corpus, registry, query): what a total is remembered by.
+/// (corpus, registry + subcorpus, query): what a total is remembered by.
 pub fn total_key(corpus: &str, req: &Value) -> (String, String, String) {
+    let registry = req.get("registry").and_then(Value::as_str).unwrap_or("");
+    let subc = req.get("subc").and_then(Value::as_str).unwrap_or("");
     (
         corpus.to_string(),
-        req.get("registry").and_then(Value::as_str).unwrap_or("").to_string(),
+        if subc.is_empty() { registry.to_string() } else { format!("{registry}\u{0}{subc}") },
         req.get("cql").and_then(Value::as_str).unwrap_or("").trim().to_string(),
     )
 }

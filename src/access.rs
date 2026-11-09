@@ -170,7 +170,7 @@ mod tests {
     use super::*;
 
     fn caller(role: &str, groups: &[&str]) -> Caller {
-        Caller { role: role.into(), tier: role.into(), user: "u".into(), verified: true, groups: groups.iter().map(|g| g.to_string()).collect() }
+        Caller { role: role.into(), tier: role.into(), user: "u".into(), verified: true, groups: groups.iter().map(|g| g.to_string()).collect(), owned_groups: Vec::new() }
     }
 
     #[test]

@@ -353,6 +353,11 @@ Endpoints:
     `settings.manatee_aligned`. Needs libfqs_manatee 0.5 (`manatee/build.sh`); test data and a check
     against Manatee's Python module in `testdata/manatee-parallel/`.
 
+  - **`subcorpus`** (pando, native Manatee): the name of a stored subcorpus (see *Stored subcorpora*);
+    `subcorpus_mode` `use` (default) or `within`, `subcorpus_owner` when several of that name are
+    visible. The answer gets `subcorpus: {name, mode, tokens, owner}`. The same fields on `POST /run`
+    and as query parameters on `GET /info`.
+
 In `--test` mode, `/query` adds a `policy` block:
 - `would_block`: whether normal locked mode would reject
 - `reasons`: policy reasons
@@ -810,6 +815,70 @@ across runs with a fixed `--activity-salt` / `FQS_ACTIVITY_SALT`.
 
     fqs serve --activity-log /var/log/fqs/activity.jsonl
     jq -c 'select(.event=="warm_close")' /var/log/fqs/activity.jsonl
+
+## Stored subcorpora
+
+Named subcorpora are kept in FQS (table `subcorpora` of the catalogue database), so every front end
+(KonText, TEITOK, the portal) sees the same ones. One belongs to a corpus and an owner (the caller's
+user: the token's `user` / `uid`; without `--jwt-secret`, the request's `user`); the name is unique
+per corpus and owner (1–64 letters, digits, `_`, `.`).
+
+**A definition is a recipe**, resolved on the corpus's engine at creation (its size is stored) and
+again on the first use after the corpus was reindexed (pando: its `index_id`; Manatee: its registry
+and data files changed):
+
+| kind | example |
+| --- | --- |
+| `regions` | `{"kind": "regions", "struct": "text", "conditions": [{"attr": "genre", "value": ["fiction", "poetry"]}, {"attr": "year", "op": "!=", "value": "1990"}]}`: the regions whose attributes match every condition (`op` `=` / `!=`, literal values; a list: any of them; no conditions: every region) |
+| `documents` | `{"kind": "documents", "ids": ["d1", "d7"], "struct"?: "doc", "attr"?: "id"}` (default: pando `text`.`id`, Manatee the registry's `FULLREF`) |
+| `query` | `{"kind": "query", "query": "[upos=\"NOUN\"]", "language"?: "pando-cql"}`: the positions of the hits, sent as written |
+| `expression` | `{"kind": "expression", "expression": "(fiction | poetry) & 1990s - spoken"}`: other subcorpora of the corpus by name (the owner's own, else a public one); `&` binds tighter than `|` and `-` |
+
+Routes (the corpus's own access rule applies first, as on `/query`):
+
+- `GET /corpora/{id}/subcorpora` — the ones the caller may use (`?owner=` only that owner's)
+- `POST /corpora/{id}/subcorpora` `{"name", "definition", "visibility"?, "groups"?, "description"?, "backend"?}`
+  → 201 and the subcorpus: `{corpus, name, owner, visibility, groups, description, definition, tokens,
+  ranges, encoding, resolved: {engine, against, at}, created_at, updated_at, warnings?}`. 409 for a name
+  the owner already has, 400 for a definition that selects nothing (or is wrong), 403 without an owner.
+  `warnings` tells the creator when it is very fragmented (many short pieces: slower to search).
+- `GET /corpora/{id}/subcorpora/{name}` (`?owner=` when several of that name are visible)
+- `PATCH /corpora/{id}/subcorpora/{name}` `{"visibility"?, "groups"?, "description"?, "owner"?}` — owner or admin
+- `DELETE /corpora/{id}/subcorpora/{name}` (`?owner=`) — owner or admin; 409 while an expression uses it
+
+**Visibility**, checked on every use: `private` (the owner), `groups` (callers sharing one of its
+`groups`: the token's `groups`, plus `anonymous` / `authenticated` as under *Access by group*),
+`public`. An admin sees all. **Who may publish** (`groups` / `public`) is a setting, not stored data:
+`{"subcorpora": {"publish": "admins"}}` in the limits file, or env `FQS_SUBCORPUS_PUBLISH`:
+
+* `admins` (default) — only admins;
+* `group_owners` — also a caller to groups their token lists in `owned_groups`; `public` stays with admins;
+* `any_user` — any signed-in caller (role `user`), to groups they are in, or public.
+
+Making one private again is always allowed; one published under a looser rule stays published until
+its owner or an admin withdraws it.
+
+**Using one:** `"subcorpus": "<name>"` on `/query` and `/run`, `?subcorpus=<name>` on `/info`.
+`subcorpus_mode`: `use` (default; the subcorpus becomes the corpus: statistics relative to it, `/info`
+`result.size` / `result.tokens` are its size, the corpus's in `subcorpus.corpus_tokens`) or `within`
+(a filter; statistics of the whole corpus). A hit counts only when all its tokens are inside (Manatee's
+rule); the context shown is not cut. Answers add `subcorpus: {name, mode, tokens, owner}` at the top
+level (additive).
+
+Per engine:
+
+* **pando** — FQS sends the recipe as a pando definition per request (`"subcorpus": {"definition",
+  "mode", "name"}`; regions as `r:<text> :: r.text_genre = "fiction"`, expressions with their names
+  expanded) and resolves it with pando's `POST /subcorpus`. Needs FQS's pando library built with a
+  pando that has subcorpora (EF-12, pando 6221f62 or later).
+* **native Manatee** — FQS writes a `.subc` file (Manatee's own format, by Manatee's
+  `create_subcorpus`, as KonText's subcorpus form does: `<catalogue folder>/subcorpora/<corpus>/`, env
+  `FQS_SUBCORPUS_DIR`) and runs the query on the corpus opened as that subcorpus (Manatee's
+  `SubCorpus`). Expressions are joined in FQS over the range lists. Manatee's answers carry counts,
+  so `use` and `within` give the same hits; `within` reports the subcorpus for the front end to
+  divide by the whole corpus. Needs libfqs_manatee 0.7 (`manatee/build.sh`); test data and a check in
+  `testdata/manatee-subcorpora/`.
+* **CWB** — not available yet (400 naming the engine).
 
 ## Pando hit-set sessions
 

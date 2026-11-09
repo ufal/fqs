@@ -26,6 +26,9 @@ type KwicFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_longlong, c_lon
 type KwicPageFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_longlong, c_longlong, c_int, *const c_char, *const c_char, c_int, *mut *mut c_char) -> *mut c_char;
 type KwicAlignedFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_longlong, c_longlong, c_int, *const c_char, *const c_char, c_int, *const c_char, *mut *mut c_char) -> *mut c_char;
 type ExportFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, c_longlong, *mut *mut c_char) -> *mut c_char;
+type SubcCreateFn = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, *const c_char, *mut *mut c_char) -> *mut c_char;
+type OpenSubcFn = unsafe extern "C" fn(*mut c_void, *const c_char, *mut *mut c_char) -> *mut c_void;
+type SizesFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_char) -> *mut c_char;
 
 /// An open corpus (a `Corpus *` inside the library).
 struct Handle(*mut c_void);
@@ -46,7 +49,13 @@ pub struct ManateeLib {
     kwic_page: Option<KwicPageFn>,
     kwic_aligned: Option<KwicAlignedFn>,
     export_jsonl: Option<ExportFn>,
+    subc_create: Option<SubcCreateFn>,
+    open_subc: Option<OpenSubcFn>,
+    sizes: Option<SizesFn>,
     corpora: Mutex<HashMap<String, Arc<Mutex<Handle>>>>,
+    /// The subcorpus (.subc) the current request runs under ([`ManateeLib::set_subcorpus`]): the
+    /// worker answers one request at a time, and sets it per request.
+    subcorpus: Mutex<Option<PathBuf>>,
 }
 
 impl Drop for ManateeLib {
@@ -105,6 +114,9 @@ impl ManateeLib {
             let kwic_page = lib.get::<KwicPageFn>(b"fqsm_kwic_page\0").ok().map(|f| *f);   // from 0.4
             let kwic_aligned = lib.get::<KwicAlignedFn>(b"fqsm_kwic_aligned\0").ok().map(|f| *f);   // from 0.5
             let export_jsonl = lib.get::<ExportFn>(b"fqsm_export_jsonl\0").ok().map(|f| *f);   // from 0.6
+            let subc_create = lib.get::<SubcCreateFn>(b"fqsm_subc_create\0").ok().map(|f| *f);   // from 0.7
+            let open_subc = lib.get::<OpenSubcFn>(b"fqsm_open_subc\0").ok().map(|f| *f);   // from 0.7
+            let sizes = lib.get::<SizesFn>(b"fqsm_sizes\0").ok().map(|f| *f);   // from 0.7
             Ok(ManateeLib {
                 _lib: lib,
                 path: path.to_path_buf(),
@@ -119,13 +131,84 @@ impl ManateeLib {
                 kwic_page,
                 kwic_aligned,
                 export_jsonl,
+                subc_create,
+                open_subc,
+                sizes,
                 corpora: Mutex::new(HashMap::new()),
+                subcorpus: Mutex::new(None),
             })
         }
     }
 
-    /// The corpus `id` (registry file `registry`), opened on first use and kept open.
+    /// Whether the library has subcorpora (fqsm_subc_create / fqsm_open_subc, fqs-manatee 0.7).
+    pub fn has_subcorpora(&self) -> bool {
+        self.subc_create.is_some() && self.open_subc.is_some()
+    }
+
+    /// Run the following calls under the subcorpus file `path` (None: the whole corpus).
+    pub fn set_subcorpus(&self, path: Option<PathBuf>) {
+        if let Ok(mut s) = self.subcorpus.lock() {
+            *s = path;
+        }
+    }
+
+    /// The corpus `id`, or under [`ManateeLib::set_subcorpus`] the corpus opened as that subcorpus
+    /// (Manatee's SubCorpus; a handle of its own, kept open like the corpus: a re-resolved subcorpus
+    /// is written to a new file, so a kept handle never reads a changed one).
     fn handle(&self, id: &str, registry: &Path) -> Result<Arc<Mutex<Handle>>> {
+        let subc = self.subcorpus.lock().map_err(|_| anyhow!("manatee subcorpus lock poisoned"))?.clone();
+        let Some(subc) = subc else { return self.corpus_handle(id, registry) };
+        let open_subc = self.open_subc.ok_or_else(|| anyhow!("{} has no subcorpora: rebuild the library (fqs-manatee 0.7 or later)", self.version))?;
+        let key = format!("{id}\u{0}{}", subc.display());
+        if let Some(h) = self.corpora.lock().map_err(|_| anyhow!("manatee corpora lock poisoned"))?.get(&key) {
+            return Ok(Arc::clone(h));
+        }
+        let parent = self.corpus_handle(id, registry)?;
+        let parent = parent.lock().map_err(|_| anyhow!("manatee corpus lock poisoned"))?;
+        let p = CString::new(subc.to_string_lossy().as_bytes())?;
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let h = unsafe { open_subc(parent.0, p.as_ptr(), &mut err) };
+        if h.is_null() {
+            let msg = if err.is_null() { "could not open the subcorpus".to_string() } else { unsafe { CStr::from_ptr(err).to_string_lossy().into_owned() } };
+            if !err.is_null() {
+                unsafe { (self.free)(err) };
+            }
+            bail!("Manatee: {msg}");
+        }
+        let h = Arc::new(Mutex::new(Handle(h)));
+        self.corpora.lock().map_err(|_| anyhow!("manatee corpora lock poisoned"))?.insert(key, Arc::clone(&h));
+        Ok(h)
+    }
+
+    /// Write the subcorpus file `path` of corpus `id`: the regions of `structure` matching the
+    /// structure-attribute condition `query`, or (`structure` empty) the hits of the token query
+    /// `query`. {"written": bool} (false: nothing selected, no file).
+    pub fn subc_create(&self, id: &str, registry: &Path, path: &Path, structure: &str, query: &str) -> Result<Value> {
+        let f = self.subc_create.ok_or_else(|| anyhow!("{} has no subcorpora: rebuild the library (fqs-manatee 0.7 or later)", self.version))?;
+        let h = self.corpus_handle(id, registry)?;
+        let h = h.lock().map_err(|_| anyhow!("manatee corpus lock poisoned"))?;
+        let (p, s, q) = (CString::new(path.to_string_lossy().as_bytes())?, CString::new(structure)?, CString::new(query)?);
+        let mut err: *mut c_char = std::ptr::null_mut();
+        unsafe {
+            let out = f(h.0, p.as_ptr(), s.as_ptr(), q.as_ptr(), &mut err);
+            take(self.free, out, err)
+        }
+    }
+
+    /// {"size", "search_size"} of corpus `id` (under a subcorpus: search_size is its size).
+    pub fn sizes(&self, id: &str, registry: &Path) -> Result<Value> {
+        let f = self.sizes.ok_or_else(|| anyhow!("{} cannot report sizes: rebuild the library (fqs-manatee 0.7 or later)", self.version))?;
+        let h = self.handle(id, registry)?;
+        let h = h.lock().map_err(|_| anyhow!("manatee corpus lock poisoned"))?;
+        let mut err: *mut c_char = std::ptr::null_mut();
+        unsafe {
+            let out = f(h.0, &mut err);
+            take(self.free, out, err)
+        }
+    }
+
+    /// The corpus `id` (registry file `registry`), opened on first use and kept open.
+    fn corpus_handle(&self, id: &str, registry: &Path) -> Result<Arc<Mutex<Handle>>> {
         let mut map = self.corpora.lock().map_err(|_| anyhow!("manatee corpora lock poisoned"))?;
         if let Some(h) = map.get(id) {
             return Ok(Arc::clone(h));

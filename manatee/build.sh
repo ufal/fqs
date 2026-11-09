@@ -36,7 +36,7 @@ pcre() { if grep -q "^#define USE_PCRE2 " "$1/config.hh"; then echo "-lpcre2-8";
 S=$(cd "$MANATEE_SRC" && pwd)
 [ -f "$S/config.hh" ] || { echo "missing $S/config.hh: run ./configure in $S (with the options Manatee was built with)" >&2; exit 1; }
 inc=$(src_inc "$S")
-sources="$here/fqs_manatee.cc $here/fqs_manatee_aligned.cc $here/fqs_manatee_export.cc"   # + fqs_manatee.hh
+sources="$here/fqs_manatee.cc $here/fqs_manatee_aligned.cc $here/fqs_manatee_export.cc $here/fqs_manatee_subc.cc"   # + fqs_manatee.hh
 regex=$(pcre "$S")
 
 if [ -n "${MANATEE_PREFIX:-}" ]; then
