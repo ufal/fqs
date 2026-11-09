@@ -19,7 +19,7 @@ pub const JOB_PREFIX: &str = "manatee-";
 #[derive(Clone)]
 enum State {
     Counting,
-    Done(u64),
+    Done(u64, Option<f64>),
     Failed(String),
 }
 
@@ -47,7 +47,7 @@ fn lock() -> std::sync::MutexGuard<'static, Jobs> {
 /// A `kwic` request answered at once: with the total when it is known, else with the hits of the page,
 /// `"total_exact": false` and the `job_id` of the count.
 pub fn kwic(pool: &Arc<Pool>, corpus: &str, req: Value) -> Result<Value> {
-    if pool.known_total(corpus, &req).is_some() {
+    if pool.known(corpus, &req).is_some() {
         return pool.kwic(corpus, req);
     }
     let mut page_req = req.clone();
@@ -77,13 +77,14 @@ fn start_count(pool: &Arc<Pool>, corpus: &str, req: Value) -> String {
     count_req["start"] = json!(0);
     count_req["size"] = json!(0);
     if let Some(o) = count_req.as_object_mut() {
-        o.remove("aligned");   // counting needs no aligned segments
+        o.remove("aligned");   // counting needs no aligned segments, nor lines
+        o.remove("view");
     }
     std::thread::spawn(move || {
         // the pool's kwic counts every hit (the total is not known) and keeps the total for later pages
         let state = match pool.kwic(&corpus, count_req) {
             Ok(res) => match res.get("total").and_then(Value::as_u64) {
-                Some(total) => State::Done(total),
+                Some(total) => State::Done(total, res.get("arf").and_then(Value::as_f64)),
                 None => State::Failed("the Manatee count gave no total".to_string()),
             },
             Err(e) => State::Failed(format!("{e:#}")),
@@ -102,7 +103,13 @@ pub fn status(job: &str) -> Option<Value> {
     let job = j.by_id.get(job)?;
     Some(match &job.state {
         State::Counting => json!({ "ok": true, "result": { "finished": false, "running_ms": job.since.elapsed().as_millis() as u64 } }),
-        State::Done(total) => json!({ "ok": true, "result": { "finished": true, "total": total, "count": total, "total_exact": true } }),
+        State::Done(total, arf) => {
+            let mut r = json!({ "finished": true, "total": total, "count": total, "total_exact": true });
+            if let Some(a) = arf {
+                r["arf"] = json!(a);   // asked for with the query ("arf": true)
+            }
+            json!({ "ok": true, "result": r })
+        }
         State::Failed(e) => json!({ "ok": false, "error": e }),
     })
 }

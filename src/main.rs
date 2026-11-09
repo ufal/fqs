@@ -499,6 +499,21 @@ struct HttpQueryRequest {
     /// all of the registry's ALIGNED; a name or a list of names); manatee_aligned.rs
     #[serde(default)]
     aligned: Option<Value>,
+    /// KonText's KWIC lines (manatee, pando): `{left, right, attrs, ctxattrs, structs, refs}` as
+    /// KonText's kwiclib gives them to Manatee's KWICLines (`-40#`, `40#`, `-1:s`, …); each hit gets
+    /// `kwic_view` {pos, kwiclen, ctxbeg, ctxend, linegroup, refs, left, kwic, right}, the raw line
+    /// (strings and classes alternating) KonText builds its page from
+    #[serde(default)]
+    kwic_view: Option<Value>,
+    /// The query's default attribute (KonText's simple query, `a<attr>,<query>`; the query itself is
+    /// not changed): manatee sets it on the corpus for this query, pando's dialects read bare strings
+    /// with it
+    #[serde(default)]
+    default_attr: Option<String>,
+    /// manatee: with the counted total, Manatee's ARF of the whole result (`page.arf`; the async
+    /// count's `/status` too)
+    #[serde(default)]
+    arf: Option<bool>,
     /// pando: a random sample of this many hits (KonText "random sample"), in corpus order
     sample: Option<u64>,
     /// pando: the hits (or the sample) in a random order (KonText "shuffle")
@@ -8378,6 +8393,13 @@ fn run_pando_query(
             if let Some(sd) = q.seed {
                 extra.insert("seed".into(), json!(sd));
             }
+            // KonText's lines per hit and the query's default attribute (pando's dialects)
+            if let Some(v) = q.kwic_view.as_ref().filter(|v| v.is_object()) {
+                extra.insert("kwic_view".into(), v.clone());
+            }
+            if let Some(a) = q.default_attr.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+                extra.insert("default_attr".into(), json!(a));
+            }
             if let Some(a) = &q.subcorpus_applied {
                 extra.insert("subcorpus".into(), a.pando_field());
             }
@@ -8750,6 +8772,16 @@ fn run_manatee_query(
     };
     let t0 = Instant::now();
     let mut req = json!({ "registry": registry, "cql": query_text, "start": start, "size": size, "window": window, "doc_attr": doc_attr });
+    // KonText's lines, the query's default attribute, the ARF (manatee_lib::KwicExtra)
+    if let Some(v) = query_options.and_then(|q| q.kwic_view.as_ref()).filter(|v| v.is_object()) {
+        req["view"] = v.clone();
+    }
+    if let Some(a) = query_options.and_then(|q| q.default_attr.as_deref()).map(str::trim).filter(|a| !a.is_empty()) {
+        req["default_attr"] = json!(a);
+    }
+    if query_options.and_then(|q| q.arf) == Some(true) {
+        req["arf"] = json!(true);
+    }
     if !frag_attrs.is_empty() {
         req["attrs"] = json!(frag_attrs);
     }
@@ -8796,6 +8828,9 @@ fn run_manatee_query(
         });
         if let Some(al) = manatee_aligned::hit(&h, &res_attrs) {
             hit["aligned"] = al;
+        }
+        if let Some(v) = h.get("view") {
+            hit["kwic_view"] = v.clone();
         }
         if !frag_attrs.is_empty() {
             // the context's tokens with their attributes (Manatee gives no sentence boundaries here)
@@ -8844,6 +8879,10 @@ fn run_manatee_query(
         }
     });
     let mut payload = payload;
+    if let Some(arf) = res.get("arf").filter(|a| a.is_number()) {
+        payload["done"]["result"]["arf"] = arf.clone();
+        payload["done"]["result"]["page"]["arf"] = arf.clone();
+    }
     if let Some(names) = res.get("aligned_corpora") {
         payload["done"]["result"]["aligned_corpora"] = names.clone();
     }

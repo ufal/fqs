@@ -6,7 +6,9 @@
 //! "window", "attr"?, "skip_check"?} | {"op": "kwic", …as query, "attrs": [..], "doc_attr"?,
 //! "count"? (false: walk only to the end of the page), "aligned"? (a parallel corpus: the aligned
 //! corpora's registry names, a list or comma-separated, or "*" / true for all: per hit their aligned
-//! segments)} |
+//! segments), "view"? (KonText's KWIC line spec {left, right, attrs, ctxattrs, structs, refs}: per hit
+//! "view", Manatee's KWICLines), "default_attr"? (the query's default attribute: KonText's `a`),
+//! "arf"? (with the count: "arf")} |
 //! {"op": "freq", "corpus", "registry", "cql", "crit", "limit"} |
 //! {"op": "subc_create", "corpus", "registry", "path", "structure", "query"} (write a .subc) |
 //! {"op": "sizes", "corpus", "registry"}.
@@ -142,7 +144,8 @@ fn run(lib: &ManateeLib, op: &str, corpus: &str, registry: &Path, req: &Value) -
             let doc = req.get("doc_attr").and_then(Value::as_str).filter(|d| !d.is_empty());
             let count = req.get("count").and_then(Value::as_bool).unwrap_or(true);
             let aligned = aligned_arg(req.get("aligned"));
-            Ok(lib.kwic(corpus, &registry, s(req, "cql"), n(req, "start", 0), n(req, "size", 20), n(req, "window", 5) as u32, &attrs, doc, count, aligned.as_deref())?)
+            let extra = crate::manatee_lib::KwicExtra::from_request(req);
+            Ok(lib.kwic(corpus, &registry, s(req, "cql"), n(req, "start", 0), n(req, "size", 20), n(req, "window", 5) as u32, &attrs, doc, count, aligned.as_deref(), &extra)?)
         }
         "freq" => Ok(lib.freq(corpus, &registry, s(req, "cql"), s(req, "crit"), n(req, "limit", 0))?),
         other => Err(anyhow!("unknown op '{other}'").into()),

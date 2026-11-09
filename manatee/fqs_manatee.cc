@@ -102,7 +102,7 @@ std::string fqsm::read_problem(Corpus *c, int &checked) {
 
 extern "C" {
 
-const char *fqsm_version() { return "fqs-manatee 0.7.0"; }
+const char *fqsm_version() { return "fqs-manatee 0.8.0"; }
 
 // Open a corpus: a registry file path (or a name in MANATEE_REGISTRY). NULL and *err on failure.
 // The registry file's folder is where its aligned corpora are looked for first (fqsm::use).
@@ -173,11 +173,36 @@ char *fqsm_query(void *h, const char *cql, long long start, long long size, int 
 namespace {
 
 // fqsm_kwic_page and fqsm_kwic_aligned: `aligned` NULL for no aligned corpora.
+// The corpus's default attribute set for one query (KonText's `a` operation: Corpus::set_default_attr,
+// as KonText's conclib does), the registry's restored afterwards: the handle is reused.
+class DefaultAttr {
+    Corpus *c_;
+    std::string saved_;
+public:
+    DefaultAttr(Corpus *c, const char *attr) : c_(nullptr) {
+        if (!attr || !*attr) return;
+        saved_ = c->get_conf("DEFAULTATTR");
+        if (saved_ == attr) return;
+        c->set_default_attr(attr);   // throws for an attribute the corpus lacks
+        c_ = c;
+    }
+    ~DefaultAttr() {
+        if (c_) {
+            try { c_->set_default_attr(saved_); } catch (...) {}
+        }
+    }
+};
+
+// `view`: KonText's KWIC line spec (fqs_manatee_view.cc), NULL for none; `default_attr`: the
+// default attribute for this query ("" the registry's); `want_arf`: with count_all, "arf" too.
 char *kwic_impl(void *h, const char *cql, long long start, long long size, int window, const char *attrs,
-                const char *doc_attr, int count_all, const char *aligned, char **err) {
+                const char *doc_attr, int count_all, const char *aligned, const char *view,
+                const char *default_attr, int want_arf, char **err) {
     fqsm::AlignedPage *al = nullptr;
+    fqsm::KwicView *kv = nullptr;
     try {
         Corpus *c = use(h);
+        DefaultAttr da(c, default_attr);
         std::vector<std::string> names = fqsm::split_list(attrs ? attrs : "");
         std::vector<PosAttr *> pas;
         for (const std::string &n : names) pas.push_back(c->get_attr(n));
@@ -195,7 +220,10 @@ char *kwic_impl(void *h, const char *cql, long long start, long long size, int w
             doc_pa = doc_st->get_attr(d.substr(dot + 1));
         }
         if (aligned) al = fqsm::aligned_page_new(c, aligned, names);
+        if (view) kv = fqsm::kwic_view_new(c, view);
         const Position csize = c->size();
+        std::vector<Position> begs;
+        const bool arf = want_arf && count_all;
         std::string hits;
         long long total = walk(c, cql, start, size, [&](Position b, Position e, RangeStream *rs) {
             const Position lb = b > window ? b - window : 0;
@@ -217,8 +245,9 @@ char *kwic_impl(void *h, const char *cql, long long start, long long size, int w
                 hits += ",\"aligned\":";
                 fqsm::aligned_page_hit(al, hits, b, rs);
             }
+            if (kv) fqsm::kwic_view_hit(kv, hits, b, e, rs);
             hits += '}';
-        }, count_all != 0);
+        }, count_all != 0, arf ? &begs : nullptr);
         std::string an;
         for (size_t i = 0; i < names.size(); ++i) {
             if (i) an += ',';
@@ -227,8 +256,14 @@ char *kwic_impl(void *h, const char *cql, long long start, long long size, int w
         std::string out = "{\"total\":" + std::to_string(total) + ",\"counted\":" + (count_all ? "true" : "false") +
                           ",\"attrs\":[" + an + "]";
         if (al) out += ",\"aligned_corpora\":" + fqsm::aligned_page_names(al);
+        if (arf) {
+            char buf[64];
+            std::snprintf(buf, sizeof buf, "%.17g", fqsm::arf(begs, csize));
+            out += std::string(",\"arf\":") + buf;
+        }
         out += ",\"hits\":[" + hits + "]}";
         fqsm::aligned_page_free(al);
+        fqsm::kwic_view_free(kv);
         return dup(out);
     } catch (std::exception &e) {
         set_err(err, e.what());
@@ -236,6 +271,7 @@ char *kwic_impl(void *h, const char *cql, long long start, long long size, int w
         set_err(err, "unknown error in the query");
     }
     fqsm::aligned_page_free(al);
+    fqsm::kwic_view_free(kv);
     return nullptr;
 }
 
@@ -248,7 +284,7 @@ char *kwic_impl(void *h, const char *cql, long long start, long long size, int w
 // For FCS (layers, the document) and pando-shaped answers.
 char *fqsm_kwic(void *h, const char *cql, long long start, long long size, int window, const char *attrs,
                 const char *doc_attr, char **err) {
-    return kwic_impl(h, cql, start, size, window, attrs, doc_attr, 1, nullptr, err);
+    return kwic_impl(h, cql, start, size, window, attrs, doc_attr, 1, nullptr, nullptr, nullptr, 0, err);
 }
 
 // fqsm_kwic, but with `count_all` 0 the result is walked only up to the end of the page: for a
@@ -256,7 +292,7 @@ char *fqsm_kwic(void *h, const char *cql, long long start, long long size, int w
 // the hits seen, "counted": false.
 char *fqsm_kwic_page(void *h, const char *cql, long long start, long long size, int window, const char *attrs,
                      const char *doc_attr, int count_all, char **err) {
-    return kwic_impl(h, cql, start, size, window, attrs, doc_attr, count_all, nullptr, err);
+    return kwic_impl(h, cql, start, size, window, attrs, doc_attr, count_all, nullptr, nullptr, nullptr, 0, err);
 }
 
 // fqsm_kwic_page with, per hit, the aligned segments of the parallel corpora `aligned` (comma-
@@ -271,7 +307,21 @@ char *fqsm_kwic_page(void *h, const char *cql, long long start, long long size, 
 // corpus lacks). Without ALIGNED in the registry: an error.
 char *fqsm_kwic_aligned(void *h, const char *cql, long long start, long long size, int window, const char *attrs,
                         const char *doc_attr, int count_all, const char *aligned, char **err) {
-    return kwic_impl(h, cql, start, size, window, attrs, doc_attr, count_all, aligned ? aligned : "*", err);
+    return kwic_impl(h, cql, start, size, window, attrs, doc_attr, count_all, aligned ? aligned : "*", nullptr, nullptr, 0, err);
+}
+
+// fqsm_kwic_aligned with KonText's view (fqs-manatee 0.8): `aligned` NULL or "" for none (else as
+// there); `view` (NULL or "" for none): left, right, attrs, ctxattrs, structs, refs separated by \x1f,
+// as KonText's kwiclib gives them to Manatee's KWICLines: per hit also "view": {"pos", "kwiclen",
+// "ctxbeg", "ctxend", "linegroup", "refs": [...], "left" / "kwic" / "right": [str, class, str, class,
+// …]} (KWICLines' get_left() etc.); `default_attr` (NULL or ""): the default attribute for this query
+// (KonText's `a` operation; an attribute the corpus lacks is an error); `want_arf` with `count_all`:
+// also "arf", Manatee's average reduced frequency of the whole result.
+char *fqsm_kwic_ex(void *h, const char *cql, long long start, long long size, int window, const char *attrs,
+                   const char *doc_attr, int count_all, const char *aligned, const char *view,
+                   const char *default_attr, int want_arf, char **err) {
+    return kwic_impl(h, cql, start, size, window, attrs, doc_attr, count_all, (aligned && *aligned) ? aligned : nullptr,
+                     (view && *view) ? view : nullptr, default_attr, want_arf, err);
 }
 
 // Frequencies of a query's hits by a Manatee criterion ("word 0", "lemma/i 0", "doc.id 0", …):

@@ -25,10 +25,40 @@ type CheckFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_char) -> *mut c_cha
 type KwicFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_longlong, c_longlong, c_int, *const c_char, *const c_char, *mut *mut c_char) -> *mut c_char;
 type KwicPageFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_longlong, c_longlong, c_int, *const c_char, *const c_char, c_int, *mut *mut c_char) -> *mut c_char;
 type KwicAlignedFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_longlong, c_longlong, c_int, *const c_char, *const c_char, c_int, *const c_char, *mut *mut c_char) -> *mut c_char;
+type KwicExFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_longlong, c_longlong, c_int, *const c_char, *const c_char, c_int, *const c_char, *const c_char, *const c_char, c_int, *mut *mut c_char) -> *mut c_char;
 type ExportFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, c_longlong, *mut *mut c_char) -> *mut c_char;
 type SubcCreateFn = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, *const c_char, *mut *mut c_char) -> *mut c_char;
 type OpenSubcFn = unsafe extern "C" fn(*mut c_void, *const c_char, *mut *mut c_char) -> *mut c_void;
 type SizesFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_char) -> *mut c_char;
+
+/// What a `kwic` request may add (fqs-manatee 0.8): KonText's KWIC line spec (`view`: left, right,
+/// attrs, ctxattrs, structs, refs joined by U+001F), the default attribute of this query, the ARF.
+#[derive(Default, Debug, Clone)]
+pub struct KwicExtra {
+    pub view: Option<String>,
+    pub default_attr: Option<String>,
+    pub arf: bool,
+}
+
+impl KwicExtra {
+    pub fn is_empty(&self) -> bool {
+        self.view.is_none() && self.default_attr.is_none() && !self.arf
+    }
+
+    /// From a worker request: "view" ({left, right, attrs, ctxattrs, structs, refs}), "default_attr",
+    /// "arf".
+    pub fn from_request(req: &Value) -> Self {
+        let view = req.get("view").filter(|v| v.is_object()).map(|v| {
+            ["left", "right", "attrs", "ctxattrs", "structs", "refs"]
+                .iter()
+                .map(|k| v.get(*k).and_then(Value::as_str).unwrap_or("").replace('\u{1f}', ""))
+                .collect::<Vec<_>>()
+                .join("\u{1f}")
+        });
+        let default_attr = req.get("default_attr").and_then(Value::as_str).map(str::trim).filter(|a| !a.is_empty()).map(str::to_string);
+        KwicExtra { view, default_attr, arf: req.get("arf").and_then(Value::as_bool).unwrap_or(false) }
+    }
+}
 
 /// An open corpus (a `Corpus *` inside the library).
 struct Handle(*mut c_void);
@@ -48,6 +78,7 @@ pub struct ManateeLib {
     kwic: Option<KwicFn>,
     kwic_page: Option<KwicPageFn>,
     kwic_aligned: Option<KwicAlignedFn>,
+    kwic_ex: Option<KwicExFn>,
     export_jsonl: Option<ExportFn>,
     subc_create: Option<SubcCreateFn>,
     open_subc: Option<OpenSubcFn>,
@@ -113,6 +144,7 @@ impl ManateeLib {
             let kwic = lib.get::<KwicFn>(b"fqsm_kwic\0").ok().map(|f| *f);   // from fqs-manatee 0.3
             let kwic_page = lib.get::<KwicPageFn>(b"fqsm_kwic_page\0").ok().map(|f| *f);   // from 0.4
             let kwic_aligned = lib.get::<KwicAlignedFn>(b"fqsm_kwic_aligned\0").ok().map(|f| *f);   // from 0.5
+            let kwic_ex = lib.get::<KwicExFn>(b"fqsm_kwic_ex\0").ok().map(|f| *f);   // from 0.8
             let export_jsonl = lib.get::<ExportFn>(b"fqsm_export_jsonl\0").ok().map(|f| *f);   // from 0.6
             let subc_create = lib.get::<SubcCreateFn>(b"fqsm_subc_create\0").ok().map(|f| *f);   // from 0.7
             let open_subc = lib.get::<OpenSubcFn>(b"fqsm_open_subc\0").ok().map(|f| *f);   // from 0.7
@@ -130,6 +162,7 @@ impl ManateeLib {
                 kwic,
                 kwic_page,
                 kwic_aligned,
+                kwic_ex,
                 export_jsonl,
                 subc_create,
                 open_subc,
@@ -288,8 +321,27 @@ impl ManateeLib {
     /// `count_all` false: the result is walked only to the end of the page ("counted": false; a
     /// library before 0.4 always counts). `aligned` (a parallel corpus: registry names of aligned
     /// corpora, comma-separated, `*` all): also "aligned_corpora" and per hit "aligned" (0.5).
+    ///
+    /// `extra` (fqs-manatee 0.8, [`KwicExtra`]): KonText's view per hit ("view"), a default attribute
+    /// for this query, and the ARF of the whole result ("arf", when it is counted).
     #[allow(clippy::too_many_arguments)]
-    pub fn kwic(&self, id: &str, registry: &Path, cql: &str, start: u64, size: u64, window: u32, attrs: &[String], doc_attr: Option<&str>, count_all: bool, aligned: Option<&str>) -> Result<Value> {
+    pub fn kwic(&self, id: &str, registry: &Path, cql: &str, start: u64, size: u64, window: u32, attrs: &[String], doc_attr: Option<&str>, count_all: bool, aligned: Option<&str>, extra: &KwicExtra) -> Result<Value> {
+        if !extra.is_empty() {
+            let f = self.kwic_ex.ok_or_else(|| anyhow!("{} has no KonText view, default attribute or ARF: rebuild the library (fqs-manatee 0.8 or later)", self.version))?;
+            let h = self.handle(id, registry)?;
+            let h = h.lock().map_err(|_| anyhow!("manatee corpus lock poisoned"))?;
+            let q = CString::new(cql)?;
+            let a = CString::new(attrs.join(","))?;
+            let d = CString::new(doc_attr.unwrap_or(""))?;
+            let al = CString::new(aligned.unwrap_or(""))?;
+            let v = CString::new(extra.view.as_deref().unwrap_or(""))?;
+            let da = CString::new(extra.default_attr.as_deref().unwrap_or(""))?;
+            let mut err: *mut c_char = std::ptr::null_mut();
+            return unsafe {
+                let out = f(h.0, q.as_ptr(), start as c_longlong, size as c_longlong, window as c_int, a.as_ptr(), d.as_ptr(), count_all as c_int, al.as_ptr(), v.as_ptr(), da.as_ptr(), extra.arf as c_int, &mut err);
+                take(self.free, out, err)
+            };
+        }
         let kwic = self.kwic.ok_or_else(|| anyhow!("{} has no fqsm_kwic: rebuild the library (fqs-manatee 0.3 or later)", self.version))?;
         let aligned_fn = match aligned {
             Some(_) => Some(self.kwic_aligned.ok_or_else(|| anyhow!("{} gives no aligned segments: rebuild the library (fqs-manatee 0.5 or later)", self.version))?),
@@ -380,6 +432,21 @@ pub const MANATEE_PRIORITY: &[&str] = &["word.", "lemma.", "lc."];
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn kwic_extra_from_request() {
+        use super::KwicExtra;
+        use serde_json::json;
+        assert!(KwicExtra::from_request(&json!({"cql": "x"})).is_empty());
+        let e = KwicExtra::from_request(&json!({"view": {"left": "-40#", "right": "40#", "attrs": "word,lemma", "structs": "s"},
+                                                "default_attr": " lemma ", "arf": true}));
+        assert_eq!(e.view.as_deref(), Some("-40#\u{1f}40#\u{1f}word,lemma\u{1f}\u{1f}s\u{1f}"));
+        assert_eq!(e.default_attr.as_deref(), Some("lemma"));
+        assert!(e.arf && !e.is_empty());
+        // a separator in a value cannot shift the fields
+        let e = KwicExtra::from_request(&json!({"view": {"left": "a\u{1f}b"}}));
+        assert_eq!(e.view.as_deref().map(|v| v.matches('\u{1f}').count()), Some(5));
+    }
+
     use super::*;
     use serde_json::json;
 

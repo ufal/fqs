@@ -353,6 +353,26 @@ Endpoints:
     `settings.manatee_aligned`. Needs libfqs_manatee 0.5 (`manatee/build.sh`); test data and a check
     against Manatee's Python module in `testdata/manatee-parallel/`.
 
+  - **`kwic_view`** (native Manatee, pando): KonText's KWIC lines, `{left, right, attrs, ctxattrs,
+    structs, refs}` as KonText gives them to Manatee's `KWICLines` (`"-40#"`, `"40#"`, `"word,lemma"`,
+    …; `"-1:s"` for sentences; pando also `maxctx`, the registry's MAXCONTEXT). Each hit gets
+    `kwic_view: {pos, kwiclen, ctxbeg, ctxend, linegroup, refs, left, kwic, right}`: the line as
+    `KWICLines` gives it (strings and classes alternating), so KonText builds its page with its own
+    code. Native Manatee runs `KWICLines` itself (libfqs_manatee 0.8); pando has the same algorithm
+    (`kwic_view` in pando's `/query` and `/run`). Check against Manatee's Python module:
+    `testdata/manatee-kwic-view/check-kwic-view.py`. The attribute delimiter is the Manatee build's
+    (`/` upstream, U+001F in ÚČNK's manatee-open, which KonText runs and pando follows).
+
+  - **`default_attr`** (native Manatee, pando): the attribute a bare `"string"` stands for (KonText's
+    simple query with a chosen attribute, `a<attr>,<query>`); the query is not changed. Native Manatee
+    sets the corpus's default attribute for that query (and restores it), pando's Manatee and CWB
+    dialects read bare strings with it. Totals and background counts keep queries with another default
+    attribute apart.
+
+  - **`arf`** (native Manatee): `true` adds Manatee's ARF of the result to the counted total
+    (`result.arf`, `page.arf`; with `total: "async"` the `/status` of the count). For pando, `POST /run`
+    with `…; arf`.
+
   - **`subcorpus`** (pando, native Manatee, CWB): the name of a stored subcorpus (see *Stored subcorpora*);
     `subcorpus_mode` `use` (default) or `within`, `subcorpus_owner` when several of that name are
     visible. The answer gets `subcorpus: {name, mode, tokens, owner}`. The same fields on `POST /run`

@@ -108,12 +108,15 @@ inline RangeStream *eval(Corpus *c, const char *cql) {
 // labels, e.g. the matches in aligned corpora); the total (exact: every hit is walked), or with
 // `count_all` false the hits up to the end of the page only (then the total is exact only when it
 // is below start+size: the result ended inside the page).
+// `begs` (optional): every hit's start, in corpus order (for the ARF).
 template <class Fn>
-long long walk(Corpus *c, const char *cql, long long start, long long size, Fn fn, bool count_all = true) {
+long long walk(Corpus *c, const char *cql, long long start, long long size, Fn fn, bool count_all = true,
+               std::vector<Position> *begs = nullptr) {
     RangeStream *rs = eval(c, cql);
     long long total = 0;
     try {
         while (!rs->end()) {
+            if (begs) begs->push_back(rs->peek_beg());
             if (total >= start && total < start + size) fn(rs->peek_beg(), rs->peek_end(), rs);
             ++total;
             if (!count_all && total >= start + size) break;
@@ -161,6 +164,17 @@ void aligned_page_free(AlignedPage *a);
 // array [{"corpus", "ok", "segments"?, "warning"?, "error"?}]; `problem` set when one does not read
 // as its registry describes (a corpus that cannot be opened is no problem: it is reported).
 std::string aligned_check(Corpus *c, int &checked, std::string &problem);
+}  // namespace fqsm
+
+// KonText's KWIC lines (fqs_manatee_view.cc): Manatee's KWICLines over one hit at a time. `spec`:
+// left, right, attrs, ctxattrs, structs, refs separated by \x1f, as KonText's kwiclib passes them.
+namespace fqsm {
+class KwicView;
+KwicView *kwic_view_new(Corpus *c, const char *spec);
+void kwic_view_hit(KwicView *v, std::string &out, Position beg, Position end, RangeStream *rs);
+void kwic_view_free(KwicView *v);
+// Manatee's ARF over the hits' starts (corpus order) in a corpus of `size` positions
+double arf(const std::vector<Position> &begs, Position size);
 }  // namespace fqsm
 
 #endif

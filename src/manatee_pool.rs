@@ -35,7 +35,14 @@ pub fn total_key(corpus: &str, req: &Value) -> (String, String, String) {
     (
         corpus.to_string(),
         if subc.is_empty() { registry.to_string() } else { format!("{registry}\u{0}{subc}") },
-        req.get("cql").and_then(Value::as_str).unwrap_or("").trim().to_string(),
+        {
+            // the query's default attribute (KonText's `a`) is part of what the query means
+            let cql = req.get("cql").and_then(Value::as_str).unwrap_or("").trim().to_string();
+            match req.get("default_attr").and_then(Value::as_str).map(str::trim).filter(|a| !a.is_empty()) {
+                Some(a) => format!("{cql}\u{0}default_attr={a}"),
+                None => cql,
+            }
+        },
     )
 }
 
@@ -60,7 +67,8 @@ pub struct Pool {
     /// corpus → (crashes, since)
     crashes: Mutex<HashMap<String, (u32, Instant)>>,
     /// (corpus, registry, query) → (total, counted at)
-    totals: Mutex<HashMap<(String, String, String), (u64, Instant)>>,
+    /// (total, ARF when it was asked for, when)
+    totals: Mutex<HashMap<(String, String, String), (u64, Option<f64>, Instant)>>,
 }
 
 /// Why the pool did not start although FQS_MANATEE_LIB is set (engine_status.rs).
@@ -275,8 +283,17 @@ impl Pool {
 
     /// The total of a `kwic` request's query, when it was counted within TOTAL_TTL.
     pub fn known_total(&self, corpus: &str, req: &Value) -> Option<u64> {
+        self.known(corpus, req).map(|(t, _)| t)
+    }
+
+    /// The known total and ARF of a request's query; a request asking for the ARF ("arf": true)
+    /// knows it only when the count gave one.
+    pub fn known(&self, corpus: &str, req: &Value) -> Option<(u64, Option<f64>)> {
+        let wants_arf = req.get("arf").and_then(Value::as_bool).unwrap_or(false);
         let map = self.totals.lock().unwrap_or_else(|p| p.into_inner());
-        map.get(&total_key(corpus, req)).filter(|(_, at)| at.elapsed() < TOTAL_TTL).map(|(t, _)| *t)
+        map.get(&total_key(corpus, req))
+            .filter(|(_, arf, at)| at.elapsed() < TOTAL_TTL && (!wants_arf || arf.is_some()))
+            .map(|(t, arf, _)| (*t, *arf))
     }
 
     /// A `kwic` request ({"registry", "cql", "start", "size", …}) with the total remembered: when the
@@ -285,25 +302,28 @@ impl Pool {
     /// total is kept.
     pub fn kwic(&self, corpus: &str, mut req: Value) -> Result<Value> {
         let key = total_key(corpus, &req);
-        let known = self.known_total(corpus, &req);
+        let known = self.known(corpus, &req);
         req["op"] = json!("kwic");
         req["count"] = json!(known.is_none());
         let mut res = self.call(corpus, req)?;
         match known {
-            Some(total) => {
+            Some((total, arf)) => {
                 res["total"] = json!(total);
                 res["total_reused"] = json!(true);
+                if let Some(a) = arf {
+                    res["arf"] = json!(a);
+                }
             }
             None if res.get("counted").and_then(Value::as_bool) != Some(false) => {
                 if let Some(total) = res.get("total").and_then(Value::as_u64) {
                     let mut map = self.totals.lock().unwrap_or_else(|p| p.into_inner());
                     if map.len() >= TOTALS_MAX {
-                        map.retain(|_, (_, at)| at.elapsed() < TOTAL_TTL);
+                        map.retain(|_, (_, _, at)| at.elapsed() < TOTAL_TTL);
                         if map.len() >= TOTALS_MAX {
                             map.clear();
                         }
                     }
-                    map.insert(key, (total, Instant::now()));
+                    map.insert(key, (total, res.get("arf").and_then(Value::as_f64), Instant::now()));
                 }
             }
             None => {}
@@ -359,5 +379,19 @@ impl Pool {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::total_key;
+    use serde_json::json;
+
+    #[test]
+    fn total_key_has_the_default_attribute() {
+        let w = total_key("c", &json!({"registry": "/r", "cql": "\"dog\""}));
+        let l = total_key("c", &json!({"registry": "/r", "cql": "\"dog\"", "default_attr": "lemma"}));
+        assert_ne!(w, l);   // KonText's `a` with lemma is another query than with word
+        assert_eq!(w, total_key("c", &json!({"registry": "/r", "cql": "\"dog\"", "default_attr": " "})));
     }
 }
