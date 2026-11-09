@@ -9,13 +9,16 @@
 //!   (`<catalogue folder>/subcorpora/<corpus>/…`, env FQS_SUBCORPUS_DIR). A new resolution gets a
 //!   new file: a worker that has the old one open keeps reading the old one, never a half-written one.
 //!
+//! - CWB: each part a CQP query whose ranges come back with `dump` (cwb.rs), joined in FQS, kept
+//!   with CQP's `undump` + `save` in `<…>/subcorpora/<corpus>/cwb/`.
+//!
 //! Names in an expression are the owner's own subcorpora first, else public ones of the corpus.
 
 use super::definition::{Definition, Expr};
 use super::policy::Visibility;
 use super::ranges::{self, Range};
 use super::store::{self, Resolution, Subcorpus};
-use super::{to_manatee, to_pando, Refusal};
+use super::{cwb, to_manatee, to_pando, Refusal};
 use crate::hot_corpus::HotGuard;
 use crate::{manatee_lib, manatee_pool, refuse, CorpusEntry, HttpAppState};
 use anyhow::{anyhow, Context, Result};
@@ -37,6 +40,10 @@ pub fn engine(corpus: &CorpusEntry, backend_override: Option<&str>) -> Result<St
         "pando" => Ok(b),
         "manatee" if manatee_pool::global().is_some() => Ok(b),
         "manatee" => refuse!(400, "subcorpora on Manatee corpora need FQS's native Manatee (FQS_MANATEE_LIB)"),
+        "cqp" if crate::cqp_prefers_flexicorp(corpus) => {
+            refuse!(400, "subcorpora on CWB corpora run on FQS's own CQP route; corpus '{}' uses flexicorp's (a TEITOK project)", corpus.id)
+        }
+        "cqp" => Ok(b),
         other => refuse!(400, "subcorpora work on pando and Manatee corpora; corpus '{}' is served by {other}", corpus.id),
     }
 }
@@ -65,9 +72,14 @@ pub fn pando_index_id(index_dir: &Path) -> String {
 /// A Manatee corpus's stamp: its registry file, and the name, size and time of every file in its
 /// data folder. Any recompilation changes it.
 pub fn manatee_stamp(registry: &Path) -> String {
+    files_stamp(registry, manatee_lib::data_dir(registry))
+}
+
+/// A registry file and the name, size and time of every file in a data folder, as one stamp.
+pub fn files_stamp(registry: &Path, data_dir: Option<PathBuf>) -> String {
     let mut h = Sha256::new();
     h.update(std::fs::read(registry).unwrap_or_default());
-    if let Some(dir) = manatee_lib::data_dir(registry) {
+    if let Some(dir) = data_dir {
         let mut entries: Vec<(String, u64, i64)> = std::fs::read_dir(&dir)
             .map(|rd| {
                 rd.flatten()
@@ -101,12 +113,33 @@ impl Ctx<'_> {
             .ok_or_else(|| anyhow!("no Manatee registry for '{}' (settings.manatee_registry, or MANATEE_REGISTRY)", self.corpus.id))
     }
 
+    /// The CWB corpus name, its registry file and data folder.
+    fn cwb(&self) -> (String, PathBuf, Option<PathBuf>) {
+        let (_, name, _, reg_dir) = crate::cqp_base_command(self.corpus);
+        let reg_dir = PathBuf::from(reg_dir);
+        let data = crate::warm::cwb_data_dir(&reg_dir, &name);
+        (name.clone(), reg_dir.join(name.to_lowercase()), data)
+    }
+
     /// The current index of the corpus on this engine.
     pub fn against(&self) -> Result<String> {
         Ok(match self.engine.as_str() {
             "pando" => pando_index_id(&crate::resolve_pando_index_dir(self.corpus)?),
+            "cqp" => {
+                let (_, reg, data) = self.cwb();
+                files_stamp(&reg, data)
+            }
             _ => manatee_stamp(&self.registry()?),
         })
+    }
+
+    /// Is the stored resolution's file still there?
+    fn file_there(&self, r: &Resolution) -> bool {
+        let Some(p) = r.subc_path.as_deref().map(Path::new) else { return self.engine == "pando" };
+        match self.engine.as_str() {
+            "cqp" => cwb::saved(&self.cwb().0, p),
+            _ => p.is_file(),
+        }
     }
 
     /// A subcorpus named in an expression of `owner`'s: their own, else a public one.
@@ -135,6 +168,7 @@ impl Ctx<'_> {
             Definition::Documents { ids, structure, attr } if structure.is_none() || attr.is_none() => {
                 let (s, a) = match self.engine.as_str() {
                     "pando" => (to_pando::DOC_STRUCT.to_string(), to_pando::DOC_ATTR.to_string()),
+                    "cqp" => (cwb::DOC_STRUCT.to_string(), cwb::DOC_ATTR.to_string()),
                     _ => to_manatee::doc_attr(manatee_lib::fullref(&self.registry()?).as_deref()),
                 };
                 Definition::Documents { ids, structure: Some(structure.unwrap_or(s)), attr: Some(attr.unwrap_or(a)) }
@@ -161,17 +195,25 @@ impl Ctx<'_> {
                 // pando's answer, which is the open (warm) index's and may be the previous one
                 store::resolution_now("pando", n("tokens"), n("ranges"), v.get("encoding").and_then(Value::as_str).unwrap_or("ranges"), &against, None)
             }
-            _ => {
-                let rs = self.manatee_ranges(owner, def, 0)?;
+            engine => {
+                let rs = self.ranges_of(owner, def, 0)?;
                 if rs.is_empty() {
                     refuse!(400, "the subcorpus definition selects no tokens of corpus '{}'", self.corpus.id);
                 }
                 let mut key = Sha256::new();
                 key.update(format!("{}\u{0}{owner}\u{0}{name}", self.corpus.id));
                 let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-                let path = subc_dir(self.state, &self.corpus.id).join(format!("{}-{nanos}.subc", hex(&key.finalize()[..8])));
-                ranges::write_subc(&path, &rs)?;
-                store::resolution_now("manatee", ranges::tokens(&rs), rs.len() as u64, "ranges", &against, Some(path.display().to_string()))
+                // a CQP subcorpus name: a letter first, letters, digits, '_'
+                let stem = format!("Fqs_{}_{nanos}", hex(&key.finalize()[..8]));
+                let dir = subc_dir(self.state, &self.corpus.id);
+                let path = if engine == "cqp" {
+                    cwb::save(self.corpus, &dir.join("cwb"), &stem, &rs)?
+                } else {
+                    let p = dir.join(format!("{stem}.subc"));
+                    ranges::write_subc(&p, &rs)?;
+                    p
+                };
+                store::resolution_now(engine, ranges::tokens(&rs), rs.len() as u64, "ranges", &against, Some(path.display().to_string()))
             }
         };
         if res.tokens == 0 {
@@ -192,20 +234,22 @@ impl Ctx<'_> {
         let stale = match &s.resolution {
             None => true,
             Some(r) => {
-                r.engine != self.engine
-                    || r.against != self.against()?
-                    || (self.engine == "manatee" && !r.subc_path.as_deref().is_some_and(|p| Path::new(p).is_file()))
+                r.engine != self.engine || r.against != self.against()? || !self.file_there(r)
             }
         };
         if stale {
             let (res, _) = self.resolve(&s.owner, &s.name, &s.definition)?;
             store::set_resolution(self.conn, s.id, &res)?;
-            s.resolution = Some(res);
+            if let Some(old) = s.resolution.replace(res) {
+                remove_files(self.corpus, &old);
+            }
         }
         Ok(s)
     }
 
-    fn manatee_ranges(&self, owner: &str, def: &Definition, depth: usize) -> Result<Vec<Range>> {
+    /// The ranges of a definition on Manatee or CWB: its parts from the engine, an expression
+    /// joined here from its names' stored files.
+    fn ranges_of(&self, owner: &str, def: &Definition, depth: usize) -> Result<Vec<Range>> {
         if depth > to_pando::MAX_DEPTH {
             refuse!(400, "subcorpus expressions nest more than {} deep (a name defined through itself?)", to_pando::MAX_DEPTH);
         }
@@ -214,7 +258,7 @@ impl Ctx<'_> {
             let mut leaf = |n: &str| -> Result<Vec<Range>> {
                 let s = self.named(owner, n)?;
                 if let Definition::Expression { .. } = s.definition {
-                    return self.manatee_ranges(&s.owner, &s.definition, depth + 1);
+                    return self.ranges_of(&s.owner, &s.definition, depth + 1);
                 }
                 let s = self.fresh(s)?;
                 let p = s.resolution.and_then(|r| r.subc_path).ok_or_else(|| anyhow!("subcorpus '{n}' has no file"))?;
@@ -225,6 +269,13 @@ impl Ctx<'_> {
                 '|' => ranges::union(&a, &b),
                 _ => ranges::difference(&a, &b),
             });
+        }
+        if self.engine == "cqp" {
+            let mut all = Vec::new();
+            for q in cwb::parts(def)? {
+                all.extend(cwb::dump_ranges(self.corpus, &q)?);
+            }
+            return Ok(ranges::normalize(all));
         }
         let pool = manatee_pool::global().ok_or_else(|| anyhow!("native Manatee is not available (FQS_MANATEE_LIB)"))?;
         let registry = self.registry()?;
@@ -243,6 +294,17 @@ impl Ctx<'_> {
             }
         }
         Ok(ranges::normalize(all))
+    }
+}
+
+/// Remove the files of a resolution that is no longer used (a re-resolved or deleted subcorpus).
+/// A Manatee worker that still has a `.subc` open keeps reading it (the file stays until closed).
+pub fn remove_files(corpus: &CorpusEntry, r: &Resolution) {
+    let Some(p) = r.subc_path.as_deref().map(Path::new) else { return };
+    if r.engine == "cqp" {
+        cwb::remove(&crate::cqp_base_command(corpus).1, p);
+    } else {
+        let _ = std::fs::remove_file(p);
     }
 }
 

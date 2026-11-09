@@ -15,6 +15,11 @@ catalogue row with preferred_backend pando and settings.index_dir DIR):
 
     python3 testdata/manatee-subcorpora/check-fqs.py http://127.0.0.1:18799 subcpando form
 
+and on CWB (`sh build-cwb.sh`; a row with preferred_backend cqp, settings.corpus_name subccwb,
+settings.registry_hint OUT/cwb/registry/subccwb):
+
+    python3 testdata/manatee-subcorpora/check-fqs.py http://127.0.0.1:18799 subccwb
+
 With MANATEE_SRC set, the corpus is also rebuilt once (a "reindex") to check that a subcorpus is
 resolved again on its next use. The subcorpora it makes are deleted first and at the end.
 Checks: sizes of every kind of definition (regions with = / != / several values / literal values
@@ -101,7 +106,7 @@ DEFS = {
     "night": {"kind": "regions", "struct": "doc", "conditions": [{"attr": "title", "value": "Night 1.2"}]},
     "budget": {"kind": "regions", "struct": "doc", "conditions": [{"attr": "title", "value": "Budget (draft)"}]},
     "docs": {"kind": "documents", "ids": ["d2", "d4"], "struct": "doc"},
-    "thes": {"kind": "query", "query": f'[{ATTR}="the"]', "language": "manatee-cql"},
+    "thes": {"kind": "query", "query": f'[{ATTR}="the"]'},
     "alldocs": {"kind": "regions", "struct": "doc"},
     "expr": {"kind": "expression", "expression": "(fiction | docs) - y1990"},
     "both": {"kind": "expression", "expression": "y1990 & notnews"},
@@ -202,16 +207,17 @@ st, _ = call("DELETE", f"/corpora/{C}/subcorpora/docs", **alice)
 check("delete while 'expr' uses it: 409", st, 409)
 
 # --- a reindex: resolved again on the next use ----------------------------------------------------
-if os.environ.get("MANATEE_SRC") and C == "subctest":
+REBUILD = {"subctest": "build.sh", "subccwb": "build-cwb.sh"}.get(C)
+if REBUILD and (os.environ.get("MANATEE_SRC") or C == "subccwb"):
     _, before = call("GET", f"/corpora/{C}/subcorpora/expr", **alice)
-    subprocess.run(["sh", os.path.join(HERE, "build.sh")], check=True, capture_output=True)
+    subprocess.run(["sh", os.path.join(HERE, REBUILD)], check=True, capture_output=True)
     st, got, a = run_query(f'[{ATTR}="the"]', subcorpus="expr", **alice)
     want = hits(["the"], REF["expr"])
     check("after a reindex: same hits", got, (len(want), want))
     _, after = call("GET", f"/corpora/{C}/subcorpora/expr", **alice)
     check("after a reindex: resolved again", before["resolved"]["against"] != after["resolved"]["against"], True)
 else:
-    print("skip reindex check (set MANATEE_SRC)")
+    print("skip reindex check (Manatee: set MANATEE_SRC; pando: by hand)")
 
 cleanup()
 print(f"\n{len(FAILS)} failed" if FAILS else "\nall passed")

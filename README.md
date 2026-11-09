@@ -353,7 +353,7 @@ Endpoints:
     `settings.manatee_aligned`. Needs libfqs_manatee 0.5 (`manatee/build.sh`); test data and a check
     against Manatee's Python module in `testdata/manatee-parallel/`.
 
-  - **`subcorpus`** (pando, native Manatee): the name of a stored subcorpus (see *Stored subcorpora*);
+  - **`subcorpus`** (pando, native Manatee, CWB): the name of a stored subcorpus (see *Stored subcorpora*);
     `subcorpus_mode` `use` (default) or `within`, `subcorpus_owner` when several of that name are
     visible. The answer gets `subcorpus: {name, mode, tokens, owner}`. The same fields on `POST /run`
     and as query parameters on `GET /info`.
@@ -830,7 +830,7 @@ and data files changed):
 | kind | example |
 | --- | --- |
 | `regions` | `{"kind": "regions", "struct": "text", "conditions": [{"attr": "genre", "value": ["fiction", "poetry"]}, {"attr": "year", "op": "!=", "value": "1990"}]}`: the regions whose attributes match every condition (`op` `=` / `!=`, literal values; a list: any of them; no conditions: every region) |
-| `documents` | `{"kind": "documents", "ids": ["d1", "d7"], "struct"?: "doc", "attr"?: "id"}` (default: pando `text`.`id`, Manatee the registry's `FULLREF`) |
+| `documents` | `{"kind": "documents", "ids": ["d1", "d7"], "struct"?: "doc", "attr"?: "id"}` (default: pando and CWB `text`.`id`, Manatee the registry's `FULLREF`) |
 | `query` | `{"kind": "query", "query": "[upos=\"NOUN\"]", "language"?: "pando-cql"}`: the positions of the hits, sent as written |
 | `expression` | `{"kind": "expression", "expression": "(fiction | poetry) & 1990s - spoken"}`: other subcorpora of the corpus by name (the owner's own, else a public one); `&` binds tighter than `|` and `-` |
 
@@ -878,7 +878,12 @@ Per engine:
   so `use` and `within` give the same hits; `within` reports the subcorpus for the front end to
   divide by the whole corpus. Needs libfqs_manatee 0.7 (`manatee/build.sh`); test data and a check in
   `testdata/manatee-subcorpora/`.
-* **CWB** — not available yet (400 naming the engine).
+* **CWB** — CQP's own subcorpora, on FQS's CQP route: each part a CQP query (regions as
+  `<text> [] :: match.text_genre = "fiction" expand to text`), its ranges read with `dump`, joined in
+  FQS, kept with `undump` + `save` in `<catalogue folder>/subcorpora/<corpus>/cwb/`; a query activates
+  it first (`set DataDirectory …; CORPUS:Name;`), so CQP searches only inside it. Default documents:
+  `text`.`id`. As on Manatee, `use` and `within` give the same hits. A TEITOK project queried through
+  flexicorp's CQP route has no subcorpora (400). Test data: `testdata/manatee-subcorpora/build-cwb.sh`.
 
 ## Pando hit-set sessions
 

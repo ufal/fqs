@@ -224,8 +224,8 @@ pub async fn delete(State(state): State<HttpAppState>, headers: HeaderMap, AxumP
             return Err(anyhow!(Refusal::conflict(format!("subcorpus '{}' is used by {}: delete or change those first", s.name, users.join(", ")))));
         }
         store::delete(&conn, s.id)?;
-        if let Some(p) = s.resolution.as_ref().and_then(|r| r.subc_path.as_deref()) {
-            let _ = std::fs::remove_file(p);
+        if let Some(r) = &s.resolution {
+            resolve::remove_files(&corpus, r);
         }
         Ok(s.to_json())
     })

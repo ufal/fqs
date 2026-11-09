@@ -11,10 +11,12 @@
 //! - api.rs: `GET/POST /corpora/{id}/subcorpora`, `GET/PATCH/DELETE /corpora/{id}/subcorpora/{name}`
 //!
 //! Engines: pando (definition text per request; `POST /subcorpus` to resolve) and native Manatee
-//! (a `.subc` written by libfqs_manatee, the corpus opened as that subcorpus). CWB: not yet.
+//! (a `.subc` written by libfqs_manatee, the corpus opened as that subcorpus) and CWB (CQP's own
+//! subcorpora: undump + save, activated before the query; cwb.rs).
 
 pub mod api;
 pub mod apply;
+pub mod cwb;
 pub mod definition;
 pub mod policy;
 pub mod ranges;

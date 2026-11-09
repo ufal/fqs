@@ -2494,13 +2494,7 @@ fn execute_query(
             }
             "cqp" => {
                 let effective = query_lang::effective(corpus, "cqp", &requested_language)?.to_string();
-                let prefer_flexicorp = corpus.supports_xml
-                    || corpus
-                        .settings
-                        .get("use_flexicorp_cqp")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                    || corpus.source_kind.contains("teitok");
+                let prefer_flexicorp = cqp_prefers_flexicorp(corpus);
                 let exec = if prefer_flexicorp {
                     run_flexicorp_cqp_query(corpus, query_text, start, size, query_options)?
                 } else {
@@ -8518,6 +8512,34 @@ fn run_cqp_query(
     size: u32,
     query_options: Option<&HttpQueryRequest>,
 ) -> Result<CqpExecResult> {
+    let (cmd, corpus_name, cqp_bin, registry_dir) = cqp_base_command(corpus);
+    // The query goes into a CQP script: one statement only, or a `;` / newline could append
+    // further CQP commands (e.g. `cat … > "file"` writes files as the service user).
+    check_single_cqp_statement(query_text)?;
+    // a stored subcorpus: activated first, the query runs inside it (subcorpus/cwb.rs)
+    let activate = match query_options.and_then(|q| q.subcorpus_applied.as_ref()).and_then(|a| a.subc_file.as_deref()) {
+        Some(f) => subcorpus::cwb::activate(&corpus_name, Path::new(f))?,
+        None => String::new(),
+    };
+    let end = start.saturating_add(size.saturating_sub(1));
+    // Structured hits for frontends that need positions, document and token ids (TEITOK's
+    // `tabulate … match text_id, match .. matchend id`): only the attributes the registry
+    // declares, so plain CWB corpora keep working.
+    let (pattrs, sattrs) = cqp_registry_attributes(&registry_dir, &corpus_name);
+    run_cqp_query_rest(corpus, query_text, (start, end, size), query_options, cmd, corpus_name, cqp_bin, registry_dir, pattrs, sattrs, activate)
+}
+
+/// Whether a CWB corpus is queried through flexicorp's CQP route (a TEITOK project) rather than
+/// FQS's own.
+fn cqp_prefers_flexicorp(corpus: &CorpusEntry) -> bool {
+    corpus.supports_xml
+        || corpus.settings.get("use_flexicorp_cqp").and_then(|v| v.as_bool()).unwrap_or(false)
+        || corpus.source_kind.contains("teitok")
+}
+
+/// `cqp` for a corpus: the command (registry, working folder), the corpus name, the binary, and
+/// the registry folder.
+fn cqp_base_command(corpus: &CorpusEntry) -> (ProcessCommand, String, String, String) {
     let corpus_name = corpus
         .settings
         .get("corpus_name")
@@ -8542,14 +8564,23 @@ fn run_cqp_query(
     if let Some(reg) = &registry_arg {
         cmd.arg("-r").arg(reg);
     }
-    // The query goes into a CQP script: one statement only, or a `;` / newline could append
-    // further CQP commands (e.g. `cat … > "file"` writes files as the service user).
-    check_single_cqp_statement(query_text)?;
-    let end = start.saturating_add(size.saturating_sub(1));
-    // Structured hits for frontends that need positions, document and token ids (TEITOK's
-    // `tabulate … match text_id, match .. matchend id`): only the attributes the registry
-    // declares, so plain CWB corpora keep working.
-    let (pattrs, sattrs) = cqp_registry_attributes(&registry_dir, &corpus_name);
+    (cmd, corpus_name, cqp_bin, registry_dir)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_cqp_query_rest(
+    corpus: &CorpusEntry,
+    query_text: &str,
+    (start, end, size): (u32, u32, u32),
+    query_options: Option<&HttpQueryRequest>,
+    cmd: ProcessCommand,
+    corpus_name: String,
+    cqp_bin: String,
+    registry_dir: String,
+    pattrs: HashSet<String>,
+    sattrs: HashSet<String>,
+    activate: String,
+) -> Result<CqpExecResult> {
     let mut tab_cols = vec!["match".to_string(), "matchend".to_string()];
     let with_doc = sattrs.contains("text_id");
     let with_ids = pattrs.contains("id");
@@ -8578,7 +8609,7 @@ fn run_cqp_query(
         tab_cols.push(format!("match {name}"));
     }
     let cqp_script = format!(
-        "set PrettyPrint off;\nset Context 5 words;\nset Paging off;\nMatches = {query};\nsize Matches;\ntabulate Matches {start} {end} {cols};\ncat Matches {start} {end};\n",
+        "set PrettyPrint off;\nset Context 5 words;\nset Paging off;\n{activate}Matches = {query};\nsize Matches;\ntabulate Matches {start} {end} {cols};\ncat Matches {start} {end};\n",
         query = query_text,
         start = start,
         end = end,
@@ -8722,7 +8753,7 @@ fn run_manatee_query(
         req["aligned"] = al;
     }
     // a stored subcorpus: the query runs on the corpus opened as its .subc (subcorpus/apply.rs)
-    if let Some(subc) = query_options.and_then(|q| q.subcorpus_applied.as_ref()).and_then(|a| a.manatee_subc.as_ref()) {
+    if let Some(subc) = query_options.and_then(|q| q.subcorpus_applied.as_ref()).and_then(|a| a.subc_file.as_ref()) {
         req["subc"] = json!(subc);
     }
     let total_async = query_options.and_then(|q| q.total.as_ref()).and_then(Value::as_str) == Some("async");
@@ -9233,6 +9264,12 @@ fn cqp_registry_attributes(registry_dir: &str, corpus_name: &str) -> (HashSet<St
 fn strip_cqp_prompts(line: &str) -> &str {
     let mut rest = line.trim_start();
     loop {
+        // CQP's prompt with no corpus active (after `set DataDirectory`, before a subcorpus is
+        // activated: subcorpus/cwb.rs)
+        if let Some(r) = rest.strip_prefix("[no corpus]>") {
+            rest = r.trim_start();
+            continue;
+        }
         let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         let token = &rest[..token_end];
         let is_prompt = token.len() > 1
@@ -9618,6 +9655,7 @@ mod catalog_fresh_tests {
         assert_eq!(super::strip_cqp_prompts("        4:   Nás <zajetí>"), "4:   Nás <zajetí>");
         assert_eq!(super::parse_cqp_total("1028815\n  1: <a> b\n"), Some(1028815));
         assert_eq!(super::strip_cqp_prompts("<s> text"), "<s> text");
+        assert_eq!(super::strip_cqp_prompts("[no corpus]> C:Fqs_ab_1[1]> C:Fqs_ab_1[1]> 2"), "2");
     }
 
     use super::*;

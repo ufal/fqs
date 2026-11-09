@@ -73,8 +73,8 @@ pub struct Applied {
     pub tokens: u64,
     /// pando: the definition to send
     pub pando_definition: Option<String>,
-    /// Manatee: the .subc to run under
-    pub manatee_subc: Option<String>,
+    /// Manatee: the .subc to run under; CWB: the .subc beside CQP's saved subcorpus
+    pub subc_file: Option<String>,
 }
 
 impl Applied {
@@ -129,7 +129,7 @@ pub fn prepare(state: &HttpAppState, corpus: &CorpusEntry, caller: &Caller, back
         mode,
         tokens: res.tokens,
         pando_definition,
-        manatee_subc: res.subc_path,
+        subc_file: res.subc_path,
     })
 }
 
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn info_under_a_subcorpus() {
-        let a = Applied { name: "fic".into(), owner: "alice".into(), mode: Mode::Use, tokens: 40, pando_definition: None, manatee_subc: None };
+        let a = Applied { name: "fic".into(), owner: "alice".into(), mode: Mode::Use, tokens: 40, pando_definition: None, subc_file: None };
         let v = info(json!({"ok": true, "result": {"size": 1000, "tokens": 1000, "attributes": []}}), &a);
         assert_eq!(v["result"]["size"], 40);
         assert_eq!(v["result"]["tokens"], 40);
