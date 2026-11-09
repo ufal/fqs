@@ -33,12 +33,44 @@ std::string span(PosAttr *pa, Position from, Position to) {
 
 }  // namespace
 
+namespace {
+
+// An option of an attribute in the registry, "" when not set (Manatee throws for unknown paths).
+std::string attr_opt(Corpus *c, const std::string &path) {
+    try {
+        return c->get_conf(path);
+    } catch (...) {
+        return "";
+    }
+}
+
+// Whether `value` is one of the parts of the multivalue `text` (MULTISEP `sep`; an empty separator
+// splits into bytes, as Manatee does: then any substring counts).
+bool has_part(const std::string &text, const std::string &value, const std::string &sep) {
+    if (text == value) return true;
+    if (sep.empty()) return text.find(value) != std::string::npos;
+    for (size_t from = 0; from <= text.size();) {
+        size_t at = text.find(sep, from);
+        if (text.compare(from, at == std::string::npos ? std::string::npos : at - from, value) == 0) return true;
+        if (at == std::string::npos) break;
+        from = at + sep.size();
+    }
+    return false;
+}
+
+}  // namespace
+
 std::string fqsm::read_problem(Corpus *c, int &checked) {
     const Position last = c->size() - 1;
     for (const std::string &name : fqsm::split_list(c->get_conf("ATTRLIST"))) {
         PosAttr *pa = c->get_attr(name);
         const int range = pa->id_range();
         if (range <= 0) continue;
+        // A MULTIVALUE attribute indexes each part of a value on its own ("Gender=Neut" at a token
+        // whose text is "Case=Acc|Gender=Neut|…"): there the indexed value must be one of the parts.
+        const std::string mv = attr_opt(c, name + ".MULTIVALUE");
+        const bool multivalue = !mv.empty() && (mv[0] == 'y' || mv[0] == 'Y' || mv[0] == '1' || mv[0] == 't' || mv[0] == 'T');
+        const std::string sep = multivalue ? attr_opt(c, name + ".MULTISEP") : "";
         const int ids[] = {0, range / 3, range / 2, (2 * range) / 3, range - 1};
         for (int id : ids) {
             FastStream *fs = pa->id2poss(id);
@@ -48,6 +80,10 @@ std::string fqsm::read_problem(Corpus *c, int &checked) {
             delete fs;
             if (!has) continue;
             const int back = pa->pos2id(p);
+            if (back != id && multivalue && back >= 0 && back < range && has_part(pa->id2str(back), pa->id2str(id), sep)) {
+                ++checked;
+                continue;
+            }
             if (back != id) {
                 std::string got = (back >= 0 && back < range) ? pa->id2str(back) : "an id out of range";
                 return "attribute " + name + ": the index has \"" + pa->id2str(id) + "\" at position " + std::to_string(p) +
@@ -66,7 +102,7 @@ std::string fqsm::read_problem(Corpus *c, int &checked) {
 
 extern "C" {
 
-const char *fqsm_version() { return "fqs-manatee 0.6"; }
+const char *fqsm_version() { return "fqs-manatee 0.6.1"; }
 
 // Open a corpus: a registry file path (or a name in MANATEE_REGISTRY). NULL and *err on failure.
 // The registry file's folder is where its aligned corpora are looked for first (fqsm::use).
