@@ -577,6 +577,24 @@ Audio (`spoken`, `timealigned`), video and facsimile come only from real evidenc
 
 Validation records `corpus_size`: the `size=` of the Pando index's `corpus.info` (also for a quick validation), else, in `--full` mode, the total of a small probe (`cqp` corpora: a CQP probe; `pando`: `flexicorp-pando` with `settings.pando_probe_query`, default `[word=".*"]`). Pando entries get this probe even when `interfaces` is empty. Saving an entry without a size (registration, scan, admin form) and a reindex take it from `corpus.info` too.
 
+### Manatee corpus → pando corpus
+
+`fqs manatee-export --registry FILE --out FILE.jsonl` writes a compiled Manatee corpus as pando's
+JSONL v2 (positional attributes with their names, structures with their attributes, multivalue,
+zero-width and nested ranges, UTF-8), for a pando corpus when the vertical is gone:
+
+```bash
+fqs manatee-export --registry /path/to/registry/corpus --out corpus.jsonl
+pando-index --format jsonl corpus.jsonl /path/to/pando/corpus
+```
+
+It needs libfqs_manatee 0.6 (`--lib`, else `FQS_MANATEE_LIB`, else the one in `/etc/fqs/fqs.env`),
+checks the corpus first as before a query, and prints a summary (tokens, regions per structure,
+attributes left out). `--limit N` writes the first N positions only; `--dynamic` includes dynamic
+attributes (by default left out: pando has `%c`/`%d`). `testdata/manatee-export/compare.py` counts the
+same queries on the Manatee corpus (through FQS) and on pando corpora made from it.
+Details and the checks so far: `dev/MANATEE-NATIVE.md`, "Export to pando".
+
 ## Database
 
 Which catalog `fqs` uses (every command, `serve` included) is the first of:

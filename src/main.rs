@@ -35,6 +35,7 @@ mod hot_corpus;
 mod limits;
 mod manatee_jobs;
 mod manatee_aligned;
+mod manatee_export;
 mod manatee_lib;
 mod query_lang;
 mod registry_info;
@@ -91,6 +92,8 @@ enum Command {
     /// A native Manatee worker process (started by `fqs serve`; manatee_pool.rs)
     #[command(hide = true)]
     ManateeWorker,
+    /// Write a compiled Manatee corpus as pando JSONL v2 (for `pando-index --format jsonl`)
+    ManateeExport(manatee_export::ManateeExportArgs),
 }
 
 #[derive(Args, Debug)]
@@ -1357,6 +1360,7 @@ async fn main() -> Result<()> {
         Command::Reindex(args) => handle_reindex(args)?,
         Command::AdminToken(args) => handle_admin_token(args)?,
         Command::ManateeWorker => manatee_worker::serve()?,
+        Command::ManateeExport(args) => manatee_export::run(args)?,
         Command::Frontends(args) => match args.action {
             FrontendsAction::Paths => {
                 println!("{}", serde_json::to_string_pretty(&services::frontend_write_paths())?);

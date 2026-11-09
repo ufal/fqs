@@ -66,7 +66,7 @@ std::string fqsm::read_problem(Corpus *c, int &checked) {
 
 extern "C" {
 
-const char *fqsm_version() { return "fqs-manatee 0.5"; }
+const char *fqsm_version() { return "fqs-manatee 0.6"; }
 
 // Open a corpus: a registry file path (or a name in MANATEE_REGISTRY). NULL and *err on failure.
 // The registry file's folder is where its aligned corpora are looked for first (fqsm::use).

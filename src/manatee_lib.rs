@@ -25,6 +25,7 @@ type CheckFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_char) -> *mut c_cha
 type KwicFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_longlong, c_longlong, c_int, *const c_char, *const c_char, *mut *mut c_char) -> *mut c_char;
 type KwicPageFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_longlong, c_longlong, c_int, *const c_char, *const c_char, c_int, *mut *mut c_char) -> *mut c_char;
 type KwicAlignedFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_longlong, c_longlong, c_int, *const c_char, *const c_char, c_int, *const c_char, *mut *mut c_char) -> *mut c_char;
+type ExportFn = unsafe extern "C" fn(*mut c_void, *const c_char, c_int, c_longlong, *mut *mut c_char) -> *mut c_char;
 
 /// An open corpus (a `Corpus *` inside the library).
 struct Handle(*mut c_void);
@@ -44,6 +45,7 @@ pub struct ManateeLib {
     kwic: Option<KwicFn>,
     kwic_page: Option<KwicPageFn>,
     kwic_aligned: Option<KwicAlignedFn>,
+    export_jsonl: Option<ExportFn>,
     corpora: Mutex<HashMap<String, Arc<Mutex<Handle>>>>,
 }
 
@@ -102,6 +104,7 @@ impl ManateeLib {
             let kwic = lib.get::<KwicFn>(b"fqsm_kwic\0").ok().map(|f| *f);   // from fqs-manatee 0.3
             let kwic_page = lib.get::<KwicPageFn>(b"fqsm_kwic_page\0").ok().map(|f| *f);   // from 0.4
             let kwic_aligned = lib.get::<KwicAlignedFn>(b"fqsm_kwic_aligned\0").ok().map(|f| *f);   // from 0.5
+            let export_jsonl = lib.get::<ExportFn>(b"fqsm_export_jsonl\0").ok().map(|f| *f);   // from 0.6
             Ok(ManateeLib {
                 _lib: lib,
                 path: path.to_path_buf(),
@@ -115,6 +118,7 @@ impl ManateeLib {
                 kwic,
                 kwic_page,
                 kwic_aligned,
+                export_jsonl,
                 corpora: Mutex::new(HashMap::new()),
             })
         }
@@ -158,6 +162,22 @@ impl ManateeLib {
         unsafe {
             let out = check(h.0, &mut err);
             take(self.free, out, err)
+        }
+    }
+
+    /// The corpus written as pando JSONL v2 to `out` ("-": stdout); `dynamic`: dynamic attributes too;
+    /// `limit` > 0: only the first positions. Answers the library's summary (manatee/fqs_manatee_export.cc).
+    pub fn export_jsonl(&self, id: &str, registry: &Path, out: &str, dynamic: bool, limit: u64) -> Result<Value> {
+        let Some(export) = self.export_jsonl else {
+            bail!("{} ({}) cannot export: fqs-manatee 0.6 or newer is needed (manatee/build.sh)", self.path.display(), self.version);
+        };
+        let h = self.handle(id, registry)?;
+        let h = h.lock().map_err(|_| anyhow!("manatee corpus lock poisoned"))?;
+        let o = CString::new(out)?;
+        let mut err: *mut c_char = std::ptr::null_mut();
+        unsafe {
+            let res = export(h.0, o.as_ptr(), dynamic as c_int, limit as c_longlong, &mut err);
+            take(self.free, res, err)
         }
     }
 
