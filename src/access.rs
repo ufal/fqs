@@ -155,9 +155,11 @@ pub fn check(cfg: &Config, id: &str, settings: &Value, caller: &Caller, route: &
 /// What a front-end may ask before it shows a corpus (`/corpora/{id}/may-use`): may this caller
 /// use it, why not, and is it open to everyone (a front-end may remember that for when FQS does
 /// not answer). The same rule as the query gate: the http policy (`policy_ok`: for this caller,
-/// `public_ok`: for an anonymous one), then the groups, which refuse only in enforce mode.
-pub fn may_use(cfg: &Config, settings: &Value, caller: &Caller, policy_ok: bool, public_ok: bool) -> Value {
-    let enforce = cfg.mode_for(settings) == Mode::Enforce;
+/// `public_ok`: for an anonymous one), then the groups, which refuse only in enforce mode, or in
+/// every mode with `any_mode` (`/corpora/{id}/permitted`, `/corpora?permitted=1`: for a front-end
+/// that enforces the groups itself while FQS stays in report for its other clients).
+pub fn may_use(cfg: &Config, settings: &Value, caller: &Caller, policy_ok: bool, public_ok: bool, any_mode: bool) -> Value {
+    let enforce = any_mode || cfg.mode_for(settings) == Mode::Enforce;
     let open_groups = corpus_groups(settings).map(|g| g.iter().any(|x| x == "anonymous")).unwrap_or(true);
     let everyone = public_ok && (!enforce || open_groups);
     let (ok, reason) = if !policy_ok {
@@ -173,6 +175,15 @@ pub fn may_use(cfg: &Config, settings: &Value, caller: &Caller, policy_ok: bool,
         out["reason"] = json!(r);
     }
     out
+}
+
+/// The caller `/corpora/{id}/permitted` answers for: the verified token's, else an anonymous visitor
+/// (no groups, not signed in, not admin), also where FQS has no secret and believes `request_role`.
+pub fn verified_or_anonymous(caller: &Caller) -> Caller {
+    if caller.verified {
+        return caller.clone();
+    }
+    Caller { role: "visitor".into(), groups: Vec::new(), owned_groups: Vec::new(), ..caller.clone() }
 }
 
 /// One corpus in the access list (`/access`) a front-end may keep as a fallback for when FQS does
@@ -210,17 +221,39 @@ mod tests {
         let off = Config { mode: Mode::Off, admin_bypass: true };
         let sso = json!({"access": ["authenticated"]});
         let anon = Caller { role: "public".into(), tier: "public".into(), user: String::new(), verified: false, groups: vec![], owned_groups: vec![] };
-        let r = may_use(&on, &sso, &anon, true, true);
+        let r = may_use(&on, &sso, &anon, true, true, false);
         assert_eq!((r["may_use"].as_bool(), r["reason"].as_str(), r["open_to_everyone"].as_bool()), (Some(false), Some("login_required"), Some(false)));
-        let r = may_use(&on, &sso, &caller("user", &[]), true, true);
+        let r = may_use(&on, &sso, &caller("user", &[]), true, true, false);
         assert_eq!(r["may_use"], true);
-        let r = may_use(&on, &json!({"access": ["staff"]}), &caller("user", &["students"]), true, true);
+        let r = may_use(&on, &json!({"access": ["staff"]}), &caller("user", &["students"]), true, true, false);
         assert_eq!(r["reason"], "group");
         // groups refuse only in enforce mode; the http policy always
-        assert_eq!(may_use(&off, &sso, &anon, true, true)["may_use"], true);
-        let r = may_use(&off, &json!({}), &anon, false, false);
+        assert_eq!(may_use(&off, &sso, &anon, true, true, false)["may_use"], true);
+        let r = may_use(&off, &json!({}), &anon, false, false, false);
         assert_eq!((r["may_use"].as_bool(), r["reason"].as_str()), (Some(false), Some("private")));
-        assert_eq!(may_use(&on, &json!({}), &anon, true, true)["open_to_everyone"], true);
+        assert_eq!(may_use(&on, &json!({}), &anon, true, true, false)["open_to_everyone"], true);
+    }
+
+    #[test]
+    fn any_mode_decides_groups_in_every_mode() {
+        let acad = json!({"access": ["acad", "cnc"]});
+        let sso = json!({"access": "authenticated"});
+        let early_off = json!({"access": ["acad"], "access_mode": "off"});
+        let anon = verified_or_anonymous(&Caller { verified: false, ..caller("user", &["acad"]) });
+        assert_eq!((anon.role.as_str(), anon.groups.len()), ("visitor", 0), "unverified: anonymous");
+        let ok = |cfg: &Config, s: &Value, c: &Caller| may_use(cfg, s, c, true, true, true)["may_use"] == true;
+        for mode in [Mode::Off, Mode::Report, Mode::Enforce] {
+            let cfg = Config { mode, admin_bypass: true };
+            assert!(ok(&cfg, &json!({}), &anon), "{mode:?}: no access list: open");
+            assert!(!ok(&cfg, &acad, &anon), "{mode:?}");
+            assert!(!ok(&cfg, &acad, &caller("user", &["other"])), "{mode:?}");
+            assert!(ok(&cfg, &acad, &caller("user", &["cnc"])), "{mode:?}");
+            assert!(!ok(&cfg, &sso, &anon), "{mode:?}");
+            assert!(ok(&cfg, &sso, &caller("user", &[])), "{mode:?}");
+            assert!(ok(&cfg, &acad, &caller("admin", &[])), "{mode:?}: admin bypass");
+            assert!(!ok(&cfg, &early_off, &caller("user", &[])), "{mode:?}: per-corpus off too");
+            assert!(!may_use(&cfg, &json!({}), &caller("admin", &[]), false, false, true)["may_use"].as_bool().unwrap(), "{mode:?}: policy first");
+        }
     }
 
     fn caller(role: &str, groups: &[&str]) -> Caller {

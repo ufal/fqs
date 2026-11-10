@@ -1,4 +1,4 @@
-//! `/corpora?permitted=1` and `/corpora/{id}/permitted` over HTTP (access_query.rs): a real `fqs
+//! `/corpora?permitted=1` and `/corpora/{id}/permitted` over HTTP (access.rs): a real `fqs
 //! serve` on a small catalogue, asked with signed tokens carrying groups, in each access mode, and
 //! once without a secret (nothing unsigned is believed). `cargo test --test access_permitted`.
 

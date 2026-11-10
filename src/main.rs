@@ -45,7 +45,6 @@ mod xidx_build;
 mod engine_status;
 mod catalog_import;
 mod access;
-mod access_query;
 mod manatee_pool;
 mod manatee_worker;
 mod pando_lib;
@@ -628,7 +627,7 @@ struct HttpCorporaQuery {
     /// `browse` returns a public DTO (no project_root / settings dump).
     view: Option<String>,
     /// `/corpora?permitted=1`: only the corpora the caller (its verified token) may use, whatever
-    /// the access mode (access_query.rs); each row gets `"permitted": true`
+    /// the access mode (access.rs `may_use`); each row gets `"permitted": true`
     permitted: Option<String>,
 }
 
@@ -5303,8 +5302,8 @@ async fn http_list_corpora(
                 return false;
             }
             if permitted_only {
-                // the group rule whatever the mode, for a front-end that enforces it (access_query.rs)
-                return access_query::permitted(state.limits.access(), &c.http_policy_mode, is_http_operation_allowed(c, "query"), &c.settings, &caller);
+                // the group rule whatever the mode, for a front-end that enforces it (access.rs)
+                return corpus_permitted(&state, c, &caller);
             }
             // restricted corpora are left out of lists only in enforce mode (access.rs)
             is_http_access_allowed(c, &role) && access::listed(state.limits.access(), &c.settings, &caller)
@@ -7066,14 +7065,14 @@ async fn http_corpus_may_use(
     let query_op = is_http_operation_allowed(&corpus, "query");
     let policy_ok = query_op && is_http_access_allowed(&corpus, &caller.role);
     let public_ok = query_op && is_http_access_allowed(&corpus, "public");
-    let mut out = access::may_use(state.limits.access(), &corpus.settings, &caller, policy_ok, public_ok);
+    let mut out = access::may_use(state.limits.access(), &corpus.settings, &caller, policy_ok, public_ok, false);
     out["ok"] = json!(true);
     out["corpus"] = json!(corpus.id);
     (StatusCode::OK, Json(out))
 }
 
 /// `GET /corpora/{id}/permitted`: may the caller use this corpus under its access groups, whatever
-/// the access mode (access_query.rs): the check behind KonText's `corpus_access` on LINDAT.
+/// the access mode: the check behind KonText's `corpus_access` on LINDAT.
 async fn http_corpus_permitted(
     State(state): State<HttpAppState>,
     headers: HeaderMap,
@@ -7084,8 +7083,17 @@ async fn http_corpus_permitted(
         Err(_) => return (StatusCode::NOT_FOUND, Json(json!({"ok": false, "corpus": id, "error": "unknown corpus"}))),
     };
     let caller = route_caller(&state, &headers, None);
-    let ok = access_query::permitted(state.limits.access(), &corpus.http_policy_mode, is_http_operation_allowed(&corpus, "query"), &corpus.settings, &caller);
-    (StatusCode::OK, Json(json!({"ok": true, "corpus": corpus.id, "permitted": ok})))
+    (StatusCode::OK, Json(json!({"ok": true, "corpus": corpus.id, "permitted": corpus_permitted(&state, &corpus, &caller)})))
+}
+
+/// `may-use`'s rule with the groups applied whatever the mode, for a verified caller (else an
+/// anonymous one): `/corpora/{id}/permitted` and `/corpora?permitted=1`.
+fn corpus_permitted(state: &HttpAppState, corpus: &CorpusEntry, caller: &Caller) -> bool {
+    let c = access::verified_or_anonymous(caller);
+    let query_op = is_http_operation_allowed(corpus, "query");
+    let policy_ok = query_op && is_http_access_allowed(corpus, &c.role);
+    let public_ok = query_op && is_http_access_allowed(corpus, "public");
+    access::may_use(state.limits.access(), &corpus.settings, &c, policy_ok, public_ok, true)["may_use"] == true
 }
 
 /// `GET /access` (admin token when FQS has a secret): every corpus's access rule, for a front-end
