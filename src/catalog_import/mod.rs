@@ -28,6 +28,8 @@ pub struct Options {
     pub teitok: Option<PathBuf>,
     pub teitok_corplist: Option<PathBuf>,
     pub teitok_url: Option<String>,
+    /// pando indexes kept apart from the TEITOK projects: `<DIR>/<id>/pando` or `<DIR>/<id>`
+    pub pando_root: Option<PathBuf>,
     pub kontext_corplist: Option<PathBuf>,
     pub registry: Option<PathBuf>,
     pub kontext_url: Option<String>,
@@ -40,6 +42,8 @@ pub struct Options {
     pub portal: Option<String>,
     pub portal_url: Option<String>,
     pub only: Vec<String>,
+    /// leave these corpus ids out
+    pub exclude: Vec<String>,
 }
 
 /// One catalogue row and what the review table says about it.
@@ -122,6 +126,9 @@ pub fn run(o: &Options) -> Result<Outcome> {
     if o.teitok.is_none() && o.kontext_corplist.is_none() {
         bail!("give --teitok DIR and/or --kontext-corplist FILE (or --kontext-corplist auto)");
     }
+    if o.pando_root.is_some() && o.teitok.is_none() {
+        bail!("--pando-root needs --teitok (it adds pando indexes to the TEITOK projects)");
+    }
     if o.registry.is_some() && o.kontext_corplist.is_none() {
         bail!("--registry needs --kontext-corplist (the corplist says which registries are corpora)");
     }
@@ -140,6 +147,7 @@ pub fn run(o: &Options) -> Result<Outcome> {
     if !o.only.is_empty() {
         rows.retain(|r| o.only.iter().any(|w| w == r.id()));
     }
+    rows.retain(|r| !o.exclude.iter().any(|w| w == r.id()));
     link_same_corpus(&mut rows);
 
     let existing = match &o.existing {

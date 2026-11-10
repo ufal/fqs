@@ -575,6 +575,18 @@ fn shell_paths(cfg: Option<&Value>, registry_dir: &Path, ident: &str) -> ShellPa
 }
 
 
+/// The shell's files for a KonText on another machine (`fqs corpora kontext-shell`): the registry
+/// text and the one-token vertical, with the paths as that KonText's machine sees them
+/// (`<manatee_base>/{registry,data,vert}`). Nothing is written or encoded here.
+pub fn shell_files_for(manatee_base: &Path, spec: &ShellSpec<'_>) -> (ShellPaths, String, String) {
+    let paths = shell_paths(None, &manatee_base.join("registry"), spec.ident);
+    let spec = &ShellSpec { encoded: true, ..*spec };
+    let registry = manatee_registry_text(spec, &paths);
+    let vertical = manatee_shell_vertical(spec);
+    (paths, registry, vertical)
+}
+
+
 pub struct ShellSpec<'a> {
     /// whether the one-token shell gets encoded (Manatee data), see create_manatee_shell
     pub encoded: bool,

@@ -273,6 +273,17 @@ enum CorporaAction {
     ///     --out kontext-rows.json --report kontext-rows.tsv
     #[command(verbatim_doc_comment)]
     Import(ImportArgs),
+    /// The Manatee registry shell a KonText on another machine needs for a pando corpus
+    ///
+    /// kontext-pando still opens a Manatee corpus for each pando corpus it lists. FQS's "Add to KonText"
+    /// writes that shell on FQS's own machine; for a KonText elsewhere this writes the registry file and
+    /// the one-token vertical into --out, with the paths that KonText's machine uses (--manatee-base),
+    /// and prints the encodevert command to run there. Nothing is encoded here.
+    ///
+    /// Example: fqs corpora kontext-shell --index /opt/DATA-TEITOK/pando/ud217/pando --ident ud217 \
+    ///     --corpus-id ud217 --label "UD 2.17" --project-url https://lindat.mff.cuni.cz/services/teitok/ud217/ --out /tmp/shell
+    #[command(verbatim_doc_comment)]
+    KontextShell(KontextShellArgs),
     /// Validate corpus registry entries and optionally run query probes
     Validate(ValidateArgs),
     /// One-shot: detect languages / features / interfaces from TEITOK+index layout
@@ -281,6 +292,35 @@ enum CorporaAction {
     Supersede(ShowByIdArgs),
     /// Remove one corpus row from the catalogue (requires --force)
     Delete(DeleteCorpusArgs),
+}
+
+#[derive(Args, Debug)]
+struct KontextShellArgs {
+    /// The corpus's pando index (the folder with corpus.info)
+    #[arg(long, value_name = "DIR")]
+    index: PathBuf,
+    /// KonText's corpus name (corplist.xml ident, pando_corpora.json key)
+    #[arg(long)]
+    ident: String,
+    /// The FQS corpus id (default: the ident)
+    #[arg(long = "corpus-id")]
+    corpus_id: Option<String>,
+    /// The name KonText shows (default: the ident)
+    #[arg(long)]
+    label: Option<String>,
+    #[arg(long)]
+    description: Option<String>,
+    #[arg(long)]
+    language: Option<String>,
+    /// The TEITOK project's URL, for KonText's "Open in TEITOK" (crp.path)
+    #[arg(long = "project-url", value_name = "URL")]
+    project_url: Option<String>,
+    /// Manatee's folder on the KonText machine: <DIR>/registry, <DIR>/data, <DIR>/vert
+    #[arg(long = "manatee-base", value_name = "DIR", default_value = "/var/lib/manatee")]
+    manatee_base: PathBuf,
+    /// Write <ident> (the registry) and <ident>.vert here
+    #[arg(long, value_name = "DIR")]
+    out: PathBuf,
 }
 
 #[derive(Args, Debug)]
@@ -918,6 +958,9 @@ struct ImportArgs {
     /// Public base URL of that TEITOK, for project_url
     #[arg(long = "teitok-url", value_name = "URL")]
     teitok_url: Option<String>,
+    /// Pando indexes kept apart from the projects: <DIR>/<id>/pando (xidx beside it) or <DIR>/<id>; preferred over CWB
+    #[arg(long = "pando-root", value_name = "DIR")]
+    pando_root: Option<PathBuf>,
     /// KonText's corplist.xml; `auto` finds it (fqs.json, FQS_KONTEXT_CORPLIST, KonText's config.xml)
     #[arg(long = "kontext-corplist", value_name = "FILE|auto")]
     kontext_corplist: Option<PathBuf>,
@@ -951,6 +994,9 @@ struct ImportArgs {
     /// Only these corpus ids (comma-separated)
     #[arg(long, value_delimiter = ',')]
     only: Vec<String>,
+    /// Leave these corpus ids out (comma-separated)
+    #[arg(long, value_delimiter = ',')]
+    exclude: Vec<String>,
     /// Write the rows here (default: stdout)
     #[arg(long, value_name = "FILE")]
     out: Option<PathBuf>,
@@ -1611,6 +1657,7 @@ fn handle_corpora(args: CorporaArgs) -> Result<()> {
                 teitok: args.teitok,
                 teitok_corplist: args.teitok_corplist,
                 teitok_url: args.teitok_url,
+                pando_root: args.pando_root,
                 kontext_corplist: args.kontext_corplist,
                 registry: args.registry,
                 kontext_url: args.kontext_url,
@@ -1622,9 +1669,44 @@ fn handle_corpora(args: CorporaArgs) -> Result<()> {
                 portal: args.portal,
                 portal_url: args.portal_url,
                 only: args.only.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+                exclude: args.exclude.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
             };
             let outcome = catalog_import::run(&opts)?;
             catalog_import::write(&outcome, args.out.as_deref(), args.report.as_deref())?;
+        }
+        CorporaAction::KontextShell(args) => {
+            let info = frontends::read_pando_corpus_info(&args.index)
+                .with_context(|| format!("no pando index (corpus.info) in {}", args.index.display()))?;
+            if !frontends::kontext::valid_kontext_ident(&args.ident) {
+                anyhow::bail!("'{}' is not a valid KonText corpus name", args.ident);
+            }
+            let crp = args.project_url.as_deref().and_then(frontends::kontext::teitok_crp_from_project_url);
+            let corpus_id = args.corpus_id.clone().unwrap_or_else(|| args.ident.clone());
+            let spec = frontends::kontext::ShellSpec {
+                encoded: true,
+                ident: &args.ident,
+                corpus_id: &corpus_id,
+                label: args.label.as_deref().unwrap_or(&args.ident),
+                description: args.description.as_deref(),
+                language: args.language.as_deref(),
+                info: &info,
+                crp_path: crp.as_ref().map(|c| c.1.as_str()),
+                crp_server: crp.as_ref().map(|c| c.0.as_str()),
+            };
+            let (paths, registry, vertical) = frontends::kontext::shell_files_for(&args.manatee_base, &spec);
+            fs::create_dir_all(&args.out).with_context(|| format!("creating {}", args.out.display()))?;
+            let reg_out = args.out.join(&args.ident);
+            let vert_out = args.out.join(format!("{}.vert", args.ident));
+            fs::write(&reg_out, registry).with_context(|| format!("writing {}", reg_out.display()))?;
+            fs::write(&vert_out, vertical).with_context(|| format!("writing {}", vert_out.display()))?;
+            println!("wrote {} and {}", reg_out.display(), vert_out.display());
+            println!("on the KonText machine: copy them to {} and {}, then", paths.registry.display(), paths.vertical.display());
+            println!(
+                "  mkdir -p {d} && encodevert -c {r} -p {d} {v}",
+                d = paths.data.display(),
+                r = paths.registry.display(),
+                v = paths.vertical.display()
+            );
         }
         CorporaAction::ExportJson(args) => {
             let conn = open_db(&resolve_db_path(&args.db))?;

@@ -2,6 +2,11 @@
 //! title, `<cqp corpus=…>`, `<flexicorp fqs_corpus_id=…>`; which indexes it has: pando/, a CWB
 //! registry in cqp/), with what the shared project's corpus list (`shared/Resources/corplist.xml`)
 //! says about it (name, fullname, enname, descr, lang, type, …).
+//!
+//! A pando index kept apart from the projects (`--pando-root DIR`: `DIR/<id>/pando`, or `DIR/<id>`
+//! being the index itself, with the xidx beside it in `DIR/<id>/xidx`) counts as the project's own.
+//! A project with both indexes gets pando as its preferred engine and CWB as the other one
+//! (`settings.available_backends`), which a front-end may offer as a choice.
 
 use super::{corpus_id, labels, Options, PathMap, Row};
 use anyhow::{bail, Result};
@@ -98,6 +103,23 @@ pub(crate) fn read_corplist(text: &str) -> Result<BTreeMap<String, BTreeMap<Stri
     Ok(out)
 }
 
+/// The project's pando index: under `--pando-root` as `<root>/<id>/pando` or `<root>/<id>` (by the
+/// FQS id, then by the project's folder name), else `<project>/pando`. The pando root wins: it is
+/// where the published indexes are kept, and a project may still hold an older index of its own.
+pub(crate) fn pando_index_dir(proj: &Path, pando_root: Option<&Path>, id: &str, name: &str) -> Option<std::path::PathBuf> {
+    if let Some(root) = pando_root {
+        let mut keys = vec![id];
+        if name != id {
+            keys.push(name);
+        }
+        if let Some(d) = keys.iter().flat_map(|k| [root.join(k).join("pando"), root.join(k)]).find(|d| d.join("corpus.info").is_file()) {
+            return Some(d);
+        }
+    }
+    let own = proj.join("pando");
+    own.join("corpus.info").is_file().then_some(own)
+}
+
 /// "Czech, Slovak and German" → [Czech, Slovak, German]
 pub(crate) fn split_langs(s: &str) -> Vec<String> {
     s.replace(" and ", ",")
@@ -146,16 +168,26 @@ pub(crate) fn rows(o: &Options, dir: &Path, pmap: &PathMap, issues: &mut Vec<Str
         if let Some(e) = &st.parse_error {
             notes.push(format!("settings.xml does not parse ({e}); read from its text"));
         }
-        let pando = proj.join("pando/corpus.info").is_file();
+        let pando_dir = pando_index_dir(&proj, o.pando_root.as_deref(), &id, &name);
+        let pando = pando_dir.is_some();
         let cqp_name = st.cqp_corpus.clone();
         let cqp = !cqp_name.is_empty() && !cqp_name.ends_with('-') && proj.join("cqp").join(cqp_name.to_lowercase()).is_file();
         let mut s = Map::new();
-        if pando {
-            s.insert("index_dir".into(), json!(pmap.map(&proj.join("pando"))));
+        let mut engines = Vec::new();
+        if let Some(dir) = &pando_dir {
+            s.insert("index_dir".into(), json!(pmap.map(dir)));
+            engines.push("pando");
+            if !dir.starts_with(&proj) {
+                notes.push(format!("pando index from --pando-root: {}", pmap.map(dir)));
+            }
         }
         if cqp {
             s.insert("cqp_corpus".into(), json!(cqp_name));
             s.insert("registry_hint".into(), json!(pmap.map(&proj.join("cqp"))));
+            engines.push("cqp");
+        }
+        if !engines.is_empty() {
+            s.insert("available_backends".into(), json!(engines));
         }
         if !pando && !cqp {
             notes.push("no index (no pando/corpus.info, no CWB registry for the cqp corpus): build one first".into());
@@ -221,6 +253,30 @@ mod tests {
         assert_eq!(s.title, "A &nbsp; B");
         assert_eq!(s.cqp_corpus, "TT-B", "not taken from <cqpsettings>");
         assert_eq!(s.fqs_corpus_id, "");
+    }
+
+    #[test]
+    fn pando_index_beside_the_projects() {
+        let base = std::env::temp_dir().join(format!("fqs-import-pando-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let proj = base.join("teitok/ud2.17");
+        std::fs::create_dir_all(&proj).unwrap();
+        let root = base.join("pando");
+        assert_eq!(pando_index_dir(&proj, Some(&root), "ud2_17", "ud2.17"), None);
+        // by the folder name, the index itself
+        std::fs::create_dir_all(root.join("ud2.17")).unwrap();
+        std::fs::write(root.join("ud2.17/corpus.info"), "size=1\n").unwrap();
+        assert_eq!(pando_index_dir(&proj, Some(&root), "ud2_17", "ud2.17"), Some(root.join("ud2.17")));
+        // by the id, with pando/ and xidx/ in it: preferred
+        std::fs::create_dir_all(root.join("ud2_17/pando")).unwrap();
+        std::fs::write(root.join("ud2_17/pando/corpus.info"), "size=1\n").unwrap();
+        assert_eq!(pando_index_dir(&proj, Some(&root), "ud2_17", "ud2.17"), Some(root.join("ud2_17/pando")));
+        // an older index in the project: the pando root still wins; without one, the project's
+        std::fs::create_dir_all(proj.join("pando")).unwrap();
+        std::fs::write(proj.join("pando/corpus.info"), "size=1\n").unwrap();
+        assert_eq!(pando_index_dir(&proj, Some(&root), "ud2_17", "ud2.17"), Some(root.join("ud2_17/pando")));
+        assert_eq!(pando_index_dir(&proj, None, "ud2_17", "ud2.17"), Some(proj.join("pando")));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
