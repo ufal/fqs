@@ -1031,7 +1031,8 @@ struct ImportArgs {
     #[arg(long, default_value_t = false)]
     private: bool,
     /// Restrict the rows to these groups (comma-separated: settings.access; `authenticated` = any
-    /// signed-in user, e.g. SSO). Takes effect where FQS's access mode is enforce
+    /// signed-in user, e.g. SSO), enforced for these rows (settings.access_mode) whatever the
+    /// server's access mode
     #[arg(long, value_delimiter = ',')]
     access: Vec<String>,
     /// Write the rows here (default: stdout)

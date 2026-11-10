@@ -159,7 +159,10 @@ pub fn run(o: &Options) -> Result<Outcome> {
             r.notes.push("private (auth_required) until imported without --private".into());
         }
         if !o.access.is_empty() {
+            // enforced for these rows whatever the server's access mode (settings.access_mode
+            // overrides it), so that the rest of the catalogue stays as it is
             r.settings_mut().insert("access".into(), json!(o.access));
+            r.settings_mut().insert("access_mode".into(), json!("enforce"));
             r.access = o.access.join(",");
         }
     }
