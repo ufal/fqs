@@ -674,6 +674,11 @@ fn blobs_contain_any(blobs: &[String], needles: &[&str]) -> bool {
 }
 
 fn has_dependencies(root: &Path) -> bool {
+    // The pando index's own dependency file: what makes dependency queries (PML-TQ, `>`) work.
+    // Older indexes have it without the `relation.head=` line in corpus.info.
+    if [root.join("dep.head"), root.join("pando/dep.head")].iter().any(|p| fs::metadata(p).is_ok_and(|m| m.len() > 0)) {
+        return true;
+    }
     let blobs = catalog_text_blobs(root);
     // Require deprel+head together — bare "dep" / "head" alone are too common.
     blobs.iter().any(|b| b.contains("deprel") && b.contains("head"))
@@ -750,6 +755,22 @@ mod tests {
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(p.join("Resources")).unwrap();
         p
+    }
+
+    #[test]
+    fn dependencies_from_the_index_file() {
+        // an older pando index: deprel listed, no `relation.head=` line, but dep.head present
+        let root = tmp_root("deps_old_index");
+        fs::write(root.join("corpus.info"), "size=10\npositional=form,lemma,upos,deprel\n").unwrap();
+        assert!(!has_dependencies(&root), "deprel alone is not enough");
+        fs::write(root.join("dep.head"), [0u8; 40]).unwrap();
+        assert!(has_dependencies(&root));
+        let empty = tmp_root("deps_empty");
+        fs::create_dir_all(empty.join("pando")).unwrap();
+        fs::write(empty.join("pando/dep.head"), b"").unwrap();
+        assert!(!has_dependencies(&empty), "an empty dep.head is no dependency index");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&empty);
     }
 
     #[test]
