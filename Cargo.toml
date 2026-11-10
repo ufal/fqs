@@ -22,3 +22,8 @@ base64 = "0.22"
 ureq = { version = "2", features = ["json"] }
 flate2 = "1"
 roxmltree = "0.20"
+
+# HTTP-level tests against a real `fqs serve` (tests/ is local-by-design)
+[[test]]
+name = "access_permitted"
+path = "testdata/access/permitted_http.rs"

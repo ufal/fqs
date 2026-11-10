@@ -811,6 +811,27 @@ The check covers every route that reads a corpus (`/query`, `/run`, `/info`, `/c
 default `true`). `/health` → `access.mode`. Which groups may use a corpus is for admins: `/corpora`
 leaves `settings.access` and `settings.access_mode` out for other callers.
 
+### Which corpora may this caller use
+
+For a front-end that takes its corpus permissions from FQS and enforces them itself (KonText on
+LINDAT: its corpus list and `corpus_access`). The answer is the rule above **whatever the access
+mode** (off, report or enforce, server-wide or per corpus), so FQS can stay in `report` for its
+other clients:
+
+* `GET /corpora?permitted=1` — only the corpora the caller may use. The same rows and filters as
+  `/corpora` (`q=`, `tag=`, `facet=`, `frontend=`, `view=browse`, …), each with `"permitted": true`;
+  `settings.access` still only for admins.
+* `GET /corpora/{id}/permitted` — `{"ok": true, "corpus": "<id>", "permitted": true|false}`; 404
+  (`"ok": false`) for an unknown id.
+
+"May use": the corpus's http policy lets the caller query it (`disabled`: nobody; `auth_required`:
+admins; and its `query` operation is on), and then its `access` groups as above (no `access`: open;
+an admin passes when `admin_bypass`). The caller is only what a **verified token** says: its `groups`,
+`anonymous`, and `authenticated` for role `user` / `admin`. Without one (no token, a bad or expired
+one, or FQS without a secret) the caller is anonymous: no groups, not signed in, not admin, whatever
+`request_role` says. Both are answered from the catalogue alone, and write nothing to the activity
+log. (`/corpora/{id}/may-use` is the other question: what FQS itself does under its current mode.)
+
 ## Activity log
 
 `fqs serve --activity-log FILE` (or `FQS_ACTIVITY_LOG`) writes one JSON object

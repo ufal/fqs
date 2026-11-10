@@ -45,6 +45,7 @@ mod xidx_build;
 mod engine_status;
 mod catalog_import;
 mod access;
+mod access_query;
 mod manatee_pool;
 mod manatee_worker;
 mod pando_lib;
@@ -626,6 +627,9 @@ struct HttpCorporaQuery {
     q: Option<String>,
     /// `browse` returns a public DTO (no project_root / settings dump).
     view: Option<String>,
+    /// `/corpora?permitted=1`: only the corpora the caller (its verified token) may use, whatever
+    /// the access mode (access_query.rs); each row gets `"permitted": true`
+    permitted: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2901,6 +2905,7 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         .route("/health", get(http_health))
         .route("/corpora", get(http_list_corpora))
         .route("/corpora/{id}/may-use", get(http_corpus_may_use))
+        .route("/corpora/{id}/permitted", get(http_corpus_permitted))
         .route("/access", get(http_access_list))
         .route("/corpora/{id}/subcorpora", get(subcorpus::api::list).post(subcorpus::api::create))
         .route(
@@ -5200,6 +5205,7 @@ async fn http_root_with_state(State(state): State<HttpAppState>) -> Json<Value> 
             json!({"method":"GET", "path":"/health", "description":"Health check"}),
             json!({"method":"GET", "path":"/corpora", "description":"List corpora (request_role, environment, tag, frontend=teitok, facet=/facets=, q=, view=browse)"}),
             json!({"method":"GET", "path":"/access", "description":"Admin: every corpus's access rule (policy, query, mode, access groups), for a front-end's fallback cache"}),
+            json!({"method":"GET", "path":"/corpora/{id}/permitted", "description":"May the caller (verified token; else anonymous) use this corpus under its access groups, whatever the access mode: {corpus, permitted}. /corpora?permitted=1 lists those"}),
             json!({"method":"GET", "path":"/corpora/{id}/may-use", "description":"May the caller (signed token) use this corpus: may_use, reason (private | login_required | group), open_to_everyone"}),
             json!({"method":"GET", "path":"/labels", "description":"Browse labels + facet groups/counts (frontend=teitok, facet=…)"}),
             json!({"method":"GET", "path":"/fcs", "description":"FCS/SRU-style endpoint"}),
@@ -5288,11 +5294,21 @@ async fn http_list_corpora(
         .as_deref()
         .map(|s| s.eq_ignore_ascii_case("browse"))
         .unwrap_or(false);
+    let permitted_only = params.permitted.as_deref().map(truthy).unwrap_or(false);
 
     let filtered: Vec<CorpusEntry> = corpora
         .into_iter()
-        // restricted corpora are left out of lists only in enforce mode (access.rs)
-        .filter(|c| is_http_access_allowed(c, &role) && is_http_operation_allowed(c, "catalog") && access::listed(state.limits.access(), &c.settings, &caller))
+        .filter(|c| {
+            if !is_http_operation_allowed(c, "catalog") {
+                return false;
+            }
+            if permitted_only {
+                // the group rule whatever the mode, for a front-end that enforces it (access_query.rs)
+                return access_query::permitted(state.limits.access(), &c.http_policy_mode, is_http_operation_allowed(c, "query"), &c.settings, &caller);
+            }
+            // restricted corpora are left out of lists only in enforce mode (access.rs)
+            is_http_access_allowed(c, &role) && access::listed(state.limits.access(), &c.settings, &caller)
+        })
         .filter(|c| {
             if frontend.as_deref() != Some("teitok") {
                 return true;
@@ -5355,6 +5371,9 @@ async fn http_list_corpora(
                 // real TEITOK XML around each hit (from xidx); without it a front end asks for
                 // synthetic fragments (`fragment: true`) built from the index
                 o.insert("xml_fragments".into(), json!(corpus_xidx_dir(c).is_some()));
+                if permitted_only {
+                    o.insert("permitted".into(), json!(true));
+                }
             }
         }
     }
@@ -7051,6 +7070,22 @@ async fn http_corpus_may_use(
     out["ok"] = json!(true);
     out["corpus"] = json!(corpus.id);
     (StatusCode::OK, Json(out))
+}
+
+/// `GET /corpora/{id}/permitted`: may the caller use this corpus under its access groups, whatever
+/// the access mode (access_query.rs): the check behind KonText's `corpus_access` on LINDAT.
+async fn http_corpus_permitted(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> impl IntoResponse {
+    let corpus = match state.catalog.get(&id) {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::NOT_FOUND, Json(json!({"ok": false, "corpus": id, "error": "unknown corpus"}))),
+    };
+    let caller = route_caller(&state, &headers, None);
+    let ok = access_query::permitted(state.limits.access(), &corpus.http_policy_mode, is_http_operation_allowed(&corpus, "query"), &corpus.settings, &caller);
+    (StatusCode::OK, Json(json!({"ok": true, "corpus": corpus.id, "permitted": ok})))
 }
 
 /// `GET /access` (admin token when FQS has a secret): every corpus's access rule, for a front-end
