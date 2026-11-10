@@ -32,6 +32,7 @@ mod admin;
 mod enrich;
 mod fcs;
 mod hot_corpus;
+mod inbox;
 mod limits;
 mod manatee_jobs;
 mod manatee_aligned;
@@ -273,6 +274,18 @@ enum CorporaAction {
     ///     --out kontext-rows.json --report kontext-rows.tsv
     #[command(verbatim_doc_comment)]
     Import(ImportArgs),
+    /// Load the row files a development server put in an inbox folder (only reads it)
+    ///
+    /// For a set-up where corpora are built elsewhere (LINDAT: teitok-dev) and FQS may not write to
+    /// the shared disk: each *.json file in --dir (a writer uses NAME.json.part and renames it) is
+    /// loaded once, as `upsert-json` would, and remembered in the catalogue database by name and
+    /// content (a changed file is loaded again; a refused one is not retried until it changes).
+    /// Every path in a row (project_root, the pando index, registries) must lie under an
+    /// --allow-root. Run it from a timer as the FQS service user.
+    ///
+    /// Example: sudo -u www-data fqs corpora inbox --dir /opt/DATA-TEITOK/fqs/inbox --allow-root /opt/DATA-TEITOK
+    #[command(verbatim_doc_comment)]
+    Inbox(InboxArgs),
     /// The Manatee registry shell a KonText on another machine needs for a pando corpus
     ///
     /// kontext-pando still opens a Manatee corpus for each pando corpus it lists. FQS's "Add to KonText"
@@ -292,6 +305,21 @@ enum CorporaAction {
     Supersede(ShowByIdArgs),
     /// Remove one corpus row from the catalogue (requires --force)
     Delete(DeleteCorpusArgs),
+}
+
+#[derive(Args, Debug)]
+struct InboxArgs {
+    /// The inbox folder
+    #[arg(long, value_name = "DIR")]
+    dir: PathBuf,
+    /// Paths in the rows must lie under one of these (repeatable; at least one)
+    #[arg(long = "allow-root", value_name = "DIR", required = true)]
+    allow_root: Vec<PathBuf>,
+    /// Say what would be loaded, load nothing
+    #[arg(long = "dry-run", default_value_t = false)]
+    dry_run: bool,
+    #[command(flatten)]
+    db: DbPathArg,
 }
 
 #[derive(Args, Debug)]
@@ -1622,40 +1650,13 @@ fn handle_corpora(args: CorporaArgs) -> Result<()> {
         CorporaAction::UpsertJson(args) => {
             let conn = open_db(&resolve_db_path(&args.db))?;
             let payload = read_json_input(&args)?;
-            let mut entries = parse_entries_from_json(&payload)?;
-            let raws = raw_entries_from_json(&payload);
-            let mut inserted_ids = Vec::<String>::new();
-            let mut updated_ids = Vec::<String>::new();
-            for (i, entry) in entries.iter_mut().enumerate() {
-                let existed = corpus_exists(&conn, &entry.id)?;
-                if existed && !args.replace {
-                    let old = get_corpus(&conn, &entry.id)?;
-                    let raw = raws.get(i).cloned().unwrap_or(Value::Null);
-                    *entry = merge_upsert_entry(&old, entry, &raw)?;
-                }
-                // a new entry, or one without labels yet (registered from TEITOK before this):
-                // its languages and features from the project, as `corpora enrich` finds them
-                if !existed || entry.labels.is_empty() {
-                    let _ = enrich::enrich_corpus_entry(entry);
-                }
-                upsert_corpus(&conn, entry)?;
-                if existed {
-                    updated_ids.push(entry.id.clone());
-                } else {
-                    inserted_ids.push(entry.id.clone());
-                }
-            }
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "ok": true,
-                    "operation": "corpora_upsert_json",
-                    "count": entries.len(),
-                    "inserted": inserted_ids,
-                    "updated": updated_ids,
-                    "ids": entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>()
-                }))?
-            );
+            let out = upsert_payload(&conn, &payload, args.replace)?;
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        CorporaAction::Inbox(args) => {
+            let conn = open_db(&resolve_db_path(&args.db))?;
+            let out = inbox::run(&conn, &args.dir, &args.allow_root, args.dry_run, |c, p| upsert_payload(c, p, false))?;
+            println!("{}", serde_json::to_string_pretty(&out)?);
         }
         CorporaAction::Import(args) => {
             let opts = catalog_import::Options {
@@ -7932,6 +7933,42 @@ fn get_corpus(conn: &Connection, id: &str) -> Result<CorpusEntry> {
         row_to_corpus,
     )
     .with_context(|| format!("Corpus '{}' not found in database", id))
+}
+
+/// Insert or update the rows of a JSON object or array (what `corpora upsert-json` and the inbox
+/// load): without `replace`, fields the JSON leaves out keep their stored value.
+fn upsert_payload(conn: &Connection, payload: &str, replace: bool) -> Result<Value> {
+    let mut entries = parse_entries_from_json(payload)?;
+    let raws = raw_entries_from_json(payload);
+    let mut inserted_ids = Vec::<String>::new();
+    let mut updated_ids = Vec::<String>::new();
+    for (i, entry) in entries.iter_mut().enumerate() {
+        let existed = corpus_exists(conn, &entry.id)?;
+        if existed && !replace {
+            let old = get_corpus(conn, &entry.id)?;
+            let raw = raws.get(i).cloned().unwrap_or(Value::Null);
+            *entry = merge_upsert_entry(&old, entry, &raw)?;
+        }
+        // a new entry, or one without labels yet (registered from TEITOK before this):
+        // its languages and features from the project, as `corpora enrich` finds them
+        if !existed || entry.labels.is_empty() {
+            let _ = enrich::enrich_corpus_entry(entry);
+        }
+        upsert_corpus(conn, entry)?;
+        if existed {
+            updated_ids.push(entry.id.clone());
+        } else {
+            inserted_ids.push(entry.id.clone());
+        }
+    }
+    Ok(json!({
+        "ok": true,
+        "operation": "corpora_upsert_json",
+        "count": entries.len(),
+        "inserted": inserted_ids,
+        "updated": updated_ids,
+        "ids": entries.iter().map(|e| e.id.clone()).collect::<Vec<_>>()
+    }))
 }
 
 fn upsert_corpus(conn: &Connection, entry: &CorpusEntry) -> Result<()> {
