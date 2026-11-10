@@ -1,6 +1,6 @@
 [package]
 name = "fqs"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2024"
 license = "MIT"
 # Edition 2024 needs Rust 1.85+. Ubuntu 22.04/24.04 ship an older cargo: use rustup.

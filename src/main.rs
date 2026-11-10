@@ -6352,17 +6352,26 @@ async fn http_pando_run_inner(
         None => cql,
     };
     let effective = query_lang::effective(&corpus, "pando", &requested_language).map_err(|e| (StatusCode::BAD_REQUEST, format!("{e:#}")))?;
-    let applied = subcorpus::apply::for_request(
-        &state, &corpus, &caller, Some("pando"),
-        req.extra.get("subcorpus"), req.extra.get("subcorpus_mode"), req.extra.get("subcorpus_owner"),
-    ).await?;
+    // `subcorpus` as a name: a stored subcorpus (subcorpus/apply.rs); as an object
+    // ({"definition", "mode", "name"}, pando's own per-request form): passed to pando as it is
+    let inline_subcorpus = matches!(req.extra.get("subcorpus"), Some(Value::Object(_)));
+    let applied = if inline_subcorpus {
+        None
+    } else {
+        subcorpus::apply::for_request(
+            &state, &corpus, &caller, Some("pando"),
+            req.extra.get("subcorpus"), req.extra.get("subcorpus_mode"), req.extra.get("subcorpus_owner"),
+        ).await?
+    };
     let mut body = json!({ "cql": cql });
     if let Some(a) = &applied {
         body["subcorpus"] = a.pando_field();
     }
     if let Some(obj) = body.as_object_mut() {
         for (k, v) in req.extra {
-            if !matches!(k.as_str(), "corpus" | "request_role" | "user" | "tier" | "language" | "dialect" | "subcorpus" | "subcorpus_mode" | "subcorpus_owner") {
+            let ours = matches!(k.as_str(), "corpus" | "request_role" | "user" | "tier" | "language" | "dialect" | "subcorpus_mode" | "subcorpus_owner")
+                || (k == "subcorpus" && !inline_subcorpus);
+            if !ours {
                 obj.insert(k, v);
             }
         }
