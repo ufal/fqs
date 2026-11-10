@@ -219,11 +219,27 @@ pub(crate) fn rows(o: &Options, dir: &Path, pmap: &PathMap, issues: &mut Vec<Str
         if ["shared", "common", "Scripts"].contains(&name.as_str()) || !settings_file.is_file() {
             continue;
         }
+        // a link to another project of this folder is an alias (an old stable address): left out;
+        // a link to a project elsewhere (e.g. teitok-live) is kept, with a note
+        let mut link_note = None;
+        if std::fs::symlink_metadata(&proj).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+            let target = std::fs::canonicalize(&proj).unwrap_or_else(|_| proj.clone());
+            if target.parent() == Some(root.as_path()) {
+                issues.push(format!(
+                    "'{name}' is a link to the project '{}' in the same folder (an alias): left out",
+                    target.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+                ));
+                continue;
+            }
+            if !target.starts_with(&root) {
+                link_note = Some(format!("a link to {} (outside this folder: another environment?)", target.display()));
+            }
+        }
         seen.insert(name.clone());
         let st = read_settings(&std::fs::read_to_string(&settings_file).unwrap_or_default());
         let cl = clist.get(&name).cloned().unwrap_or_default();
         let id = if st.fqs_corpus_id.is_empty() { corpus_id(&name) } else { st.fqs_corpus_id.clone() };
-        let mut notes = Vec::new();
+        let mut notes: Vec<String> = link_note.into_iter().collect();
         if let Some(e) = &st.parse_error {
             notes.push(format!("settings.xml does not parse ({e}); read from its text"));
         }
@@ -337,6 +353,30 @@ mod tests {
         std::fs::write(proj.join("pando/corpus.info"), "size=1\n").unwrap();
         assert_eq!(pando_index_dir(&proj, Some(&root), "ud2_17", "ud2.17"), Some(root.join("ud2_17/pando")));
         assert_eq!(pando_index_dir(&proj, None, "ud2_17", "ud2.17"), Some(proj.join("pando")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn links_alias_left_out_outside_noted() {
+        let base = std::env::temp_dir().join(format!("fqs-import-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let main = base.join("main");
+        let live = base.join("live/skript");
+        for d in [main.join("pdtc10/Resources"), main.join("pdtc10/cqp"), live.join("Resources")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(main.join("pdtc10/Resources/settings.xml"), r#"<ttsettings><cqp corpus="TT-PDTC10"/></ttsettings>"#).unwrap();
+        std::fs::write(main.join("pdtc10/cqp/tt-pdtc10"), "").unwrap();
+        std::fs::write(live.join("Resources/settings.xml"), "<ttsettings/>").unwrap();
+        std::os::unix::fs::symlink("pdtc10/", main.join("pdtc")).unwrap();
+        std::os::unix::fs::symlink(&live, main.join("skript")).unwrap();
+        let o = Options { environment: "stable".into(), ..Default::default() };
+        let mut issues = Vec::new();
+        let rows = rows(&o, &main, &PathMap::new(&[]).unwrap(), &mut issues).unwrap();
+        let ids: Vec<&str> = rows.iter().map(|r| r.id()).collect();
+        assert_eq!(ids, vec!["pdtc10", "skript"], "the alias left out");
+        assert!(issues.iter().any(|i| i.contains("'pdtc' is a link to the project 'pdtc10'")), "{issues:?}");
+        assert!(rows[1].notes.iter().any(|n| n.contains("outside this folder")), "{:?}", rows[1].notes);
         let _ = std::fs::remove_dir_all(&base);
     }
 
