@@ -9775,6 +9775,15 @@ fn merge_upsert_entry(old: &CorpusEntry, new: &CorpusEntry, raw: &Value) -> Resu
     if !merged.settings.is_object() {
         merged.settings = json!({});
     }
+    // labels are added, not replaced: an import sends only what it knows (TEITOK, its type), and the
+    // detected ones (feature:…, lang:…, set by enrich) stay; --replace replaces them too
+    if raw_obj.contains_key("labels") {
+        for l in &old.labels {
+            if !merged.labels.iter().any(|m| m == l) {
+                merged.labels.push(l.clone());
+            }
+        }
+    }
     // the description written in the admin (or in the TEITOK project and sent along)
     if let Some(d) = old.settings.get("description") {
         let set_in_payload = raw_obj.get("settings").and_then(|s| s.get("description")).is_some();
