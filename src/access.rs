@@ -152,6 +152,41 @@ pub fn check(cfg: &Config, id: &str, settings: &Value, caller: &Caller, route: &
     Check::Refuse(format!("corpus '{id}' is restricted to {} (your groups: {})", open_to.join(", "), caller_groups(caller).join(", ")))
 }
 
+/// What a front-end may ask before it shows a corpus (`/corpora/{id}/may-use`): may this caller
+/// use it, why not, and is it open to everyone (a front-end may remember that for when FQS does
+/// not answer). The same rule as the query gate: the http policy (`policy_ok`: for this caller,
+/// `public_ok`: for an anonymous one), then the groups, which refuse only in enforce mode.
+pub fn may_use(cfg: &Config, settings: &Value, caller: &Caller, policy_ok: bool, public_ok: bool) -> Value {
+    let enforce = cfg.mode_for(settings) == Mode::Enforce;
+    let open_groups = corpus_groups(settings).map(|g| g.iter().any(|x| x == "anonymous")).unwrap_or(true);
+    let everyone = public_ok && (!enforce || open_groups);
+    let (ok, reason) = if !policy_ok {
+        (false, Some("private"))
+    } else if enforce && !allowed(cfg, settings, caller) {
+        let signed_in = caller.verified && (caller.role == "user" || caller.role == "admin");
+        (false, Some(if signed_in { "group" } else { "login_required" }))
+    } else {
+        (true, None)
+    };
+    let mut out = json!({"may_use": ok, "open_to_everyone": everyone});
+    if let Some(r) = reason {
+        out["reason"] = json!(r);
+    }
+    out
+}
+
+/// One corpus in the access list (`/access`) a front-end may keep as a fallback for when FQS does
+/// not answer: what it needs to apply the same rule itself (`may_use`'s parts).
+pub fn list_entry(cfg: &Config, id: &str, settings: &Value, policy: &str, query_op: bool) -> Value {
+    json!({
+        "id": id,
+        "policy": policy,
+        "query": query_op,
+        "mode": cfg.mode_for(settings).as_str(),
+        "access": corpus_groups(settings),
+    })
+}
+
 /// A corpus's settings as a non-admin sees them: without its groups (`access`) and `access_mode`.
 pub fn hide_from_non_admin(settings: &mut Value) {
     if let Some(o) = settings.as_object_mut() {
@@ -168,6 +203,25 @@ pub fn listed(cfg: &Config, settings: &Value, caller: &Caller) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn may_use_answers() {
+        let on = Config { mode: Mode::Enforce, admin_bypass: true };
+        let off = Config { mode: Mode::Off, admin_bypass: true };
+        let sso = json!({"access": ["authenticated"]});
+        let anon = Caller { role: "public".into(), tier: "public".into(), user: String::new(), verified: false, groups: vec![], owned_groups: vec![] };
+        let r = may_use(&on, &sso, &anon, true, true);
+        assert_eq!((r["may_use"].as_bool(), r["reason"].as_str(), r["open_to_everyone"].as_bool()), (Some(false), Some("login_required"), Some(false)));
+        let r = may_use(&on, &sso, &caller("user", &[]), true, true);
+        assert_eq!(r["may_use"], true);
+        let r = may_use(&on, &json!({"access": ["staff"]}), &caller("user", &["students"]), true, true);
+        assert_eq!(r["reason"], "group");
+        // groups refuse only in enforce mode; the http policy always
+        assert_eq!(may_use(&off, &sso, &anon, true, true)["may_use"], true);
+        let r = may_use(&off, &json!({}), &anon, false, false);
+        assert_eq!((r["may_use"].as_bool(), r["reason"].as_str()), (Some(false), Some("private")));
+        assert_eq!(may_use(&on, &json!({}), &anon, true, true)["open_to_everyone"], true);
+    }
 
     fn caller(role: &str, groups: &[&str]) -> Caller {
         Caller { role: role.into(), tier: role.into(), user: "u".into(), verified: true, groups: groups.iter().map(|g| g.to_string()).collect(), owned_groups: Vec::new() }

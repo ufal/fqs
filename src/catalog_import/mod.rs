@@ -46,6 +46,8 @@ pub struct Options {
     pub exclude: Vec<String>,
     /// private until released: http_policy_mode auth_required (admins only)
     pub private: bool,
+    /// groups the rows are restricted to (settings.access)
+    pub access: Vec<String>,
 }
 
 /// One catalogue row and what the review table says about it.
@@ -155,6 +157,10 @@ pub fn run(o: &Options) -> Result<Outcome> {
         r.value.insert("http_policy_mode".into(), json!(if o.private { "auth_required" } else { "public_query" }));
         if o.private {
             r.notes.push("private (auth_required) until imported without --private".into());
+        }
+        if !o.access.is_empty() {
+            r.settings_mut().insert("access".into(), json!(o.access));
+            r.access = o.access.join(",");
         }
     }
     link_same_corpus(&mut rows);

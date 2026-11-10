@@ -1030,6 +1030,10 @@ struct ImportArgs {
     /// without it makes them public
     #[arg(long, default_value_t = false)]
     private: bool,
+    /// Restrict the rows to these groups (comma-separated: settings.access; `authenticated` = any
+    /// signed-in user, e.g. SSO). Takes effect where FQS's access mode is enforce
+    #[arg(long, value_delimiter = ',')]
+    access: Vec<String>,
     /// Write the rows here (default: stdout)
     #[arg(long, value_name = "FILE")]
     out: Option<PathBuf>,
@@ -1677,6 +1681,7 @@ fn handle_corpora(args: CorporaArgs) -> Result<()> {
                 only: args.only.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
                 exclude: args.exclude.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
                 private: args.private,
+                access: args.access.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
             };
             let outcome = catalog_import::run(&opts)?;
             catalog_import::write(&outcome, args.out.as_deref(), args.report.as_deref())?;
@@ -2894,6 +2899,8 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         .route("/", get(http_root_with_state))
         .route("/health", get(http_health))
         .route("/corpora", get(http_list_corpora))
+        .route("/corpora/{id}/may-use", get(http_corpus_may_use))
+        .route("/access", get(http_access_list))
         .route("/corpora/{id}/subcorpora", get(subcorpus::api::list).post(subcorpus::api::create))
         .route(
             "/corpora/{id}/subcorpora/{name}",
@@ -5191,6 +5198,8 @@ async fn http_root_with_state(State(state): State<HttpAppState>) -> Json<Value> 
             json!({"method":"GET", "path":"/", "description":"Route index"}),
             json!({"method":"GET", "path":"/health", "description":"Health check"}),
             json!({"method":"GET", "path":"/corpora", "description":"List corpora (request_role, environment, tag, frontend=teitok, facet=/facets=, q=, view=browse)"}),
+            json!({"method":"GET", "path":"/access", "description":"Admin: every corpus's access rule (policy, query, mode, access groups), for a front-end's fallback cache"}),
+            json!({"method":"GET", "path":"/corpora/{id}/may-use", "description":"May the caller (signed token) use this corpus: may_use, reason (private | login_required | group), open_to_everyone"}),
             json!({"method":"GET", "path":"/labels", "description":"Browse labels + facet groups/counts (frontend=teitok, facet=…)"}),
             json!({"method":"GET", "path":"/fcs", "description":"FCS/SRU-style endpoint"}),
             json!({"method":"GET", "path":"/reindex/jobs", "description":"List reindex queue (status/corpus/limit)"}),
@@ -7019,6 +7028,48 @@ fn access_check(state: &HttpAppState, corpus: &CorpusEntry, caller: &Caller, rou
         }
         None => eprintln!("[fqs] access_report {}", Value::Object(f)),
     })
+}
+
+/// `GET /corpora/{id}/may-use`: may the caller (its signed token) use this corpus, and is it open
+/// to everyone? For front-ends that decide before they show a corpus (TEITOK on LINDAT): the same
+/// rule as the query gate, without its report-mode log entry (a page view is not a query).
+async fn http_corpus_may_use(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> impl IntoResponse {
+    let corpus = match state.catalog.get(&id) {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::NOT_FOUND, Json(json!({"ok": false, "corpus": id, "error": "unknown corpus"}))),
+    };
+    let caller = route_caller(&state, &headers, None);
+    let query_op = is_http_operation_allowed(&corpus, "query");
+    let policy_ok = query_op && is_http_access_allowed(&corpus, &caller.role);
+    let public_ok = query_op && is_http_access_allowed(&corpus, "public");
+    let mut out = access::may_use(state.limits.access(), &corpus.settings, &caller, policy_ok, public_ok);
+    out["ok"] = json!(true);
+    out["corpus"] = json!(corpus.id);
+    (StatusCode::OK, Json(out))
+}
+
+/// `GET /access` (admin token when FQS has a secret): every corpus's access rule, for a front-end
+/// server to keep as a fallback (TEITOK on LINDAT decides from it when FQS does not answer in
+/// time). The rule is may_use's: policy (public_query | auth_required | disabled) and `query`
+/// allowed, then, in mode enforce, `access` (groups; null = open; `anonymous` for everyone,
+/// `authenticated` for any signed-in user); admins pass when `admin_bypass`.
+async fn http_access_list(State(state): State<HttpAppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err((code, msg)) = require_admin_if_secured(&state, &headers) {
+        return (code, Json(json!({"ok": false, "error": msg})));
+    }
+    let cfg = state.limits.access();
+    let rows: Vec<Value> = state
+        .catalog
+        .list(None, true, None)
+        .iter()
+        .map(|c| access::list_entry(cfg, &c.id, &c.settings, &c.http_policy_mode, is_http_operation_allowed(c, "query")))
+        .collect();
+    let at = OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default();
+    (StatusCode::OK, Json(json!({"ok": true, "generated_at": at, "admin_bypass": cfg.admin_bypass, "corpora": rows})))
 }
 
 fn gate_corpus(state: &HttpAppState, headers: &HeaderMap, corpus_id: &str, route: &str) -> Result<(), (StatusCode, String)> {
