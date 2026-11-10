@@ -7,6 +7,11 @@
 //! being the index itself, with the xidx beside it in `DIR/<id>/xidx`) counts as the project's own.
 //! A project with both indexes gets pando as its preferred engine and CWB as the other one
 //! (`settings.available_backends`), which a front-end may offer as a choice.
+//!
+//! Versions: projects whose folder names end in a version and share the rest with another project
+//! form a family (`ud10` … `ud217`: `ud` 1.0 … 2.17; `parczech-3.0`, `parczech-4.0`; `parlamint-41`:
+//! 4.1). Each gets `family_key`, `family_label` and `version_tag`, and FQS keeps only the newest of a
+//! family current (the others are listed on request). A name alone (`skript2015`) is no family.
 
 use super::{corpus_id, labels, Options, PathMap, Row};
 use anyhow::{bail, Result};
@@ -120,6 +125,59 @@ pub(crate) fn pando_index_dir(proj: &Path, pando_root: Option<&Path>, id: &str, 
     own.join("corpus.info").is_file().then_some(own)
 }
 
+/// A project folder name split into its family and version: `parczech-3.0` → (parczech, 3.0);
+/// undotted, the first digit is the major version (`ud217` → (ud, 2.17), `parlamint-40` →
+/// (parlamint, 4.0), `ud10` → (ud, 1.0)), as LINDAT's TEITOK names them. None without a version.
+pub(crate) fn family_of(name: &str) -> Option<(String, String)> {
+    let tail_len = name.chars().rev().take_while(|c| c.is_ascii_digit() || *c == '.').count();
+    let split = name.len() - tail_len; // ASCII tail
+    let (head, tail) = name.split_at(split);
+    let tail = tail.trim_start_matches('.');
+    if tail.is_empty() || tail.ends_with('.') || tail.contains("..") {
+        return None;
+    }
+    let base = head.trim_end_matches(['-', '_', '.']);
+    if base.is_empty() || !base.ends_with(|c: char| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let version = if tail.contains('.') {
+        tail.to_string()
+    } else if tail.len() >= 2 {
+        format!("{}.{}", &tail[..1], &tail[1..])
+    } else {
+        tail.to_string()
+    };
+    Some((base.to_string(), version))
+}
+
+/// Family, label and version for the projects that share a family with another one.
+fn assign_families(rows: &mut [Row], folders: &[String]) {
+    let parsed: Vec<Option<(String, String)>> = folders.iter().map(|f| family_of(f)).collect();
+    let mut count: BTreeMap<String, usize> = BTreeMap::new();
+    for (b, _) in parsed.iter().flatten() {
+        *count.entry(b.clone()).or_default() += 1;
+    }
+    for (row, p) in rows.iter_mut().zip(parsed) {
+        let Some((base, version)) = p else { continue };
+        if count.get(&base).copied().unwrap_or(0) < 2 {
+            continue;
+        }
+        // the label without its version ("UD 2.17" → "UD"), else the family's name
+        let label = row.str_field("label");
+        let family_label = label
+            .replace(&version, "")
+            .trim()
+            .trim_end_matches(['-', ',', '(', ')', 'v'])
+            .trim()
+            .to_string();
+        let family_label = if family_label.is_empty() || family_label == label { base.clone() } else { family_label };
+        row.value.insert("family_key".into(), json!(base));
+        row.value.insert("family_label".into(), json!(family_label));
+        row.value.insert("version_tag".into(), json!(version));
+        row.value.insert("corpus_version".into(), json!(version));
+    }
+}
+
 /// "Czech, Slovak and German" → [Czech, Slovak, German]
 pub(crate) fn split_langs(s: &str) -> Vec<String> {
     s.replace(" and ", ",")
@@ -154,6 +212,7 @@ pub(crate) fn rows(o: &Options, dir: &Path, pmap: &PathMap, issues: &mut Vec<Str
     names.sort();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
+    let mut folders: Vec<String> = Vec::new();
     for name in names {
         let proj = root.join(&name);
         let settings_file = proj.join("Resources/settings.xml");
@@ -229,7 +288,9 @@ pub(crate) fn rows(o: &Options, dir: &Path, pmap: &PathMap, issues: &mut Vec<Str
         v.insert("settings".into(), Value::Object(s));
         v.insert("is_current".into(), json!(true));
         out.push(Row { value: v, source: "teitok", access: String::new(), notes, match_key: cqp_name.to_lowercase() });
+        folders.push(name.clone());
     }
+    assign_families(&mut out, &folders);
     for name in clist.keys().filter(|n| !seen.contains(*n)) {
         issues.push(format!("the TEITOK corpus list names '{name}', but there is no project folder for it"));
     }
@@ -277,6 +338,32 @@ mod tests {
         assert_eq!(pando_index_dir(&proj, Some(&root), "ud2_17", "ud2.17"), Some(root.join("ud2_17/pando")));
         assert_eq!(pando_index_dir(&proj, None, "ud2_17", "ud2.17"), Some(proj.join("pando")));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn families_from_folder_names() {
+        let f = |n: &str| family_of(n).map(|(a, b)| format!("{a} {b}"));
+        assert_eq!(f("ud217").as_deref(), Some("ud 2.17"));
+        assert_eq!(f("ud10").as_deref(), Some("ud 1.0"));
+        assert_eq!(f("ud29").as_deref(), Some("ud 2.9"));
+        assert_eq!(f("parlamint-41").as_deref(), Some("parlamint 4.1"));
+        assert_eq!(f("parczech-ps7-2.0").as_deref(), Some("parczech-ps7 2.0"));
+        assert_eq!(f("deltacorpus-1.1").as_deref(), Some("deltacorpus 1.1"));
+        assert_eq!(f("haczech"), None);
+        assert_eq!(f("2019"), None);
+        let mk = |id: &str, label: &str| Row {
+            value: json!({"id": id, "label": label}).as_object().unwrap().clone(),
+            source: "teitok", access: String::new(), notes: vec![], match_key: String::new(),
+        };
+        let mut rows = vec![mk("ud29", "UD 2.9"), mk("ud217", "UD 2.17"), mk("skript2015", "SKRIPT 2015"), mk("sir-1_0", "SiR")];
+        let folders: Vec<String> = ["ud29", "ud217", "skript2015", "sir-1.0"].iter().map(|s| s.to_string()).collect();
+        assign_families(&mut rows, &folders);
+        assert_eq!(rows[1].value["family_key"], "ud");
+        assert_eq!(rows[1].value["family_label"], "UD");
+        assert_eq!(rows[1].value["version_tag"], "2.17");
+        assert_eq!(rows[0].value["version_tag"], "2.9");
+        assert!(rows[2].value.get("family_key").is_none(), "a single project is no family");
+        assert!(rows[3].value.get("family_key").is_none());
     }
 
     #[test]

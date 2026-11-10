@@ -61,7 +61,7 @@ impl Row {
     pub fn id(&self) -> &str {
         self.value.get("id").and_then(Value::as_str).unwrap_or("")
     }
-    fn str_field(&self, k: &str) -> String {
+    pub(crate) fn str_field(&self, k: &str) -> String {
         self.value.get(k).and_then(Value::as_str).unwrap_or("").to_string()
     }
     fn settings_mut(&mut self) -> &mut Map<String, Value> {

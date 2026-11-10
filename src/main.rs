@@ -880,7 +880,7 @@ struct AddCorpusArgs {
     /// Optional family display label
     #[arg(long)]
     family_label: Option<String>,
-    /// Optional version tag (e.g. live, stable — deployment lane)
+    /// The version within its family (2.17): the newest of a family (per environment) is the current one
     #[arg(long)]
     version_tag: Option<String>,
     /// Content / publication version (semver, date, etc.) — one catalogue row per corpus + version
