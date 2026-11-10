@@ -44,6 +44,8 @@ pub struct Options {
     pub only: Vec<String>,
     /// leave these corpus ids out
     pub exclude: Vec<String>,
+    /// private until released: http_policy_mode auth_required (admins only)
+    pub private: bool,
 }
 
 /// One catalogue row and what the review table says about it.
@@ -148,6 +150,13 @@ pub fn run(o: &Options) -> Result<Outcome> {
         rows.retain(|r| o.only.iter().any(|w| w == r.id()));
     }
     rows.retain(|r| !o.exclude.iter().any(|w| w == r.id()));
+    // public_query is written explicitly, so that importing a released version again makes it public
+    for r in rows.iter_mut() {
+        r.value.insert("http_policy_mode".into(), json!(if o.private { "auth_required" } else { "public_query" }));
+        if o.private {
+            r.notes.push("private (auth_required) until imported without --private".into());
+        }
+    }
     link_same_corpus(&mut rows);
 
     let existing = match &o.existing {

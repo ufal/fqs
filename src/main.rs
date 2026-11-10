@@ -997,6 +997,11 @@ struct ImportArgs {
     /// Leave these corpus ids out (comma-separated)
     #[arg(long, value_delimiter = ',')]
     exclude: Vec<String>,
+    /// Private until released (a pre-release): http_policy_mode auth_required, so only admins
+    /// see and query them, and they do not become their family's current version; an import
+    /// without it makes them public
+    #[arg(long, default_value_t = false)]
+    private: bool,
     /// Write the rows here (default: stdout)
     #[arg(long, value_name = "FILE")]
     out: Option<PathBuf>,
@@ -1670,6 +1675,7 @@ fn handle_corpora(args: CorporaArgs) -> Result<()> {
                 portal_url: args.portal_url,
                 only: args.only.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
                 exclude: args.exclude.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+                private: args.private,
             };
             let outcome = catalog_import::run(&opts)?;
             catalog_import::write(&outcome, args.out.as_deref(), args.report.as_deref())?;
@@ -8052,8 +8058,10 @@ fn update_family_current(conn: &Connection, family: &str, environment: &str) -> 
         return Ok(Vec::new());
     }
     let mut stmt = conn.prepare(
+        // a private version (a pre-release: auth_required) neither becomes the current one nor
+        // demotes the public ones; it takes part once it is public
         "SELECT id, version_tag, is_current FROM corpora WHERE family_key = ?1 AND environment = ?2 \
-         AND version_tag IS NOT NULL AND TRIM(version_tag) != ''",
+         AND version_tag IS NOT NULL AND TRIM(version_tag) != '' AND http_policy_mode = 'public_query'",
     )?;
     let rows: Vec<(String, String, bool)> = stmt
         .query_map(params![family, environment], |r| {
