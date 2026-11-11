@@ -114,9 +114,10 @@ void kwic_view_hit(KwicView *v, std::string &out, Position beg, Position end, Ra
 // kwiclib reads them: KWICLines over conc->RS(true, from, to). Appends the hits as JSON objects
 // {"pos","end","doc"?,"view":{…}} separated by commas.
 void kwic_conc_lines(Corpus *c, Concordance *conc, long long from, long long to, const char *spec,
-                     Structure *doc_st, PosAttr *doc_pa, std::string &out) {
+                     Structure *doc_st, PosAttr *doc_pa, AlignedPage *al, std::string &out) {
     std::vector<std::string> f = spec_fields(spec);
     KWICLines kl(c, conc->RS(true, from, to), f[0].c_str(), f[1].c_str(), f[2].c_str(), f[3].c_str(), f[4].c_str(), f[5].c_str());
+    RangeStream *hits = al ? conc->RS(true, from, to) : nullptr;   // the same lines again, for the aligned segments
     bool first = true;
     while (kl.nextline()) {
         if (!first) out += ',';
@@ -127,10 +128,16 @@ void kwic_conc_lines(Corpus *c, Concordance *conc, long long from, long long to,
             out += ",\"doc\":";
             if (n >= 0) json_str(out, doc_pa->pos2str(n)); else out += "null";
         }
+        if (hits && !hits->end()) {
+            out += ",\"aligned\":";
+            aligned_page_hit(al, out, hits->peek_beg(), hits);
+            hits->next();
+        }
         out += ",\"view\":{";
         line_json(&kl, out);
         out += "}}";
     }
+    delete hits;
 }
 
 // Manatee's ARF (finlib/fsstat.cc compute_ARF) over the hits' starts in corpus order.

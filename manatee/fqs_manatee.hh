@@ -194,10 +194,13 @@ class KwicView;
 KwicView *kwic_view_new(Corpus *c, const char *spec);
 void kwic_view_hit(KwicView *v, std::string &out, Position beg, Position end, RangeStream *rs);
 void kwic_view_free(KwicView *v);
+// The words of an attribute matching a pattern with at least a frequency (fqs_manatee_wordlist.cc)
+std::vector<std::string> pattern_words(Corpus *c, const std::string &attrname, const std::string &pattern,
+                                       const std::string &excl, const std::string &nums, double minfreq);
 // Lines [from, to) of a stored concordance as KWICLines reads them (fqs_manatee_conc.cc): hits
 // {"pos","end","doc"?,"view":{…}}, comma-separated, appended to `out`.
 void kwic_conc_lines(Corpus *c, Concordance *conc, long long from, long long to, const char *spec,
-                     Structure *doc_st, PosAttr *doc_pa, std::string &out);
+                     Structure *doc_st, PosAttr *doc_pa, AlignedPage *al, std::string &out);
 // Manatee's ARF over the hits' starts (corpus order) in a corpus of `size` positions
 double arf(const std::vector<Position> &begs, Position size);
 }  // namespace fqsm

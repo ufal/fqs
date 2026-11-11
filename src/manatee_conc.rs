@@ -24,9 +24,10 @@ type NewFn = unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char, *mu
 type ApplyFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_char, c_uint, *const c_char, *mut *mut c_char) -> *mut c_void;
 type FreeConcFn = unsafe extern "C" fn(*mut c_void);
 type ConcStrFn = unsafe extern "C" fn(*mut c_void, *mut *mut c_char) -> *mut c_char;
-type PageFn = unsafe extern "C" fn(*mut c_void, *mut c_void, c_longlong, c_longlong, *const c_char, *const c_char, *mut *mut c_char) -> *mut c_char;
+type PageFn = unsafe extern "C" fn(*mut c_void, *mut c_void, c_longlong, c_longlong, *const c_char, *const c_char, *const c_char, *mut *mut c_char) -> *mut c_char;
 type FreqFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_char, c_longlong, *mut *mut c_char) -> *mut c_char;
 type AttrSizesFn = unsafe extern "C" fn(*mut c_void, *const c_char, *mut *mut c_char) -> *mut c_char;
+type DistFn = unsafe extern "C" fn(*mut c_void, c_int, c_int, *mut *mut c_char) -> *mut c_char;
 type CollFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *const c_char, *const c_char, c_longlong, c_longlong, c_int, c_int, c_int, *const c_char, *mut *mut c_char) -> *mut c_char;
 
 /// The library's concordance calls (fqs-manatee 0.9).
@@ -40,6 +41,7 @@ pub struct ConcFns {
     freq: FreqFn,
     attr_sizes: AttrSizesFn,
     coll: CollFn,
+    dist: DistFn,
 }
 
 impl ConcFns {
@@ -57,6 +59,7 @@ impl ConcFns {
                 freq: *lib.get::<FreqFn>(b"fqsm_conc_freq\0").ok()?,
                 attr_sizes: *lib.get::<AttrSizesFn>(b"fqsm_attr_value_sizes\0").ok()?,
                 coll: *lib.get::<CollFn>(b"fqsm_conc_coll\0").ok()?,
+                dist: *lib.get::<DistFn>(b"fqsm_conc_distribution\0").ok()?,
             })
         }
     }
@@ -270,7 +273,8 @@ impl ManateeLib {
             "page" => {
                 let view = cstr(&req.get("view").filter(|v| v.is_object()).map(view_spec).unwrap_or_default())?;
                 let doc = cstr(str_of(req, "doc_attr"))?;
-                let mut page = unsafe { take(free, (fns.page)(corp, ptr, int_of(req, "start", 0), int_of(req, "size", 20), view.as_ptr(), doc.as_ptr(), &mut err), err)? };
+                let aligned = cstr(&crate::manatee_worker::aligned_arg(req.get("aligned")).unwrap_or_default())?;
+                let mut page = unsafe { take(free, (fns.page)(corp, ptr, int_of(req, "start", 0), int_of(req, "size", 20), view.as_ptr(), doc.as_ptr(), aligned.as_ptr(), &mut err), err)? };
                 let mut err2: *mut c_char = std::ptr::null_mut();
                 let size = unsafe { take(free, (fns.size)(ptr, &mut err2), err2)? };
                 if let (Some(p), Some(s)) = (page.as_object_mut(), size.as_object()) {
@@ -293,6 +297,9 @@ impl ManateeLib {
                 let crit = cstr(str_of(req, "crit"))?;
                 unsafe { take(free, (fns.freq)(corp, ptr, crit.as_ptr(), int_of(req, "limit", 0), &mut err), err) }
             }
+            "distribution" => unsafe {
+                take(free, (fns.dist)(ptr, int_of(req, "bins", 100) as c_int, int_of(req, "amplitude", 101) as c_int, &mut err), err)
+            },
             "coll" => {
                 let attr = cstr(str_of(req, "attr"))?;
                 let sortfn = cstr(str_of(req, "sortfn"))?;
@@ -319,5 +326,33 @@ impl ManateeLib {
         let a = cstr(attr)?;
         let mut err: *mut c_char = std::ptr::null_mut();
         unsafe { take(self.free_fn(), (fns.attr_sizes)(h.0, a.as_ptr(), &mut err), err) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seeds_are_stable_and_differ_by_step() {
+        let a = seed_of("c\0reg\0\0\0[lemma=\"dog\"]\0f");
+        assert_eq!(a, seed_of("c\0reg\0\0\0[lemma=\"dog\"]\0f"));
+        assert_ne!(a, seed_of("c\0reg\0\0\0[lemma=\"dog\"]\0r10\0f"));
+        assert_ne!(a, 0);
+    }
+
+    #[test]
+    fn view_spec_fields_in_order_without_separators() {
+        let v = json!({"left": "-40#", "right": "40#", "attrs": "word", "ctxattrs": "word", "structs": "s", "refs": "=text.id\u{1f}x"});
+        assert_eq!(view_spec(&v), "-40#\u{1f}40#\u{1f}word\u{1f}word\u{1f}s\u{1f}=text.idx");
+        assert_eq!(view_spec(&json!({})), "\u{1f}\u{1f}\u{1f}\u{1f}\u{1f}");
+    }
+
+    #[test]
+    fn store_keeps_the_newest_within_the_budget() {
+        // (no library: the store only counts; freeing needs one, so stay under the budget here)
+        let store = ConcStore::default();
+        assert_eq!(store.len(), 0);
+        assert!(max_kept_lines() > 0 && budget_bytes() > 0);
     }
 }

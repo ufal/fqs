@@ -79,7 +79,8 @@ void *fqsm_conc_new(void *h, const char *cql, const char *default_attr, char **e
 // which, the rest are its options, as in KonText's operation chain): s sort, p / n / P / N
 // filters, r sample (reduce_lines: deterministic in Manatee), f shuffle (here with `seed`, so that a
 // chain gives the same order again; KonText's own route shuffles once and caches the result),
-// D (first hit per document, delete_subparts), F (delete_struct_repeats).
+// D (first hit per document, delete_subparts), F (delete_struct_repeats), X<corpus> (exclude the
+// lines without a segment in that aligned corpus).
 // `default_attr`: as for fqsm_conc_new (filter queries read bare strings with it). `conc` stays valid.
 void *fqsm_conc_apply(void *h, void *conc, const char *op, unsigned seed, const char *default_attr, char **err) {
     Concordance *n = nullptr;
@@ -110,6 +111,10 @@ void *fqsm_conc_apply(void *h, void *conc, const char *op, unsigned seed, const 
                 break;
             }
             case 'D': n->delete_subparts(); break;
+            case 'X':   // parallel corpora: leave out the lines with an empty translation
+                n->add_aligned(arg);
+                n->filter_aligned(arg);
+                break;
             case 'F': n->delete_struct_repeats(arg); break;
             default:
                 throw std::runtime_error("The operation '" + o.substr(0, 1) + "' is not supported for this corpus");
@@ -168,7 +173,8 @@ char *fqsm_conc_arf(void *conc, char **err) {
 // ctxattrs, structs, refs separated by \x1f); `doc_attr` "structure.attribute" (or empty).
 // {"size": lines in the concordance, "hits": [...]}
 char *fqsm_conc_page(void *h, void *conc, long long start, long long size, const char *view, const char *doc_attr,
-                     char **err) {
+                     const char *aligned, char **err) {
+    fqsm::AlignedPage *al = nullptr;
     try {
         Corpus *c = use(h);
         Concordance *cc = as_conc(conc);
@@ -181,15 +187,48 @@ char *fqsm_conc_page(void *h, void *conc, long long start, long long size, const
             doc_st = c->get_struct(d.substr(0, dot));
             doc_pa = doc_st->get_attr(d.substr(dot + 1));
         }
+        // the parallel corpora whose segment goes with each line: their words (the default attribute)
+        std::vector<std::string> names;
+        if (aligned && *aligned) {
+            names.push_back(c->get_conf("DEFAULTATTR"));
+            al = fqsm::aligned_page_new(c, aligned, names);
+        }
         const long long total = cc->size();
         long long from = std::max(0LL, start), to = std::min(total, start + std::max(0LL, size));
         std::string hits;
-        if (from < to) fqsm::kwic_conc_lines(c, cc, from, to, view, doc_st, doc_pa, hits);
-        return dup("{\"size\":" + std::to_string(total) + ",\"hits\":[" + hits + "]}");
+        if (from < to) fqsm::kwic_conc_lines(c, cc, from, to, view, doc_st, doc_pa, al, hits);
+        std::string tail;
+        if (al) tail = ",\"aligned_corpora\":" + fqsm::aligned_page_names(al);
+        fqsm::aligned_page_free(al);
+        return dup("{\"size\":" + std::to_string(total) + tail + ",\"hits\":[" + hits + "]}");
     } catch (std::exception &e) {
         set_err(err, e.what());
     } catch (...) {
         set_err(err, "unknown error reading the concordance");
+    }
+    fqsm::aligned_page_free(al);
+    return nullptr;
+}
+
+// Where the hits lie in the corpus (KonText's dispersion; PyConc.xdistribution): {"begs": [...],
+// "values": [...]}, `bins` of each, `yrange` the height the values are scaled to (Manatee's
+// Concordance::distribution: the first line index of each bin, hits per bin).
+char *fqsm_conc_distribution(void *conc, int bins, int yrange, char **err) {
+    try {
+        if (bins <= 0) throw std::runtime_error("bins must be positive");
+        std::vector<int> vals(bins, 0), begs(bins, 0);
+        as_conc(conc)->distribution(vals, begs, yrange);
+        std::string v, b;
+        for (int i = 0; i < bins; ++i) {
+            if (i) { v += ','; b += ','; }
+            v += std::to_string(vals[i]);
+            b += std::to_string(begs[i]);
+        }
+        return dup("{\"begs\":[" + b + "],\"values\":[" + v + "]}");
+    } catch (std::exception &e) {
+        set_err(err, e.what());
+    } catch (...) {
+        set_err(err, "unknown error");
     }
     return nullptr;
 }

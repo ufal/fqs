@@ -77,7 +77,7 @@ fn n(req: &Value, key: &str, default: u64) -> u64 {
 }
 
 /// The library's `aligned` argument: None (no aligned segments), "*" (all) or "a,b".
-fn aligned_arg(v: Option<&Value>) -> Option<String> {
+pub(crate) fn aligned_arg(v: Option<&Value>) -> Option<String> {
     match v? {
         Value::Bool(true) => Some("*".to_string()),
         Value::String(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
@@ -148,6 +148,24 @@ fn run(lib: &ManateeLib, op: &str, corpus: &str, registry: &Path, req: &Value) -
             let extra = crate::manatee_lib::KwicExtra::from_request(req);
             Ok(lib.kwic(corpus, &registry, s(req, "cql"), n(req, "start", 0), n(req, "size", 20), n(req, "window", 5) as u32, &attrs, doc, count, aligned.as_deref(), &extra)?)
         }
+        "region_at" => Ok(lib.region_at(corpus, &registry, s(req, "name"), req.get("pos").and_then(Value::as_i64).unwrap_or(0))?),
+        "structure" => {
+            let attrs = match req.get("attrs") {
+                Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","),
+                Some(Value::String(t)) => t.clone(),
+                _ => String::new(),
+            };
+            Ok(lib.structure(corpus, &registry, s(req, "name"), &attrs, req.get("max_regions").and_then(Value::as_i64).unwrap_or(1_000_000), req.get("ranges").and_then(Value::as_bool).unwrap_or(true))?)
+        }
+        "keywords" => {
+            let ref_id = s(req, "ref_corpus");
+            let ref_registry = PathBuf::from(s(req, "ref_registry"));
+            if ref_id.is_empty() || ref_registry.as_os_str().is_empty() {
+                return Err(anyhow!("ref_corpus and ref_registry are required").into());
+            }
+            Ok(lib.keywords(corpus, &registry, ref_id, &ref_registry, req)?)
+        }
+        "wordlist" => Ok(lib.wordlist(corpus, &registry, req)?),
         "info" => Ok(lib.corpus_info(corpus, &registry)?),
         "context" => Ok(lib.context(corpus, &registry, req.get("pos").and_then(Value::as_i64).unwrap_or(0), req.get("left").and_then(Value::as_i64).unwrap_or(5), req.get("right").and_then(Value::as_i64).unwrap_or(5), req.get("regions").and_then(Value::as_bool).unwrap_or(false), s(req, "attr"), s(req, "doc_attr"))?),
         "conc" => Ok(lib.conc_run(corpus, &registry, req)?),

@@ -2930,6 +2930,9 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         .route("/status", get(http_pando_status))
         .route("/run", post(http_pando_run))
         .route("/conc", post(manatee_conc_http::http_manatee_conc))
+        .route("/wordlist", post(manatee_conc_http::http_manatee_wordlist))
+        .route("/structure", post(manatee_conc_http::http_manatee_structure))
+        .route("/keywords", post(manatee_conc_http::http_manatee_keywords))
         .route("/session", get(http_pando_session_info).post(http_pando_session_create))
         .route("/session/close", post(http_pando_session_close))
         .route("/sessions", get(http_pando_sessions));
