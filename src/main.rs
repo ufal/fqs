@@ -54,6 +54,7 @@ mod pando_lib;
 mod scan;
 mod services;
 mod subcorpus;
+mod hit_cap;
 mod warm;
 mod frontends;
 
@@ -542,6 +543,11 @@ struct HttpQueryRequest {
     context_scope: Option<String>,
     context_format: Option<String>,
     flexicorp_fragment_kwic_cpos_span: Option<bool>,
+    /// Pando, region queries (`r:<text lang="x">`): hits come back as small records (`doc_id`, span,
+    /// `named_regions`, `token_count`) without the tokens and the XML of the whole region, for
+    /// listing texts or other regions; see hit_cap::compact_result
+    #[serde(default)]
+    compact_regions: Option<bool>,
     /// Pando: each hit also gets `fragment` (its context as TEITOK-style XML,
     /// `<s id><tok id=… attrs head=…>form</tok>…</s>`), token ids and a
     /// `highlight_map` by query token — for corpora without XML files (TEITOK
@@ -8679,13 +8685,23 @@ fn run_pando_query(
         if status >= 400 {
             return Err(EngineHttpError { status: status as u16, payload: engine }.into());
         }
+        // compact_regions: the hits as small records, no tokens and no XML at all
+        let compact = query_options.and_then(|q| q.compact_regions).unwrap_or(false);
+        if compact {
+            hit_cap::compact_result(&mut engine);
+        }
+        // a hit with a huge match (a region query lists whole texts) keeps its first tokens only
+        let capped = hit_cap::cap_result(&mut engine, hit_cap::max_tokens_from_env());
+        if capped > 0 {
+            eprintln!("[fqs] {}: {capped} hit(s) cut to {} tokens (FQS_HIT_MAX_TOKENS)", corpus.id, hit_cap::max_tokens_from_env());
+        }
         // a TEITOK project: the hits' own XML from its xidx (as the flexicorp-pando command
         // line gives it), unless plain text was asked for or the hits carry synthetic XML
         let wants_xml = query_options
             .and_then(|q| q.context_format.as_deref())
             .map(|f| !f.trim().eq_ignore_ascii_case("text"))
             .unwrap_or(true);
-        if wants_xml && !extra.contains_key("fragment") {
+        if wants_xml && !compact && !extra.contains_key("fragment") {
             let root = &corpus.project_root;
             if corpus_xidx_dir(corpus).is_some() {
                 let scope = query_options
@@ -8693,7 +8709,7 @@ fn run_pando_query(
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .unwrap_or("s");
-                if let Err(e) = add_xidx_fragments(&guard, root, &mut engine, scope, window.unwrap_or(5) as i32) {
+                if let Err(e) = add_xidx_fragments(&guard, root, &mut engine, scope, window.unwrap_or(5) as i32, hit_cap::max_tokens_from_env()) {
                     eprintln!("[fqs] {}: xidx fragments: {e:#}", corpus.id);
                 }
             }

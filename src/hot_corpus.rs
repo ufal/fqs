@@ -508,6 +508,7 @@ pub fn add_xidx_fragments(
     engine: &mut Value,
     context_scope: &str,
     context: i32,
+    max_tokens: usize,
 ) -> Result<usize> {
     let Some(result) = engine.get_mut("result") else { return Ok(0) };
     // the hits to fill, as JSON pointers below `result`
@@ -536,7 +537,8 @@ pub fn add_xidx_fragments(
         ) else {
             continue;
         };
-        spans.push((a, b));
+        // a huge match (a whole text) is cut to its first tokens, as the hit's token list is
+        spans.push((a, crate::hit_cap::capped_end(a, b, max_tokens)));
         slots.push(t.clone());
     }
     if spans.is_empty() {
