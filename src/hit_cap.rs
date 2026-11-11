@@ -5,11 +5,12 @@
 //! tokens (the XML fragment is cut from the same span, so it stays well-formed) and say so in
 //! `truncated`; `match_start` / `match_end` stay the real span.
 //!
-//! FQS_HIT_MAX_TOKENS (default 500; 0 = no cap).
+//! FQS_HIT_MAX_TOKENS (default 100; 0 = no cap, as the CLI wants it). A match longer than that is a
+//! region, not a KWIC match.
 
 use serde_json::{json, Value};
 
-pub const DEFAULT_MAX_TOKENS: usize = 500;
+pub const DEFAULT_MAX_TOKENS: usize = 100;
 
 pub fn max_tokens_from_env() -> usize {
     std::env::var("FQS_HIT_MAX_TOKENS")
@@ -65,6 +66,28 @@ pub fn cap_result(engine: &mut Value, max: usize) -> usize {
         }
     }
     n
+}
+
+/// Is this answer a region listing (`r:<text lang="x">`)? The engine marks it itself: a named
+/// *region* is a hit group with a `region` (the structure), a named token is a group without one.
+/// A region listing has region groups only, so what matched is the region, not tokens in it
+/// (`n:<np> [upos="DET"]` has a token group too). No reading of the query text.
+pub fn is_region_result(engine: &Value) -> bool {
+    let Some(hits) = engine.pointer("/result/hits").and_then(Value::as_array) else { return false };
+    !hits.is_empty()
+        && hits.iter().all(|h| {
+            h.get("groups")
+                .and_then(Value::as_array)
+                .map(|g| !g.is_empty() && g.iter().all(|x| x.get("region").is_some()))
+                .unwrap_or(false)
+        })
+}
+
+/// Say what the hits are (additive): `result.hit_kind = "regions"`.
+pub fn mark_regions(engine: &mut Value) {
+    if let Some(r) = engine.get_mut("result").and_then(Value::as_object_mut) {
+        r.insert("hit_kind".into(), json!("regions"));
+    }
 }
 
 /// `compact_regions`: every hit becomes a small record, whatever the size of its match: `doc_id`, the
@@ -129,6 +152,22 @@ mod tests {
         for k in ["tokens", "fragment", "context_xml", "groups"] {
             assert!(h.get(k).is_none(), "{k}");
         }
+    }
+
+    #[test]
+    fn a_region_listing_is_recognised_by_its_groups() {
+        let region = json!({"id": "r", "name": "r", "region": "text", "start": 0, "end": 99, "tok_ids": ["w-1"]});
+        let token = json!({"index": 0, "id": "t1", "name": "t1", "start": 0, "end": 0});
+        let e = json!({"result": {"hits": [{"groups": [region.clone()]}, {"groups": [region.clone()]}]}});
+        assert!(is_region_result(&e));
+        // a token anchor beside the region: the match is tokens, not the region
+        let mixed = json!({"result": {"hits": [{"groups": [token, region]}]}});
+        assert!(!is_region_result(&mixed));
+        assert!(!is_region_result(&json!({"result": {"hits": []}})));
+        assert!(!is_region_result(&json!({"result": {"hits": [{"match_start": 0}]}})));
+        let mut m = e.clone();
+        mark_regions(&mut m);
+        assert_eq!(m["result"]["hit_kind"], "regions");
     }
 
     #[test]

@@ -8685,8 +8685,13 @@ fn run_pando_query(
         if status >= 400 {
             return Err(EngineHttpError { status: status as u16, payload: engine }.into());
         }
-        // compact_regions: the hits as small records, no tokens and no XML at all
-        let compact = query_options.and_then(|q| q.compact_regions).unwrap_or(false);
+        // A region listing (every hit is a region) is answered as regions: small records, no tokens
+        // and no XML. compact_regions overrides either way (false = the full hits).
+        let region_result = hit_cap::is_region_result(&engine);
+        if region_result {
+            hit_cap::mark_regions(&mut engine);
+        }
+        let compact = query_options.and_then(|q| q.compact_regions).unwrap_or(region_result);
         if compact {
             hit_cap::compact_result(&mut engine);
         }
