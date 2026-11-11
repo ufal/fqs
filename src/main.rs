@@ -5961,6 +5961,9 @@ async fn http_warm(
     let Some((dir, priority)) = target else {
         return Ok(Json(json!({ "ok": true, "corpus": corpus.id, "status": "skipped", "backend": backend })));
     };
+    // a TEITOK pando corpus is also queried through its xidx (the hits' XML fragments are cut from
+    // it): its files are read into the cache too, with a budget of their own, after the index
+    let xidx_dir = if backend == "pando" { corpus_xidx_dir(&corpus) } else { None };
     let outcome = state.warmer.try_start(&corpus.id);
     if outcome == warm::Outcome::Accepted {
         let warmer = state.warmer.clone();
@@ -5977,12 +5980,18 @@ async fn http_warm(
                 }
             }
             let (files, bytes) = warm::read_into_cache(&dir, priority, warmer.max_bytes);
+            let (xfiles, xbytes) = match &xidx_dir {
+                Some(x) => warm::read_into_cache(x, warm::XIDX_PRIORITY, warmer.max_bytes),
+                None => (0, 0),
+            };
             warmer.finish();
             if let Some(a) = activity {
                 a.event("warm", activity::fields(vec![
                     ("corpus", json!(id)),
                     ("files", json!(files)),
                     ("bytes", json!(bytes)),
+                    ("xidx_files", json!(xfiles)),
+                    ("xidx_bytes", json!(xbytes)),
                     ("elapsed_ms", json!(t0.elapsed().as_millis() as u64)),
                 ]));
             }

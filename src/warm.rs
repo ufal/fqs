@@ -148,6 +148,8 @@ pub fn cwb_data_dir(registry_dir: &Path, corpus_name: &str) -> Option<PathBuf> {
 /// The attributes read first: pando (form, lemma) and CWB (word, lemma) naming.
 pub const PANDO_PRIORITY: &[&str] = &["form.", "lemma."];
 pub const CWB_PRIORITY: &[&str] = &["word.", "lemma."];
+/// A TEITOK xidx folder: the token table first (every hit's fragment starts from it), then the rest, smallest first.
+pub const XIDX_PRIORITY: &[&str] = &["tokens."];
 
 #[cfg(test)]
 mod tests {
@@ -194,6 +196,19 @@ mod tests {
         let (files, bytes) = read_into_cache(&d, PANDO_PRIORITY, 2500);
         assert_eq!(files, 2, "stops at the cap: form first, then part of lemma");
         assert!(bytes >= 2500 && bytes <= 5000);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn xidx_reads_the_token_table_first() {
+        let d = tmpdir("xidx");
+        let write = |name: &str, n: usize| std::fs::File::create(d.join(name)).unwrap().write_all(&vec![0u8; n]).unwrap();
+        write("tokens.bin", 3000);
+        write("docs.idx", 10);
+        write("zz.big", 9000);
+        let names: Vec<String> = ordered_files(&d, XIDX_PRIORITY).iter()
+            .map(|(p, _)| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["tokens.bin", "docs.idx", "zz.big"]);
         let _ = std::fs::remove_dir_all(&d);
     }
 
