@@ -88,25 +88,49 @@ public:
 KwicView *kwic_view_new(Corpus *c, const char *spec) { return new KwicView(c, spec); }
 void kwic_view_free(KwicView *v) { delete v; }
 
+// the line KWICLines is at, as the "view" object (see kwic_view_hit)
+static void line_json(KWICLines *kl, std::string &out) {
+    out += "\"pos\":" + std::to_string(kl->get_pos()) + ",\"kwiclen\":" + std::to_string(kl->get_kwiclen()) +
+           ",\"ctxbeg\":" + std::to_string(kl->get_ctxbeg()) + ",\"ctxend\":" + std::to_string(kl->get_ctxend()) +
+           ",\"linegroup\":" + std::to_string(kl->get_linegroup()) + ",\"refs\":";
+    tokens_json(out, kl->get_ref_list());
+    out += ",\"left\":";
+    tokens_json(out, kl->get_left());
+    out += ",\"kwic\":";
+    tokens_json(out, kl->get_kwic());
+    out += ",\"right\":";
+    tokens_json(out, kl->get_right());
+}
+
 // ,"view":{"pos","kwiclen","ctxbeg","ctxend","linegroup","refs":[…],"left":[str, class, …],"kwic":[…],"right":[…]}
 void kwic_view_hit(KwicView *v, std::string &out, Position beg, Position end, RangeStream *rs) {
     v->hit->set(beg, end, rs);
     out += ",\"view\":{";
-    if (!v->kl->nextline()) {
-        out += "}";
-        return;
-    }
-    out += "\"pos\":" + std::to_string(v->kl->get_pos()) + ",\"kwiclen\":" + std::to_string(v->kl->get_kwiclen()) +
-           ",\"ctxbeg\":" + std::to_string(v->kl->get_ctxbeg()) + ",\"ctxend\":" + std::to_string(v->kl->get_ctxend()) +
-           ",\"linegroup\":" + std::to_string(v->kl->get_linegroup()) + ",\"refs\":";
-    tokens_json(out, v->kl->get_ref_list());
-    out += ",\"left\":";
-    tokens_json(out, v->kl->get_left());
-    out += ",\"kwic\":";
-    tokens_json(out, v->kl->get_kwic());
-    out += ",\"right\":";
-    tokens_json(out, v->kl->get_right());
+    if (v->kl->nextline()) line_json(v->kl, out);
     out += '}';
+}
+
+// Lines [from, to) of a stored concordance (in its view order: sorted, shuffled), as KonText's
+// kwiclib reads them: KWICLines over conc->RS(true, from, to). Appends the hits as JSON objects
+// {"pos","end","doc"?,"view":{…}} separated by commas.
+void kwic_conc_lines(Corpus *c, Concordance *conc, long long from, long long to, const char *spec,
+                     Structure *doc_st, PosAttr *doc_pa, std::string &out) {
+    std::vector<std::string> f = spec_fields(spec);
+    KWICLines kl(c, conc->RS(true, from, to), f[0].c_str(), f[1].c_str(), f[2].c_str(), f[3].c_str(), f[4].c_str(), f[5].c_str());
+    bool first = true;
+    while (kl.nextline()) {
+        if (!first) out += ',';
+        first = false;
+        out += "{\"pos\":" + std::to_string(kl.get_pos()) + ",\"end\":" + std::to_string(kl.get_pos() + kl.get_kwiclen());
+        if (doc_pa) {
+            const NumOfPos n = doc_st->rng->num_at_pos(kl.get_pos());
+            out += ",\"doc\":";
+            if (n >= 0) json_str(out, doc_pa->pos2str(n)); else out += "null";
+        }
+        out += ",\"view\":{";
+        line_json(&kl, out);
+        out += "}}";
+    }
 }
 
 // Manatee's ARF (finlib/fsstat.cc compute_ARF) over the hits' starts in corpus order.

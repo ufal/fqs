@@ -11,7 +11,8 @@
 //! "arf"? (with the count: "arf")} |
 //! {"op": "freq", "corpus", "registry", "cql", "crit", "limit"} |
 //! {"op": "subc_create", "corpus", "registry", "path", "structure", "query"} (write a .subc) |
-//! {"op": "sizes", "corpus", "registry"}.
+//! {"op": "sizes", "corpus", "registry"} |
+//! {"op": "conc", …} (stored concordances: manatee_conc.rs) | {"op": "attr_sizes", "corpus", "registry", "attr"}.
 //! `"subc": PATH` on query / kwic / freq / sizes: run under that subcorpus (Manatee's SubCorpus).
 //! Answers: {"ok": true, "result"} or {"ok": false, "error", "check"?}, each line starting with
 //! [`MARK`]: the library may write to stdout itself, and such lines are not answers.
@@ -91,7 +92,7 @@ fn aligned_arg(v: Option<&Value>) -> Option<String> {
 fn handle(lib: &ManateeLib, req: &Value, checked: &mut HashMap<String, std::result::Result<(), String>>) -> std::result::Result<Value, Failure> {
     let op = s(req, "op");
     if op == "hello" {
-        return Ok(json!({ "version": lib.version, "path": lib.path.display().to_string(), "check": lib.has_check(), "aligned": lib.has_aligned(), "subcorpora": lib.has_subcorpora() }));
+        return Ok(json!({ "version": lib.version, "path": lib.path.display().to_string(), "check": lib.has_check(), "aligned": lib.has_aligned(), "subcorpora": lib.has_subcorpora(), "conc": lib.has_conc(), "info": lib.has_info() }));
     }
     let corpus = s(req, "corpus");
     let registry = PathBuf::from(s(req, "registry"));
@@ -147,6 +148,10 @@ fn run(lib: &ManateeLib, op: &str, corpus: &str, registry: &Path, req: &Value) -
             let extra = crate::manatee_lib::KwicExtra::from_request(req);
             Ok(lib.kwic(corpus, &registry, s(req, "cql"), n(req, "start", 0), n(req, "size", 20), n(req, "window", 5) as u32, &attrs, doc, count, aligned.as_deref(), &extra)?)
         }
+        "info" => Ok(lib.corpus_info(corpus, &registry)?),
+        "context" => Ok(lib.context(corpus, &registry, req.get("pos").and_then(Value::as_i64).unwrap_or(0), req.get("left").and_then(Value::as_i64).unwrap_or(5), req.get("right").and_then(Value::as_i64).unwrap_or(5), req.get("regions").and_then(Value::as_bool).unwrap_or(false), s(req, "attr"), s(req, "doc_attr"))?),
+        "conc" => Ok(lib.conc_run(corpus, &registry, req)?),
+        "attr_sizes" => Ok(lib.attr_value_sizes(corpus, &registry, s(req, "attr"))?),
         "freq" => Ok(lib.freq(corpus, &registry, s(req, "cql"), s(req, "crit"), n(req, "limit", 0))?),
         other => Err(anyhow!("unknown op '{other}'").into()),
     }

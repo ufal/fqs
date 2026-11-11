@@ -36,6 +36,9 @@ mod inbox;
 mod limits;
 mod manatee_jobs;
 mod manatee_aligned;
+mod manatee_conc;
+mod manatee_conc_http;
+mod manatee_info;
 mod manatee_export;
 mod manatee_lib;
 mod query_lang;
@@ -2926,6 +2929,7 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         .route("/fragment", get(http_pando_fragment))
         .route("/status", get(http_pando_status))
         .route("/run", post(http_pando_run))
+        .route("/conc", post(manatee_conc_http::http_manatee_conc))
         .route("/session", get(http_pando_session_info).post(http_pando_session_create))
         .route("/session/close", post(http_pando_session_close))
         .route("/sessions", get(http_pando_sessions));
@@ -5221,6 +5225,7 @@ async fn http_root_with_state(State(state): State<HttpAppState>) -> Json<Value> 
             json!({"method":"GET", "path":"/fragment", "description":"TEITOK XML fragment from xidx (?corpus=&pos=&end=&context=&context_scope=) for KonText token_connect"}),
             json!({"method":"GET", "path":"/status", "description":"Async total job, pando or Manatee (?corpus=&job=)"}),
             json!({"method":"POST", "path":"/warm", "description":"Read a corpus's main index files into the file cache ahead of its first query ({corpus}); a frontend calls it when its search page for the corpus opens"}),
+            json!({"method":"POST", "path":"/conc", "description":"KonText operation chain on a native Manatee corpus (JSON: corpus, cql, ops?, want, …); stored concordances in the Manatee workers"}),
             json!({"method":"POST", "path":"/run", "description":"Pando CQL program (JSON: corpus, cql|query, session_id?, …)"}),
             json!({"method":"POST", "path":"/session", "description":"Pando hit-set session (JSON: corpus, session_id?, ttl_s?); /query name / from and /run use it"}),
             json!({"method":"GET", "path":"/session", "description":"Pando session's hit sets (?corpus=&session_id=)"}),
@@ -6124,8 +6129,12 @@ async fn http_pando_info_whole(
     let Some(file) = registry else {
         return Err((StatusCode::NOT_FOUND, format!("no registry known for corpus '{}' ({backend})", corpus.id)));
     };
-    let result = registry_info::info_from_registry_file(&file, corpus.corpus_size, &backend)
+    let mut result = registry_info::info_from_registry_file(&file, corpus.corpus_size, &backend)
         .map_err(|e| (StatusCode::NOT_FOUND, format!("corpus '{}': {e}", corpus.id)))?;
+    if backend == "manatee" {
+        // the sizes, values per attribute and regions per structure come from Manatee itself
+        manatee_info::add_native_info(&mut result, &corpus.id, &file).await;
+    }
     Ok(Json(json!({ "ok": true, "operation": "info", "result": result })))
 }
 
@@ -6157,6 +6166,10 @@ async fn http_pando_context(
     let pos = q.pos.as_deref().unwrap_or("");
     if pos.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "pos is required".to_string()));
+    }
+    let corpus = state.catalog.get(&q.corpus).map_err(to_http_err)?;
+    if resolve_effective_backend(&corpus).map(|b| b == "manatee").unwrap_or(false) {
+        return manatee_info::http_context(&corpus, &q.pos, &q.left, &q.right, &q.regions).await;
     }
     let mut parts = vec![format!("pos={pos}")];
     if let Some(l) = &q.left {

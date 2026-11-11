@@ -102,7 +102,7 @@ std::string fqsm::read_problem(Corpus *c, int &checked) {
 
 extern "C" {
 
-const char *fqsm_version() { return "fqs-manatee 0.8.0"; }
+const char *fqsm_version() { return "fqs-manatee 0.9.0"; }
 
 // Open a corpus: a registry file path (or a name in MANATEE_REGISTRY). NULL and *err on failure.
 // The registry file's folder is where its aligned corpora are looked for first (fqsm::use).
@@ -173,26 +173,6 @@ char *fqsm_query(void *h, const char *cql, long long start, long long size, int 
 namespace {
 
 // fqsm_kwic_page and fqsm_kwic_aligned: `aligned` NULL for no aligned corpora.
-// The corpus's default attribute set for one query (KonText's `a` operation: Corpus::set_default_attr,
-// as KonText's conclib does), the registry's restored afterwards: the handle is reused.
-class DefaultAttr {
-    Corpus *c_;
-    std::string saved_;
-public:
-    DefaultAttr(Corpus *c, const char *attr) : c_(nullptr) {
-        if (!attr || !*attr) return;
-        saved_ = c->get_conf("DEFAULTATTR");
-        if (saved_ == attr) return;
-        c->set_default_attr(attr);   // throws for an attribute the corpus lacks
-        c_ = c;
-    }
-    ~DefaultAttr() {
-        if (c_) {
-            try { c_->set_default_attr(saved_); } catch (...) {}
-        }
-    }
-};
-
 // `view`: KonText's KWIC line spec (fqs_manatee_view.cc), NULL for none; `default_attr`: the
 // default attribute for this query ("" the registry's); `want_arf`: with count_all, "arf" too.
 char *kwic_impl(void *h, const char *cql, long long start, long long size, int window, const char *attrs,
@@ -202,7 +182,7 @@ char *kwic_impl(void *h, const char *cql, long long start, long long size, int w
     fqsm::KwicView *kv = nullptr;
     try {
         Corpus *c = use(h);
-        DefaultAttr da(c, default_attr);
+        fqsm::DefaultAttr da(c, default_attr);
         std::vector<std::string> names = fqsm::split_list(attrs ? attrs : "");
         std::vector<PosAttr *> pas;
         for (const std::string &n : names) pas.push_back(c->get_attr(n));

@@ -248,9 +248,13 @@ impl Pool {
         (self.workers.len(), running, busy)
     }
 
-    /// A free worker if there is one, else wait for the next in turn.
-    fn worker(&self) -> std::sync::MutexGuard<'_, Option<Worker>> {
+    /// A free worker if there is one, else wait for the next in turn; with `affinity` (a hash), that
+    /// worker, waiting for it: the concordances of a Manatee session live in one worker.
+    fn worker(&self, affinity: Option<u64>) -> std::sync::MutexGuard<'_, Option<Worker>> {
         let n = self.workers.len();
+        if let Some(a) = affinity {
+            return self.workers[(a % n as u64) as usize].lock().unwrap_or_else(|p| p.into_inner());
+        }
         let start = self.next.fetch_add(1, Ordering::Relaxed);
         for i in 0..n {
             if let Ok(g) = self.workers[(start + i) % n].try_lock() {
@@ -333,7 +337,26 @@ impl Pool {
 
     /// One request for `corpus` ({"op": "query" | "freq", "registry", …}): the worker's result, or an
     /// error that says what happened (a crash or a time-out ends only that worker).
-    pub fn call(&self, corpus: &str, mut req: Value) -> Result<Value> {
+    pub fn call(&self, corpus: &str, req: Value) -> Result<Value> {
+        self.call_with(corpus, req, None)
+    }
+
+    /// A stored-concordance request ({"op": "conc", …}, manatee_conc.rs) or `attr_sizes`: to the worker
+    /// that holds this query's concordances (the same worker for every chain on one query).
+    pub fn conc(&self, corpus: &str, mut req: Value) -> Result<Value> {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for k in ["registry", "subc", "default_attr", "cql"] {
+            for b in req.get(k).and_then(Value::as_str).unwrap_or("").bytes().chain(std::iter::once(0)) {
+                h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+            }
+        }
+        if req.get("op").is_none() {
+            req["op"] = json!("conc");
+        }
+        self.call_with(corpus, req, Some(h))
+    }
+
+    fn call_with(&self, corpus: &str, mut req: Value, affinity: Option<u64>) -> Result<Value> {
         if let Some(left) = self.quarantined(corpus) {
             bail!(
                 "Manatee corpus '{corpus}' ended a Manatee worker repeatedly; it is not queried for another {} minutes (check the corpus and its registry, e.g. in KonText)",
@@ -344,7 +367,7 @@ impl Pool {
         if self.checked.lock().map(|c| c.contains(corpus)).unwrap_or(false) {
             req["skip_check"] = json!(true);
         }
-        let mut slot = self.worker();
+        let mut slot = self.worker(affinity);
         // a worker that ended while idle is replaced first (not this query's doing, nor its corpus's)
         if let Some(w) = slot.as_mut() {
             if let Ok(Some(status)) = w.child.try_wait() {

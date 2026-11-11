@@ -8,6 +8,7 @@
 
 #include "corpus.hh"
 #include "cqpeval.hh"
+#include "concord.hh"
 
 #include <cstdio>
 #include <cstdlib>
@@ -150,6 +151,26 @@ inline void tokens(std::string &out, const std::vector<PosAttr *> &pas, Position
 // fqsm_check's test, for a corpus or an aligned one. `checked` counts the words tested.
 std::string read_problem(Corpus *c, int &checked);
 
+// The corpus's default attribute set for one query or chain (KonText's `a` operation:
+// Corpus::set_default_attr), the registry's restored afterwards: the handle is reused.
+class DefaultAttr {
+    Corpus *c_;
+    std::string saved_;
+public:
+    DefaultAttr(Corpus *c, const char *attr) : c_(nullptr) {
+        if (!attr || !*attr) return;
+        saved_ = c->get_conf("DEFAULTATTR");
+        if (saved_ == attr) return;
+        c->set_default_attr(attr);   // throws for an attribute the corpus lacks
+        c_ = c;
+    }
+    ~DefaultAttr() {
+        if (c_) {
+            try { c_->set_default_attr(saved_); } catch (...) {}
+        }
+    }
+};
+
 }  // namespace fqsm
 
 // The aligned part of fqsm_kwic_aligned (fqs_manatee_aligned.cc): for one page of hits, per hit
@@ -173,6 +194,10 @@ class KwicView;
 KwicView *kwic_view_new(Corpus *c, const char *spec);
 void kwic_view_hit(KwicView *v, std::string &out, Position beg, Position end, RangeStream *rs);
 void kwic_view_free(KwicView *v);
+// Lines [from, to) of a stored concordance as KWICLines reads them (fqs_manatee_conc.cc): hits
+// {"pos","end","doc"?,"view":{…}}, comma-separated, appended to `out`.
+void kwic_conc_lines(Corpus *c, Concordance *conc, long long from, long long to, const char *spec,
+                     Structure *doc_st, PosAttr *doc_pa, std::string &out);
 // Manatee's ARF over the hits' starts (corpus order) in a corpus of `size` positions
 double arf(const std::vector<Position> &begs, Position size);
 }  // namespace fqsm

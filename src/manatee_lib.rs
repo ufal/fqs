@@ -61,7 +61,7 @@ impl KwicExtra {
 }
 
 /// An open corpus (a `Corpus *` inside the library).
-struct Handle(*mut c_void);
+pub(crate) struct Handle(pub(crate) *mut c_void);
 // SAFETY: a handle is only used under its own Mutex.
 unsafe impl Send for Handle {}
 
@@ -83,6 +83,10 @@ pub struct ManateeLib {
     subc_create: Option<SubcCreateFn>,
     open_subc: Option<OpenSubcFn>,
     sizes: Option<SizesFn>,
+    /// stored concordances (fqs-manatee 0.9; manatee_conc.rs)
+    pub(crate) conc: Option<crate::manatee_conc::ConcFns>,
+    pub(crate) concs: Mutex<crate::manatee_conc::ConcStore>,
+    pub(crate) info: Option<crate::manatee_info::InfoFns>,
     corpora: Mutex<HashMap<String, Arc<Mutex<Handle>>>>,
     /// The subcorpus (.subc) the current request runs under ([`ManateeLib::set_subcorpus`]): the
     /// worker answers one request at a time, and sets it per request.
@@ -102,7 +106,7 @@ impl Drop for ManateeLib {
 }
 
 /// The result of the library: its JSON, or its error message.
-unsafe fn take(free: FreeFn, out: *mut c_char, err: *mut c_char) -> Result<Value> {
+pub(crate) unsafe fn take(free: FreeFn, out: *mut c_char, err: *mut c_char) -> Result<Value> {
     // SAFETY: `out` / `err` are NULL or NUL-terminated strings from libfqs_manatee, freed with its fqsm_free
     unsafe {
         if out.is_null() {
@@ -149,6 +153,8 @@ impl ManateeLib {
             let subc_create = lib.get::<SubcCreateFn>(b"fqsm_subc_create\0").ok().map(|f| *f);   // from 0.7
             let open_subc = lib.get::<OpenSubcFn>(b"fqsm_open_subc\0").ok().map(|f| *f);   // from 0.7
             let sizes = lib.get::<SizesFn>(b"fqsm_sizes\0").ok().map(|f| *f);   // from 0.7
+            let conc = crate::manatee_conc::ConcFns::load(&lib);   // from 0.9
+            let info = crate::manatee_info::InfoFns::load(&lib);
             Ok(ManateeLib {
                 _lib: lib,
                 path: path.to_path_buf(),
@@ -167,6 +173,9 @@ impl ManateeLib {
                 subc_create,
                 open_subc,
                 sizes,
+                conc,
+                concs: Mutex::new(Default::default()),
+                info,
                 corpora: Mutex::new(HashMap::new()),
                 subcorpus: Mutex::new(None),
             })
@@ -183,6 +192,19 @@ impl ManateeLib {
         if let Ok(mut s) = self.subcorpus.lock() {
             *s = path;
         }
+    }
+
+    pub(crate) fn handle_for(&self, id: &str, registry: &Path) -> Result<Arc<Mutex<Handle>>> {
+        self.handle(id, registry)
+    }
+
+    pub(crate) fn free_fn(&self) -> FreeFn {
+        self.free
+    }
+
+    /// The subcorpus file the current request runs under ("" for the whole corpus).
+    pub(crate) fn current_subcorpus_key(&self) -> String {
+        self.subcorpus.lock().ok().and_then(|s| s.clone()).map(|p| p.display().to_string()).unwrap_or_default()
     }
 
     /// The corpus `id`, or under [`ManateeLib::set_subcorpus`] the corpus opened as that subcorpus
