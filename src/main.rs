@@ -28,6 +28,9 @@ use time::format_description::well_known::Rfc3339;
 use tokio::time::sleep;
 
 mod activity;
+mod activity_report;
+mod query_shape;
+mod report_html;
 mod admin;
 mod enrich;
 mod fcs;
@@ -91,6 +94,8 @@ enum Command {
     Status(StatusArgs),
     /// Reindex queue/history scaffolding (control-plane)
     Reindex(ReindexArgs),
+    /// Usage report (typical queries, failures, speed, identities) from the activity log
+    Report(activity_report::ReportArgs),
     /// Mint a short-lived admin JWT (`aud=fqs-admin`) for `/admin/api/*`
     AdminToken(AdminTokenArgs),
     /// Frontend modules (KonText, …): what they need
@@ -1480,6 +1485,7 @@ async fn main() -> Result<()> {
         Command::Query(args) => handle_query(args)?,
         Command::Serve(args) => run_http_server(args).await?,
         Command::Status(args) => handle_status(args)?,
+        Command::Report(args) => activity_report::run(&args)?,
         Command::Reindex(args) => handle_reindex(args)?,
         Command::AdminToken(args) => handle_admin_token(args)?,
         Command::ManateeWorker => manatee_worker::serve()?,

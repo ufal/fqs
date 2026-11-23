@@ -857,6 +857,26 @@ across runs with a fixed `--activity-salt` / `FQS_ACTIVITY_SALT`.
     fqs serve --activity-log /var/log/fqs/activity.jsonl
     jq -c 'select(.event=="warm_close")' /var/log/fqs/activity.jsonl
 
+### Usage report
+
+    fqs report [--activity-log FILE] [--since 30d|12h|all] [--corpus ID] [--out DIR]
+
+Reads the activity log and its rotated `FILE.N.gz` copies and writes `report.html`
+(one self-contained page) and `report.json` to `--out` (default `./fqs-report`). The log
+defaults to `FQS_ACTIVITY_LOG`, else `/var/log/fqs/activity.jsonl`. Sections: volume per
+day and hour, corpora with p50/p90/p99 and cold opens, typical query *shapes* (literals in
+quotes become `?`), failures by type with the commonest cases, searches without hits,
+slowest queries, identities, scripted bursts.
+
+Counting: a *call* is one logged query; a *search* leaves out repeats (same corpus and
+pattern within `--repeat-secs`, default 10: a search and its `freq` follow-up, or the cached
+second run); a *burst* is 5+ calls from one identity within a second (a script or test run),
+shown apart and kept out of the typical-query tables. The identity is what the log holds
+(hashed by default, so it only compares within one server run). TEITOK sends its login as
+`user`; a visitor has none, so FQS logs `session:…` (when a hit-set session is sent) or
+`ip:` the address of the TEITOK host. There is no client address or country in the log.
+
+
 ## Stored subcorpora
 
 Named subcorpora are kept in FQS (table `subcorpora` of the catalogue database), so every front end
