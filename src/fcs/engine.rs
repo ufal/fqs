@@ -46,6 +46,8 @@ pub struct Hit {
     pub doc: Option<String>,
     /// id of the first matched token (`tokid_attr`), when known
     pub tokid: Option<String>,
+    /// a lexical entry (LexFCS), instead of a stretch of text
+    pub lex: Option<super::lex::LexEntry>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -61,12 +63,14 @@ pub enum EngineError {
     Query(String),
     /// anything else (→ general system error)
     System(String),
+    /// the engine names the SRU diagnostic itself (code, details): LexFCS's store
+    Diag(u32, String),
 }
 
 impl std::fmt::Display for EngineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EngineError::Query(s) | EngineError::System(s) => write!(f, "{s}"),
+            EngineError::Query(s) | EngineError::System(s) | EngineError::Diag(_, s) => write!(f, "{s}"),
         }
     }
 }
@@ -248,6 +252,7 @@ fn pando_hit(h: &Value, text_attr: &str, layers: &[(Layer, String)], tokid_attr:
             ps.sort();
             ps.first().and_then(|p| by_pos[*p].get(t)).and_then(Value::as_str).map(str::to_string)
         }),
+        lex: None,
     }
 }
 
@@ -402,6 +407,7 @@ fn parse_cqp_output(stdout: &str, stderr: &str, layers: Vec<Layer>, with_doc: bo
                 end: f[1].trim().parse().ok(),
                 doc,
                 tokid,
+                lex: None,
             });
         }
     }
@@ -469,6 +475,7 @@ fn manatee_hit(h: &Value, attrs: &[String], a: &SearchArgs<'_>) -> Hit {
         end,
         doc: h.get("doc").and_then(Value::as_str).map(str::to_string),
         tokid,
+        lex: None,
     }
 }
 
@@ -629,7 +636,7 @@ fn kontext_lines(v: &Value, other: &[Layer]) -> Vec<Hit> {
         }
         .map(|s| s.trim_start_matches('#').to_string())
         .filter(|s| !s.is_empty());
-        hits.push(Hit { left: kontext_tokens(line.get("Left"), &[]), kwic, right: kontext_tokens(line.get("Right"), &[]), start, end, doc, tokid: None });
+        hits.push(Hit { left: kontext_tokens(line.get("Left"), &[]), kwic, right: kontext_tokens(line.get("Right"), &[]), start, end, doc, tokid: None, lex: None });
     }
     hits
 }

@@ -46,6 +46,8 @@ pub struct Resource {
     pub doc_attr: Option<String>,
     /// positional attribute with the token id (TEITOK: `id`)
     pub tokid_attr: Option<String>,
+    /// a lexicon (LexFCS) instead of a corpus
+    pub lex: Option<super::lex::LexSpec>,
 }
 
 /// A link template and the query language its `{cql}` placeholder takes.
@@ -126,20 +128,31 @@ fn str_or_map(v: Option<&Value>, fallback: &str) -> Vec<(String, String)> {
     }
 }
 
-/// ISO 639-1 → 639-3 for the languages we are likely to see; others as given.
+/// ISO 639-1 → 639-3 (all two-letter codes; macrolanguages as their macrolanguage code, `sh` as `hbs`);
+/// a three-letter code or anything else as given.
 pub fn iso639_3(code: &str) -> String {
     let c = code.trim().to_ascii_lowercase();
     let c = c.split(['-', '_']).next().unwrap_or("").to_string();
     let m = match c.as_str() {
-        "en" => "eng", "cs" => "ces", "sk" => "slk", "de" => "deu", "nl" => "nld", "fr" => "fra",
-        "es" => "spa", "it" => "ita", "pt" => "por", "pl" => "pol", "ru" => "rus", "uk" => "ukr",
-        "sl" => "slv", "hr" => "hrv", "sr" => "srp", "bg" => "bul", "hu" => "hun", "fi" => "fin",
-        "et" => "est", "lv" => "lav", "lt" => "lit", "sv" => "swe", "da" => "dan", "no" => "nor",
-        "nb" => "nob", "nn" => "nno", "is" => "isl", "el" => "ell", "tr" => "tur", "ar" => "ara",
-        "he" => "heb", "fa" => "fas", "hi" => "hin", "zh" => "zho", "ja" => "jpn", "ko" => "kor",
-        "ro" => "ron", "ca" => "cat", "eu" => "eus", "gl" => "glg", "ga" => "gle", "cy" => "cym",
-        "la" => "lat", "grc" => "grc", "af" => "afr", "sq" => "sqi", "mt" => "mlt", "be" => "bel",
-        "ka" => "kat", "hy" => "hye", "id" => "ind", "vi" => "vie", "th" => "tha",
+        "aa" => "aar", "ab" => "abk", "ae" => "ave", "af" => "afr", "ak" => "aka", "am" => "amh", "an" => "arg", "ar" => "ara", "as" => "asm", "av" => "ava",
+        "ay" => "aym", "az" => "aze", "ba" => "bak", "be" => "bel", "bg" => "bul", "bi" => "bis", "bm" => "bam", "bn" => "ben", "bo" => "bod", "br" => "bre",
+        "bs" => "bos", "ca" => "cat", "ce" => "che", "ch" => "cha", "co" => "cos", "cr" => "cre", "cs" => "ces", "cu" => "chu", "cv" => "chv", "cy" => "cym",
+        "da" => "dan", "de" => "deu", "dv" => "div", "dz" => "dzo", "ee" => "ewe", "el" => "ell", "en" => "eng", "eo" => "epo", "es" => "spa", "et" => "est",
+        "eu" => "eus", "fa" => "fas", "ff" => "ful", "fi" => "fin", "fj" => "fij", "fo" => "fao", "fr" => "fra", "fy" => "fry", "ga" => "gle", "gd" => "gla",
+        "gl" => "glg", "gn" => "grn", "gu" => "guj", "gv" => "glv", "ha" => "hau", "he" => "heb", "hi" => "hin", "ho" => "hmo", "hr" => "hrv", "ht" => "hat",
+        "hu" => "hun", "hy" => "hye", "hz" => "her", "ia" => "ina", "id" => "ind", "ie" => "ile", "ig" => "ibo", "ii" => "iii", "ik" => "ipk", "io" => "ido",
+        "is" => "isl", "it" => "ita", "iu" => "iku", "ja" => "jpn", "jv" => "jav", "ka" => "kat", "kg" => "kon", "ki" => "kik", "kj" => "kua", "kk" => "kaz",
+        "kl" => "kal", "km" => "khm", "kn" => "kan", "ko" => "kor", "kr" => "kau", "ks" => "kas", "ku" => "kur", "kv" => "kom", "kw" => "cor", "ky" => "kir",
+        "la" => "lat", "lb" => "ltz", "lg" => "lug", "li" => "lim", "ln" => "lin", "lo" => "lao", "lt" => "lit", "lu" => "lub", "lv" => "lav", "mg" => "mlg",
+        "mh" => "mah", "mi" => "mri", "mk" => "mkd", "ml" => "mal", "mn" => "mon", "mr" => "mar", "ms" => "msa", "mt" => "mlt", "my" => "mya", "na" => "nau",
+        "nb" => "nob", "nd" => "nde", "ne" => "nep", "ng" => "ndo", "nl" => "nld", "nn" => "nno", "no" => "nor", "nr" => "nbl", "nv" => "nav", "ny" => "nya",
+        "oc" => "oci", "oj" => "oji", "om" => "orm", "or" => "ori", "os" => "oss", "pa" => "pan", "pi" => "pli", "pl" => "pol", "ps" => "pus", "pt" => "por",
+        "qu" => "que", "rm" => "roh", "rn" => "run", "ro" => "ron", "ru" => "rus", "rw" => "kin", "sa" => "san", "sc" => "srd", "sd" => "snd", "se" => "sme",
+        "sg" => "sag", "sh" => "hbs", "si" => "sin", "sk" => "slk", "sl" => "slv", "sm" => "smo", "sn" => "sna", "so" => "som", "sq" => "sqi", "sr" => "srp",
+        "ss" => "ssw", "st" => "sot", "su" => "sun", "sv" => "swe", "sw" => "swa", "ta" => "tam", "te" => "tel", "tg" => "tgk", "th" => "tha", "ti" => "tir",
+        "tk" => "tuk", "tl" => "tgl", "tn" => "tsn", "to" => "ton", "tr" => "tur", "ts" => "tso", "tt" => "tat", "tw" => "twi", "ty" => "tah", "ug" => "uig",
+        "uk" => "ukr", "ur" => "urd", "uz" => "uzb", "ve" => "ven", "vi" => "vie", "vo" => "vol", "wa" => "wln", "wo" => "wol", "xh" => "xho", "yi" => "yid",
+        "yo" => "yor", "za" => "zha", "zh" => "zho", "zu" => "zul",
         "" => "und",
         other => return other.to_string(),
     };
@@ -152,6 +165,7 @@ pub fn default_layers(d: Dialect) -> Vec<(Layer, String)> {
         Dialect::Pando => vec![(Layer::Text, "form".into()), (Layer::Lemma, "lemma".into()), (Layer::Pos, "upos".into())],
         Dialect::Cwb => vec![(Layer::Text, "word".into()), (Layer::Lemma, "lemma".into()), (Layer::Pos, "pos".into())],
         Dialect::Manatee => vec![(Layer::Text, "word".into()), (Layer::Lemma, "lemma".into()), (Layer::Pos, "tag".into())],
+        Dialect::Lex => vec![],
     }
 }
 
@@ -266,11 +280,13 @@ impl Resource {
             languages,
             dialect: s.dialect,
             mapping: Mapping { layers, structures },
-            advanced,
+            // a lexicon has no tokens: never Advanced Search
+            advanced: advanced && s.dialect != Dialect::Lex,
             context: g("context").and_then(Value::as_u64).map(|n| n.clamp(1, 50) as u32).unwrap_or(5),
             hit_link,
             doc_attr: attr("doc_attr"),
             tokid_attr: attr("tokid_attr"),
+            lex: if s.dialect == Dialect::Lex { super::lex::LexSpec::from_fcs(f) } else { None },
         }
     }
 

@@ -2928,6 +2928,7 @@ async fn run_http_server(args: ServeArgs) -> Result<()> {
         )
         .route("/labels", get(http_browse_labels))
         .route("/fcs", get(http_fcs))
+        .route("/lexfcs", get(http_lexfcs))
         .route("/reindex/jobs", get(http_reindex_jobs).post(http_reindex_enqueue))
         .route("/reindex/history", get(http_reindex_history))
         .route("/reindex/workers/heartbeat", post(http_reindex_worker_heartbeat))
@@ -5226,7 +5227,8 @@ async fn http_root_with_state(State(state): State<HttpAppState>) -> Json<Value> 
             json!({"method":"GET", "path":"/corpora/{id}/permitted", "description":"May the caller (verified token; else anonymous) use this corpus under its access groups, whatever the access mode: {corpus, permitted}. /corpora?permitted=1 lists those"}),
             json!({"method":"GET", "path":"/corpora/{id}/may-use", "description":"May the caller (signed token) use this corpus: may_use, reason (private | login_required | group), open_to_everyone"}),
             json!({"method":"GET", "path":"/labels", "description":"Browse labels + facet groups/counts (frontend=teitok, facet=…)"}),
-            json!({"method":"GET", "path":"/fcs", "description":"FCS/SRU-style endpoint"}),
+            json!({"method":"GET", "path":"/fcs", "description":"FCS/SRU-style endpoint (corpora)"}),
+            json!({"method":"GET", "path":"/lexfcs", "description":"LexFCS endpoint (lexicons, LexCQL)"}),
             json!({"method":"GET", "path":"/reindex/jobs", "description":"List reindex queue (status/corpus/limit)"}),
             json!({"method":"POST", "path":"/reindex/jobs", "description":"Enqueue reindex job (admin role)"}),
             json!({"method":"GET", "path":"/reindex/history", "description":"Reindex history log (corpus/limit)"}),
@@ -6577,7 +6579,7 @@ fn fcs_config(corpus: &CorpusEntry) -> Value {
     Value::Object(o)
 }
 
-/// Which engine answers FCS for a corpus: `fcs.engine` (pando | cwb | kontext),
+/// Which engine answers FCS for a corpus: `fcs.engine` (pando | cwb | kontext | lex),
 /// else a `settings.kontext` block, else the corpus's query backend.
 fn fcs_dialect(corpus: &CorpusEntry, fcs_cfg: &Value) -> Option<fcs::translate::Dialect> {
     use fcs::translate::Dialect;
@@ -6591,6 +6593,8 @@ fn fcs_dialect(corpus: &CorpusEntry, fcs_cfg: &Value) -> Option<fcs::translate::
         "pando" => Some(Dialect::Pando),
         "cqp" | "cwb" => Some(Dialect::Cwb),
         "kontext" | "manatee" | "noske" => Some(Dialect::Manatee),
+        // a lexicon store (LexFCS): settings.fcs.store, run by lexfcs.py
+        "lex" | "lexicon" => Some(Dialect::Lex),
         _ => None,
     }
 }
@@ -6642,19 +6646,22 @@ fn fcs_resource(state: &HttpAppState, corpus: &CorpusEntry) -> Option<fcs::Resou
             landing = landing.or(Some(format!("{u}/query?corpname={c}")));
         }
     }
+    // a lexicon's default PID lives under /lexfcs, where it is served
+    let base_url = state.fcs_base_url.as_deref().map(|b| if dialect == fcs::translate::Dialect::Lex { lexfcs_base_url(b) } else { b.to_string() });
     Some(fcs::Resource::from_spec(&fcs::ResourceSpec {
         id: &corpus.id,
         label: &corpus.label,
         landing_page: landing.as_deref(),
         fcs: &cfg,
         dialect,
-        base_url: state.fcs_base_url.as_deref(),
+        base_url: base_url.as_deref(),
         default_hit_link,
     }))
 }
 
-/// The FCS resources a caller may search (FCS-enabled, current, HTTP-visible).
-fn fcs_resources(state: &HttpAppState, caller: &Caller) -> Vec<(fcs::Resource, CorpusEntry)> {
+/// The FCS resources a caller may search (FCS-enabled, current, HTTP-visible): the corpora at /fcs,
+/// the lexicons at /lexfcs (`lexical`), so that each aggregator sees only what it can show.
+fn fcs_resources(state: &HttpAppState, caller: &Caller, lexical: bool) -> Vec<(fcs::Resource, CorpusEntry)> {
     let role = caller.role.as_str();
     state
         .catalog
@@ -6666,6 +6673,7 @@ fn fcs_resources(state: &HttpAppState, caller: &Caller) -> Vec<(fcs::Resource, C
                 || (is_http_access_allowed(c, role) && is_http_operation_allowed(c, "query") && access::listed(state.limits.access(), &c.settings, caller))
         })
         .filter_map(|c| fcs_resource(state, &c).map(|r| (r, c)))
+        .filter(|(r, _)| r.lex.is_some() == lexical)
         .collect()
 }
 
@@ -6681,20 +6689,38 @@ fn fcs_public_address(base: &str) -> Option<(String, u16, String)> {
     Some((host.to_string(), port, path.trim_matches('/').to_string()))
 }
 
-fn fcs_endpoint(state: &HttpAppState) -> fcs::Endpoint {
+/// The public URL of /lexfcs: `--fcs-base-url` with its last part `fcs` read as `lexfcs`
+/// (…/services/fcs → …/services/lexfcs), else with `/lex` added.
+fn lexfcs_base_url(base: &str) -> String {
+    let b = base.trim_end_matches('/');
+    match b.rsplit_once('/') {
+        Some((head, "fcs")) => format!("{head}/lexfcs"),
+        _ => format!("{b}/lex"),
+    }
+}
+
+fn fcs_endpoint(state: &HttpAppState, lexical: bool) -> fcs::Endpoint {
+    let base_url = state.fcs_base_url.as_deref().map(|b| if lexical { lexfcs_base_url(b) } else { b.to_string() });
     // serverInfo names the public endpoint, not FQS's bind address
-    let (host, port, database) = state
-        .fcs_base_url
+    let (host, port, database) = base_url
         .as_deref()
         .and_then(fcs_public_address)
-        .unwrap_or_else(|| (state.host.clone(), state.port, state.fcs_database.clone()));
+        .unwrap_or_else(|| (state.host.clone(), state.port, if lexical { "lexfcs".to_string() } else { state.fcs_database.clone() }));
     fcs::Endpoint {
         host,
         port,
         database,
-        base_url: state.fcs_base_url.clone(),
-        title: state.server_name.clone().unwrap_or_else(|| "FQS corpus search".to_string()),
-        description: "CLARIN-FCS endpoint of FQS (Flexicorp Query Server)".to_string(),
+        base_url,
+        title: if lexical {
+            state.server_name.as_ref().map(|n| format!("{n} lexicons")).unwrap_or_else(|| "FQS lexicon search".to_string())
+        } else {
+            state.server_name.clone().unwrap_or_else(|| "FQS corpus search".to_string())
+        },
+        description: if lexical {
+            "LexFCS endpoint of FQS (Flexicorp Query Server): lexical resources, LexCQL".to_string()
+        } else {
+            "CLARIN-FCS endpoint of FQS (Flexicorp Query Server)".to_string()
+        },
         default_records: 50,
         max_records: 1000,
     }
@@ -6731,6 +6757,26 @@ fn fcs_pando_binary(corpus: &CorpusEntry) -> String {
         .unwrap_or_else(|| "pando".to_string())
 }
 
+/// `lexfcs.py` for a lexicon: `settings.fcs.lexfcs`, else `LEXFCS_SCRIPT`, else next to the fqs binary,
+/// /usr/local/share/lexfcs or /opt/lexfcs (where an installer puts lexfcs.py with lexq.py).
+fn fcs_lexfcs_script(spec: &fcs::lex::LexSpec) -> std::result::Result<String, String> {
+    if let Some(s) = spec.script.clone().or_else(|| std::env::var("LEXFCS_SCRIPT").ok().filter(|s| !s.trim().is_empty())) {
+        return Ok(s);
+    }
+    let mut c: Vec<PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            c.push(d.join("lexfcs.py"));
+        }
+    }
+    c.push(PathBuf::from("/usr/local/share/lexfcs/lexfcs.py"));
+    c.push(PathBuf::from("/opt/lexfcs/lexfcs.py"));
+    c.into_iter()
+        .find(|p| p.is_file())
+        .map(|p| p.display().to_string())
+        .ok_or_else(|| "lexfcs.py not found: set settings.fcs.lexfcs or LEXFCS_SCRIPT".to_string())
+}
+
 /// A native Manatee error as an FCS engine error: the worker's own conditions (a stopped worker, a
 /// time-out, a corpus that does not read as its registry describes, a paused corpus) are system
 /// errors; anything else is Manatee rejecting the query.
@@ -6756,6 +6802,15 @@ fn fcs_engine(
         corpus.settings.get("fcs_timeout_secs").and_then(Value::as_u64).unwrap_or(120),
     );
     match dialect {
+        Dialect::Lex => {
+            let spec = fcs::lex::LexSpec::from_fcs(&fcs_config(corpus)).ok_or("settings.fcs.store is not set")?;
+            Ok(Box::new(fcs::lex::LexEngine {
+                python: spec.python.clone().or_else(|| std::env::var("LEXFCS_PYTHON").ok().filter(|s| !s.trim().is_empty())).unwrap_or_else(|| "python3".into()),
+                script: fcs_lexfcs_script(&spec)?,
+                spec,
+                timeout,
+            }))
+        }
         Dialect::Pando => {
             let transport: fcs::engine::PandoTransport =
                 if let Some(url) = corpus.settings.get("pando_server").and_then(Value::as_str) {
@@ -6844,10 +6899,23 @@ async fn http_fcs(
     headers: HeaderMap,
     AxumQuery(params): AxumQuery<HashMap<String, String>>,
 ) -> Response {
-    let ep = fcs_endpoint(&state);
+    fcs_answer(state, headers, params, false).await
+}
+
+/// LexFCS: the same SRU/FCS endpoint, for the lexicons (`settings.fcs.engine: "lex"`).
+async fn http_lexfcs(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    AxumQuery(params): AxumQuery<HashMap<String, String>>,
+) -> Response {
+    fcs_answer(state, headers, params, true).await
+}
+
+async fn fcs_answer(state: HttpAppState, headers: HeaderMap, params: HashMap<String, String>, lexical: bool) -> Response {
+    let ep = fcs_endpoint(&state, lexical);
     // FCS clients (the aggregator) are anonymous unless a front end signs a token
     let caller = state.limits.caller(&headers, None, None, None, &header_client_ip(&headers));
-    let visible = fcs_resources(&state, &caller);
+    let visible = fcs_resources(&state, &caller, lexical);
     let resources: Vec<fcs::Resource> = visible.iter().map(|(r, _)| r.clone()).collect();
     let req = match fcs::parse_request(&params, &ep) {
         Ok(r) => r,
@@ -6864,11 +6932,15 @@ async fn http_fcs(
         }
         fcs::Operation::SearchRetrieve => {}
     }
-    let mut rec = QueryRec::new("/fcs", &req.context.join(","), &req.query);
+    let mut rec = QueryRec::new(if lexical { "/lexfcs" } else { "/fcs" }, &req.context.join(","), &req.query);
     rec.caller(&caller);
     rec.set("start", json!(req.start));
     rec.set("size", json!(req.max));
-    rec.set("query_type", json!(if req.query_type == fcs::QueryType::Fcs { "fcs" } else { "cql" }));
+    rec.set("query_type", json!(match req.query_type {
+        fcs::QueryType::Fcs => "fcs",
+        fcs::QueryType::Lex => "lex",
+        fcs::QueryType::Cql => "cql",
+    }));
     let plan = match fcs::prepare_search(&req, &resources) {
         Ok(p) => p,
         Err(refusal) => {
@@ -6887,6 +6959,8 @@ async fn http_fcs(
                 && visible.iter().any(|(r, c)| r.id == p.resource.id && c.settings.get("pando_server").is_none())
         }
         fcs::translate::Dialect::Manatee => false,
+        // lexfcs.py runs as a child process
+        fcs::translate::Dialect::Lex => true,
     });
     let t0 = Instant::now();
     let permit = if spawns {

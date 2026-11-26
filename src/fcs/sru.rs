@@ -3,6 +3,7 @@
 
 use super::config::Resource;
 use super::engine::{Hit, Token};
+use super::lex;
 use super::query::Layer;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,15 +169,23 @@ pub fn explain_response(v: Version, ep: &Endpoint, resources: &[Resource], with_
 pub fn endpoint_description(v: Version, ep: &Endpoint, resources: &[Resource]) -> String {
     let v2 = v == Version::V2_0;
     let adv = v2 && resources.iter().any(|r| r.advanced);
+    // LexFCS: lexicons are FCS 2 resources with their own capability, data view and field list
+    let lexical = v2 && resources.iter().any(|r| r.lex.is_some());
     let mut o = format!("<ed:EndpointDescription xmlns:ed=\"http://clarin.eu/fcs/endpoint-description\" version=\"{}\">\n", if v2 { 2 } else { 1 });
     o.push_str("<ed:Capabilities>\n<ed:Capability>http://clarin.eu/fcs/capability/basic-search</ed:Capability>\n");
     if adv {
         o.push_str("<ed:Capability>http://clarin.eu/fcs/capability/advanced-search</ed:Capability>\n");
     }
+    if lexical {
+        o.push_str(&format!("<ed:Capability>{}</ed:Capability>\n", lex::CAPABILITY));
+    }
     o.push_str("</ed:Capabilities>\n<ed:SupportedDataViews>\n");
     o.push_str("<ed:SupportedDataView id=\"hits\" delivery-policy=\"send-by-default\">application/x-clarin-fcs-hits+xml</ed:SupportedDataView>\n");
     if adv {
         o.push_str("<ed:SupportedDataView id=\"adv\" delivery-policy=\"need-to-request\">application/x-clarin-fcs-adv+xml</ed:SupportedDataView>\n");
+    }
+    if lexical {
+        o.push_str(&format!("<ed:SupportedDataView id=\"lex\" delivery-policy=\"send-by-default\">{}</ed:SupportedDataView>\n", lex::MIME));
     }
     o.push_str("</ed:SupportedDataViews>\n");
     if adv {
@@ -197,6 +206,20 @@ pub fn endpoint_description(v: Version, ep: &Endpoint, resources: &[Resource]) -
             ));
         }
         o.push_str("</ed:SupportedLayers>\n");
+    }
+    if lexical {
+        // every field type some lexicon offers, each once, in LexFCS's order
+        const ORDER: &[&str] = &["any", "lang", "lemma", "entryId", "phonetic", "transcription", "translation", "definition", "etymology",
+            "baseform", "case", "degree", "frequency", "gender", "grammar", "mood", "number", "pos", "segmentation", "sentiment", "tense",
+            "antonym", "holonym", "hypernym", "hyponym", "meronym", "synonym", "related", "ref", "senseRef", "citation"];
+        let mut all: Vec<String> = Vec::new();
+        for f in resources.iter().filter_map(|r| r.lex.as_ref()).flat_map(|l| l.fields.iter()) {
+            if !all.contains(f) {
+                all.push(f.clone());
+            }
+        }
+        all.sort_by_key(|f| ORDER.iter().position(|x| x == f).unwrap_or(ORDER.len()));
+        o.push_str(&lex::supported_fields_xml(&all));
     }
     o.push_str("<ed:Resources>\n");
     for r in resources {
@@ -220,8 +243,11 @@ pub fn endpoint_description(v: Version, ep: &Endpoint, resources: &[Resource]) -
             o.push_str(&format!("<ed:Language>{}</ed:Language>\n", esc(l)));
         }
         o.push_str("</ed:Languages>\n");
-        let views = if adv && r.advanced { "hits adv" } else { "hits" };
+        let views = if adv && r.advanced { "hits adv" } else if lexical && r.lex.is_some() { "hits lex" } else { "hits" };
         o.push_str(&format!("<ed:AvailableDataViews ref=\"{views}\"/>\n"));
+        if let (true, Some(l)) = (lexical, r.lex.as_ref()) {
+            o.push_str(&format!("<ed:AvailableLexFields ref=\"{}\"/>\n", esc(&l.fields.join(" "))));
+        }
         if adv && r.advanced {
             let ids: Vec<&str> = r.layers().into_iter().map(Endpoint::layer_id).collect();
             o.push_str(&format!("<ed:AvailableLayers ref=\"{}\"/>\n", ids.join(" ")));
@@ -307,6 +333,7 @@ pub fn search_response(
     first_position: u64,
     records: &[Record<'_>],
     diags: &[Diagnostic],
+    lex_fields: &[String],
 ) -> String {
     let p = v.prefix();
     let mut o = String::from(XML_DECL);
@@ -327,7 +354,14 @@ pub fn search_response(
             ));
             let frag_ref = rec.hit_ref.as_ref().map(|u| format!(" ref=\"{}\"", esc(u))).unwrap_or_default();
             o.push_str(&format!("<fcs:ResourceFragment{frag_ref}>\n"));
-            o.push_str(&hits_view(&rec.hit));
+            match &rec.hit.lex {
+                // a lexical entry: the Hits view with LexFCS's kinds, and the Lex view (send-by-default)
+                Some(e) => {
+                    o.push_str(&lex::hits_view(e));
+                    o.push_str(&lex::lex_view(e, lex_fields));
+                }
+                None => o.push_str(&hits_view(&rec.hit)),
+            }
             if rec.adv {
                 o.push_str(&adv_view(&rec.hit, rec.resource, ep));
             }

@@ -13,6 +13,7 @@
 
 pub mod config;
 pub mod engine;
+pub mod lex;
 pub mod query;
 pub mod sru;
 pub mod translate;
@@ -49,6 +50,8 @@ pub enum QueryType {
     Cql,
     /// Advanced Search (FCS-QL)
     Fcs,
+    /// Lexical Search (LexCQL, LexFCS 1.0)
+    Lex,
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +69,8 @@ pub struct Request {
     pub dataviews: Vec<String>,
     /// `x-fcs-endpoint-description=true`
     pub endpoint_description: bool,
+    /// `x-fcs-lex-fields`: the field types the Lex view shows (empty: all)
+    pub lex_fields: Vec<String>,
 }
 
 /// A request that cannot be served: answer with this (version, operation, diagnostic).
@@ -117,6 +122,7 @@ pub fn parse_request(p: &HashMap<String, String>, ep: &Endpoint) -> Result<Reque
     let query_type = match param(p, "queryType") {
         None | Some("cql") => QueryType::Cql,
         Some("fcs") if version == Version::V2_0 => QueryType::Fcs,
+        Some("lex") => QueryType::Lex,
         Some(q) => return refuse(Diagnostic::sru(6, Some("queryType"), &format!("Unsupported query type '{q}'"))),
     };
     // records are only sent as XML (SRU 71: unsupported record packing)
@@ -159,6 +165,7 @@ pub fn parse_request(p: &HashMap<String, String>, ep: &Endpoint) -> Result<Reque
         context: list("x-fcs-context"),
         dataviews: list("x-fcs-dataviews"),
         endpoint_description: matches!(param(p, "x-fcs-endpoint-description"), Some("true") | Some("1")),
+        lex_fields: list("x-fcs-lex-fields"),
     })
 }
 
@@ -186,7 +193,22 @@ fn query_diag(e: &QueryError, qt: QueryType) -> Diagnostic {
         (QueryError::Unsupported(m), QueryType::Fcs) => Diagnostic::fcs(6, Some(m), "Query too complex. Cannot perform Query"),
         (QueryError::Syntax(m), QueryType::Cql) => Diagnostic::sru(10, Some(m), "Query syntax error"),
         (QueryError::Unsupported(m), QueryType::Cql) => Diagnostic::sru(48, Some(m), "Query feature unsupported"),
+        (QueryError::Syntax(m), QueryType::Lex) => Diagnostic::sru(10, Some(m), "Query syntax error"),
+        (QueryError::Unsupported(m), QueryType::Lex) => Diagnostic::sru(48, Some(m), "Query feature unsupported"),
     }
+}
+
+/// An SRU diagnostic named by its code (what a lexicon store reports).
+fn sru_diag(code: u32, details: &str) -> Diagnostic {
+    let message = match code {
+        10 => "Query syntax error",
+        16 => "Unsupported index",
+        19 => "Unsupported relation",
+        20 => "Unsupported relation modifier",
+        48 => "Query feature unsupported",
+        _ => "General system error",
+    };
+    Diagnostic::sru(code, Some(details), message)
 }
 
 /// A resource with its query in the engine's language.
@@ -206,11 +228,6 @@ pub struct Plan {
 /// Parse the query, pick the resources, translate: everything before an engine runs.
 pub fn prepare_search(req: &Request, resources: &[Resource]) -> Result<Plan, Refusal> {
     let refusal = |d: Diagnostic| -> Refusal { (req.version, Operation::SearchRetrieve, d) };
-    let parsed: Parsed = match req.query_type {
-        QueryType::Cql => query::parse_cql(&req.query),
-        QueryType::Fcs => query::parse_fcsql(&req.query),
-    }
-    .map_err(|e| refusal(query_diag(&e, req.query_type)))?;
     let mut diagnostics = Vec::new();
     let mut chosen: Vec<&Resource> = Vec::new();
     if req.context.is_empty() {
@@ -227,6 +244,40 @@ pub fn prepare_search(req: &Request, resources: &[Resource]) -> Result<Plan, Ref
             return Err(refusal(diagnostics.remove(0)));
         }
     }
+    // Lexical Search: the lexicons only. A lexicon also answers a Basic Search (a CQL term is a LexCQL
+    // term: the lemma); the query goes to it unchanged, so it is only parsed for the corpora
+    if req.query_type == QueryType::Lex {
+        let before = chosen.len();
+        chosen.retain(|r| r.lex.is_some());
+        if chosen.is_empty() {
+            return Err(refusal(Diagnostic::sru(48, Some("Lexical Search is not available for the selected resources"), "Query feature unsupported")));
+        }
+        if chosen.len() < before {
+            diagnostics.push(Diagnostic::fcs(8, None, "Resources without Lexical Search were left out"));
+        }
+    }
+    let lex_parts: Vec<Prepared> = chosen
+        .iter()
+        .filter(|r| r.lex.is_some())
+        .map(|r| Prepared { resource: (*r).clone(), native: Native { queries: vec![req.query.clone()] }, link_query: None })
+        .collect();
+    chosen.retain(|r| r.lex.is_none());
+    if chosen.is_empty() {
+        return Ok(Plan { parts: lex_parts, diagnostics });
+    }
+    let parsed: Parsed = match match req.query_type {
+        QueryType::Cql | QueryType::Lex => query::parse_cql(&req.query),
+        QueryType::Fcs => query::parse_fcsql(&req.query),
+    } {
+        Ok(p) => p,
+        // a query only the lexicons understand: search them, say why the corpora were left out
+        Err(e) if !lex_parts.is_empty() => {
+            let d = query_diag(&e, req.query_type);
+            diagnostics.push(Diagnostic { details: Some(format!("corpora: {}", d.details.clone().unwrap_or_default())), ..d });
+            return Ok(Plan { parts: lex_parts, diagnostics });
+        }
+        Err(e) => return Err(refusal(query_diag(&e, req.query_type))),
+    };
     if req.query_type == QueryType::Fcs {
         let before = chosen.len();
         chosen.retain(|r| r.advanced);
@@ -259,6 +310,7 @@ pub fn prepare_search(req: &Request, resources: &[Resource]) -> Result<Plan, Ref
             }
         }
     }
+    parts.extend(lex_parts);
     if parts.is_empty() {
         return Err(refusal(first_err.unwrap_or_else(|| Diagnostic::sru(1, None, "No resource to search"))));
     }
@@ -343,6 +395,7 @@ pub fn search(req: &Request, ep: &Endpoint, plan: Plan, engine_for: &dyn Fn(&Res
                 let d = match &e {
                     EngineError::Query(m) => query_diag(&QueryError::Syntax(m.clone()), req.query_type),
                     EngineError::System(m) => Diagnostic::sru(1, Some(m), "General system error"),
+                    EngineError::Diag(code, m) => sru_diag(*code, m),
                 };
                 if single {
                     return sru::diagnostic_response(req.version, "searchRetrieve", &[d]);
@@ -358,7 +411,7 @@ pub fn search(req: &Request, ep: &Endpoint, plan: Plan, engine_for: &dyn Fn(&Res
         .into_iter()
         .map(|(i, hit, hit_ref, adv)| sru::Record { resource: &plan.parts[i].resource, hit, hit_ref, adv })
         .collect();
-    sru::search_response(req.version, ep, cum, exact, req.start, &recs, &diags)
+    sru::search_response(req.version, ep, cum, exact, req.start, &recs, &diags, &req.lex_fields)
 }
 
 #[cfg(test)]
@@ -391,7 +444,7 @@ mod tests {
                     left: vec![Token { text: "a<".into(), layers: vec![] }],
                     kwic: vec![Token { text: format!("w{i}"), layers: vec![(Layer::Lemma, "l".into())] }],
                     right: vec![],
-                    start: Some(i), end: Some(i), doc: None, tokid: None,
+                    start: Some(i), end: Some(i), doc: None, tokid: None, lex: None,
                 })
                 .collect();
             Ok(Page { total: self.0, exact: true, hits })
@@ -459,5 +512,62 @@ mod tests {
         let plan = prepare_search(&req, &rs).unwrap();
         let x = search(&req, &ep(), plan, &|_| Ok(Box::new(Fake(0))));
         assert!(x.contains("info:srw/diagnostic/1/61"), "{x}");
+    }
+
+    fn lexres(id: &str) -> Resource {
+        Resource::from_spec(&ResourceSpec {
+            id, label: id, landing_page: None, fcs: &json!({"store": "/x.db", "lex_fields": ["any", "lemma", "pos"]}),
+            dialect: Dialect::Lex, base_url: Some("http://h/fcs"), default_hit_link: None,
+        })
+    }
+
+    /// a lexicon engine: entries, and the query it was given
+    struct FakeLex;
+    impl Engine for FakeLex {
+        fn search(&self, a: &SearchArgs<'_>) -> Result<Page, EngineError> {
+            if a.queries[0].contains("foo") {
+                return Err(EngineError::Diag(16, "unknown field 'foo'".into()));
+            }
+            let e = lex::LexEntry::from_json(&json!({"lang": "cs", "fields": [
+                {"type": "lemma", "values": [{"text": a.queries[0].clone(), "attrs": {}}]},
+                {"type": "pos", "values": [{"text": "NOUN", "attrs": {}}]}]}));
+            Ok(Page { total: 1, exact: true, hits: vec![Hit { lex: Some(e), ..Hit::default() }] })
+        }
+    }
+
+    #[test]
+    fn lexical_search() {
+        let rs = vec![res("a", Dialect::Pando), lexres("lx")];
+        let x = explain(&parse_request(&params(&[("x-fcs-endpoint-description", "true")]), &ep()).unwrap(), &ep(), &rs);
+        assert!(x.contains("http://clarin.eu/fcs/capability/lexical-search/1.0"));
+        assert!(x.contains("<ed:SupportedDataView id=\"lex\" delivery-policy=\"send-by-default\">application/x-clarin-fcs-lex+xml"));
+        assert!(x.contains("<ed:SupportedLexField id=\"lemma\">lemma</ed:SupportedLexField>"));
+        assert!(x.contains("<ed:AvailableDataViews ref=\"hits lex\"/>\n<ed:AvailableLexFields ref=\"any lemma pos\"/>"), "{x}");
+
+        // LexCQL goes to the lexicon as it is; the corpus is left out
+        let req = parse_request(&params(&[("query", "lemma =/ignoreCase dům"), ("queryType", "lex"), ("x-fcs-lex-fields", "lemma")]), &ep()).unwrap();
+        let plan = prepare_search(&req, &rs).unwrap();
+        assert_eq!(plan.parts.len(), 1);
+        assert_eq!(plan.parts[0].native.queries, vec!["lemma =/ignoreCase dům".to_string()]);
+        assert!(plan.diagnostics.iter().any(|d| d.uri == "http://clarin.eu/fcs/diagnostic/8"));
+        let x = search(&req, &ep(), plan, &|r| if r.lex.is_some() { Ok(Box::new(FakeLex)) } else { Ok(Box::new(Fake(1))) });
+        assert!(x.contains("<hits:Hit kind=\"lex-lemma\">lemma =/ignoreCase dům</hits:Hit>"), "{x}");
+        assert!(x.contains("<lex:Field type=\"lemma\">"));
+        assert!(!x.contains("<lex:Field type=\"pos\">"), "x-fcs-lex-fields: {x}");
+
+        // a Basic Search reaches both; a CQL query only the lexicon understands searches the lexicon
+        let req = parse_request(&params(&[("query", "house")]), &ep()).unwrap();
+        assert_eq!(prepare_search(&req, &rs).unwrap().parts.len(), 2);
+        let req = parse_request(&params(&[("query", "lemma =/ignoreCase house")]), &ep()).unwrap();
+        let plan = prepare_search(&req, &rs).unwrap();
+        assert_eq!(plan.parts.len(), 1);
+        assert!(plan.parts[0].resource.lex.is_some());
+
+        // the store's error is the SRU diagnostic it names; no lexicon: Lexical Search is refused
+        let req = parse_request(&params(&[("query", "foo = x"), ("queryType", "lex")]), &ep()).unwrap();
+        let x = search(&req, &ep(), prepare_search(&req, &rs).unwrap(), &|_| Ok(Box::new(FakeLex)));
+        assert!(x.contains("info:srw/diagnostic/1/16"), "{x}");
+        let e = prepare_search(&req, &rs[..1]).err().unwrap();
+        assert_eq!(e.2.uri, "info:srw/diagnostic/1/48");
     }
 }

@@ -692,6 +692,45 @@ member by member. Schema: `dev/FQS-FCS2-IMPLEMENTATION.md` §4, e.g.:
 }
 ```
 
+### Lexicons (LexFCS)
+
+A catalogue entry with `settings.fcs.engine: "lex"` is a **lexical resource**
+(LexFCS 1.0, Text+/CLARIN), served at its own endpoint, **`/lexfcs`**; `/fcs`
+serves the corpora only. Each aggregator is registered with the one it can
+show (the CLARIN aggregator with `/fcs`, a LexFCS aggregator with `/lexfcs`),
+and each Endpoint Description lists only its own resources. `/lexfcs`
+announces the Lexical Search capability, the Lex data view and the lexical
+fields, and answers `queryType=lex` (LexCQL). Its public URL is
+`--fcs-base-url` with `fcs` read as `lexfcs` (…/services/fcs →
+…/services/lexfcs), which is also where a lexicon's default PID lives. The query goes to the
+lexicon store unchanged (`lexfcs.py search`, from the lexicon store concept,
+`concepts/lexfcs/proto`), which returns entries already flattened into LexFCS
+fields; FQS writes the Lex view and a Hits view with `kind`. A Basic Search
+(CQL) at `/lexfcs` is answered too (a CQL term is a LexCQL term: the lemma). `x-fcs-lex-fields` limits the Lex view.
+
+```json
+"fcs": {
+  "enabled": true, "engine": "lex",
+  "store": "/path/Lexicons/vallex.db",
+  "resources": ["vallex-4.5/verbs", "vallex-4.5/lvc-nouns"],
+  "lex_fields": ["any", "lang", "lemma", "pos", "definition", "citation", "case"],
+  "entry_link": "https://…/index.php?action=lexentry&store=vallex&uid={uid}",
+  "pid": "http://hdl.handle.net/11234/1-4756", "title": {"en": "VALLEX 4.5"}, "languages": ["cs"]
+}
+```
+
+`python3 lexfcs.py STORE config [--resources ID,…] [--ref URL]` writes this
+block from the store's headers (fields from the data, title, languages,
+handle). `lexfcs.py` (with `lexq.py` beside it) is found through
+`settings.fcs.lexfcs`, `LEXFCS_SCRIPT`, next to the fqs binary,
+`/usr/local/share/lexfcs/` or `/opt/lexfcs/`; Python through
+`settings.fcs.python`, `LEXFCS_PYTHON` or `python3`. It runs as a child
+process per request (a process slot, like cqp); 0.1–0.4 s on UniSegments.
+The entry must allow queries over HTTP (`http_policy_mode`
+`public_query`, `http_allowed_operations: ["query"]`). Errors of the store
+come back as SRU diagnostics (10 syntax, 16 unknown field, 19 relation, 48
+unsupported, e.g. the store's own `part[ … ]` extension).
+
 Export current corpus set as JSON:
 
 ```bash

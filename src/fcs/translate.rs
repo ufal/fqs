@@ -21,6 +21,8 @@ pub enum Dialect {
     Pando,
     Cwb,
     Manatee,
+    /// a lexicon (LexFCS): the query goes to the store unchanged, nothing is translated
+    Lex,
 }
 
 /// FCS layer → engine attribute name, FCS scope → engine structure name.
@@ -78,6 +80,7 @@ pub fn translate(p: &Parsed, d: Dialect, m: &Mapping) -> Result<Native, QueryErr
     };
     let q = nnf_query(&p.query);
     match d {
+        Dialect::Lex => unsupported("a lexicon takes the query as it is (LexCQL)"),
         Dialect::Pando => {
             let alts = flatten(&q, m)?;
             let queries = alts
@@ -179,6 +182,7 @@ fn attr_test(layer: Layer, negated: bool, value: &str, flags: &Flags, d: Dialect
     let plain = !value.chars().any(|c| ".*+?()[]{}|^$\\".contains(c));
     let flags = &Flags { literal: flags.literal || plain, ..flags.clone() };
     match d {
+        Dialect::Lex => unsupported("a lexicon takes the query as it is (LexCQL)"),
         Dialect::Pando => {
             if flags.literal {
                 let mut s = format!("{a}{op}{}", quote_literal(value));
